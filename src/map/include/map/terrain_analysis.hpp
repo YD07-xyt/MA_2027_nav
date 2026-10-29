@@ -34,6 +34,13 @@ public:
         float obstacle_band = 0.08f;         // 高出参考地面多少以内算"贴地"
         float ground_jump_thresh = 0.10f;    // 本格地面比邻域最低地面高出多少才认为被抬高
         int   ground_min_radius = 2;         // 邻域最低地面的搜索半径（格）
+        // ---- 可达生长（阶段 2，需要持久地面层）----
+        bool  reach_en = false;
+        float max_slope_deg = 25.0f;         // 可通行最大坡度
+        float reach_step_tol = 0.03f;        // 相邻格高差在坡度允许值之外的容差 (m)
+        float plane_rms_max = 0.02f;         // 局部平面拟合残差小于此值才用平面坡度判陡坡 (m)
+        bool  drop_edge_en = false;          // 射线上界证明外侧更低且未观测 → 判下沿
+        float drop_thresh = 0.10f;           // 下沿判定：外侧上界低于本格地面多少 (m)
     };
 
     // 体素状态查询：pos 为体素中心（世界系）。杆下方被射线扫空 → KNOWN_FREE；

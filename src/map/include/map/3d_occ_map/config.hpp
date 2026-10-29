@@ -229,6 +229,12 @@ public:
         loader.LoadParam(name_space + "/terrain/ground_layer/footprint_radius", ground_layer_footprint_radius, 0.20f);
         loader.LoadParam(name_space + "/terrain/ground_layer/footprint_ground_offset", ground_layer_footprint_offset, 0.0f);
         loader.LoadParam(name_space + "/terrain/ground_layer/seed_radius", ground_layer_seed_radius, 1.5f);
+        loader.LoadParam(name_space + "/terrain/reach/enable", terrain_reach_en, false);
+        loader.LoadParam(name_space + "/terrain/reach/max_slope_deg", terrain_max_slope_deg, 25.0f);
+        loader.LoadParam(name_space + "/terrain/reach/step_tol", terrain_reach_step_tol, 0.03f);
+        loader.LoadParam(name_space + "/terrain/reach/plane_rms_max", terrain_plane_rms_max, 0.02f);
+        loader.LoadParam(name_space + "/terrain/reach/drop_edge_enable", terrain_drop_edge_en, false);
+        loader.LoadParam(name_space + "/terrain/reach/drop_thresh", terrain_drop_thresh, 0.10f);
         // 2D 栅格地图边界：原点向 x 左/右、y 左/右各延伸多少米（x ∈ [-x_left, +x_right], y ∈ [-y_left, +y_right]）
         loader.LoadParam(name_space + "/grid_map/x_left", grid_map_x_left, 20.5);
         loader.LoadParam(name_space + "/grid_map/x_right", grid_map_x_right, 20.5);
@@ -393,6 +399,8 @@ public:
     int terrain_ground_min_radius{};
     utils::Vec3f sensor_offset {utils::Vec3f::Zero()};
     bool ground_layer_en {false};
+    bool terrain_reach_en {false}, terrain_drop_edge_en {false};
+    float terrain_max_slope_deg {}, terrain_reach_step_tol {}, terrain_plane_rms_max {}, terrain_drop_thresh {};
     float ground_layer_size {}, ground_layer_max_range {}, ground_layer_rise_max {};
     int ground_layer_drop_votes {}, ground_layer_rise_votes {};
     float ground_layer_footprint_radius {}, ground_layer_footprint_offset {}, ground_layer_seed_radius {};

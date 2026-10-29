@@ -43,7 +43,26 @@ void GroundLayer::seedDisk(const utils::Pose& base_pose, float radius, bool trav
     const int r = static_cast<int>(std::ceil(radius / res));
     const int cx = static_cast<int>(std::floor(base_pose.first.x() / res));
     const int cy = static_cast<int>(std::floor(base_pose.first.y() / res));
-    const float h = static_cast<float>(base_pose.first.z()) + cfg_.footprint_ground_offset;
+    // 种子高度：优先取足迹外一圈（r..r+3 格）真实地面的中位数，没有才用 base 高度 + 偏移
+    float h = static_cast<float>(base_pose.first.z()) + cfg_.footprint_ground_offset;
+    std::vector<float> ring;
+    for (int dx = -r - 3; dx <= r + 3; ++dx) {
+        for (int dy = -r - 3; dy <= r + 3; ++dy) {
+            const int d2 = dx * dx + dy * dy;
+            if (d2 <= r * r || d2 > (r + 3) * (r + 3)) {
+                continue;
+            }
+            const Cell* c = cell(cx + dx, cy + dy);
+            if (c != nullptr && (c->flags & OBS)) {
+                ring.push_back(c->h);
+            }
+        }
+    }
+    if (ring.size() >= 8) {
+        auto mid = ring.begin() + ring.size() / 2;
+        std::nth_element(ring.begin(), mid, ring.end());
+        h = *mid;
+    }
     for (int dx = -r; dx <= r; ++dx) {
         for (int dy = -r; dy <= r; ++dy) {
             if (dx * dx + dy * dy > r * r) {

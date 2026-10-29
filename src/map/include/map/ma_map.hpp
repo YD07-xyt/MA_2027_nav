@@ -30,6 +30,12 @@ public:
         terrain_cfg.obstacle_band = cfg_.terrain_obstacle_band;
         terrain_cfg.ground_jump_thresh = cfg_.terrain_ground_jump_thresh;
         terrain_cfg.ground_min_radius = cfg_.terrain_ground_min_radius;
+        terrain_cfg.reach_en = cfg_.terrain_reach_en;
+        terrain_cfg.max_slope_deg = cfg_.terrain_max_slope_deg;
+        terrain_cfg.reach_step_tol = cfg_.terrain_reach_step_tol;
+        terrain_cfg.plane_rms_max = cfg_.terrain_plane_rms_max;
+        terrain_cfg.drop_edge_en = cfg_.terrain_drop_edge_en;
+        terrain_cfg.drop_thresh = cfg_.terrain_drop_thresh;
         terrain_cfg.resolution = cfg_.resolution;
         terrain_cfg.map_size_x = cfg_.local_update_box_d.x();
         terrain_cfg.map_size_y = cfg_.local_update_box_d.y();
@@ -190,6 +196,10 @@ public:
     }
     auto get_occupancy_2d()-> grid_map::RowMatrixXi {
         return occupancy_2d;
+    }
+    // 持久地面层（只读，地图线程外读取需自行保证不与 update_map 并发）
+    auto get_ground_layer() const -> const Terrain::GroundLayer& {
+        return ground_layer_;
     }
     auto get_rog_map() -> std::shared_ptr<rog_map::ROGMap> {
         return rog_map_ptr_;

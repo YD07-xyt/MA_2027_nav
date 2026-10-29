@@ -83,6 +83,14 @@ rog_map:
         footprint_radius: 0.20         # 车走过的格按 base 高度记为地面(m)
         footprint_ground_offset: 0.0   # base_odom 到脚底的高度(m)，未核实，先取 0
         seed_radius: 1.5               # 启动时车周盲区按 base 平面给低置信地面(m)
+      # ---- 可达生长：以持久地面判上下沿/陡坡，只有从车所在格可达的地面给空闲证据（需 ground_layer）----
+      reach:
+        enable: true
+        max_slope_deg: 25.0            # 可通行最大坡度（20°/23° 坡可通行）
+        step_tol: 0.03                 # 相邻格高差在坡度允许值之外的容差(m)
+        plane_rms_max: 0.02            # 5x5 平面拟合残差小于此值才按平面坡度判陡坡(m)
+        drop_edge_enable: false        # 射线上界判下沿：高台上看不见的下坡也会被挡，默认关
+        drop_thresh: 0.10              # 下沿判定：外侧射线上界低于本格地面多少(m)
 
   # 2D grid map (A* 规划用)。边界按原点向四个方向的延伸量设置：
   # x ∈ [-x_left, +x_right], y ∈ [-y_left, +y_right]，即 x,-x,y,-y

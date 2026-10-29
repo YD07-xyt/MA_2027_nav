@@ -8,7 +8,9 @@
 //   <out_prefix>_frames.csv  每帧：t, x, y, z, 障碍格数, 车周 3 m 内障碍格数, 足迹内障碍格数, update_map 耗时 ms
 //   stdout                   汇总：轨迹扫过的格中最终被判障碍的数量（车走过的地方不应是障碍）
 #include "map/ma_map.hpp"
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <iostream>
@@ -132,6 +134,21 @@ int main(int argc, char** argv) {
             const unsigned char v = occ(x, y) == 1 ? 0 : (traversed[x * nvox.y() + y] ? 160 : 255);
             pgm.put(static_cast<char>(v));
         }
+    // 持久地面层：每个 2D 格一行 x, y, h, flags（只写有地面的格）
+    {
+        const auto& gl = map.get_ground_layer();
+        std::ofstream g(prefix + "_ground.csv");
+        g << "x,y,h,flags,ub\n";
+        const double gres = gl.config().resolution;
+        for (int x = 0; x < nvox.x(); ++x)
+            for (int y = 0; y < nvox.y(); ++y) {
+                Eigen::Vector2d p;
+                gm0->indexToPos(Eigen::Vector2i(x, y), p);
+                const auto* c = gl.cell(static_cast<int>(std::floor(p.x() / gres)), static_cast<int>(std::floor(p.y() / gres)));
+                if (c == nullptr || c->flags == 0) continue;
+                g << p.x() << ',' << p.y() << ',' << c->h << ',' << int(c->flags) << ',' << c->ub << '\n';
+            }
+    }
     std::sort(ms_all.begin(), ms_all.end());
     const double med = ms_all.empty() ? 0 : ms_all[ms_all.size() / 2];
     const double p95 = ms_all.empty() ? 0 : ms_all[ms_all.size() * 95 / 100];

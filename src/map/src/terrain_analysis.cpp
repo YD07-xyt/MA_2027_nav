@@ -213,6 +213,150 @@ auto TerrainAnalyzer::analyze(const utils::RobotState &robot_pose,
   }
   // =========================================================
 
+  // ================= 可达生长（阶段 2）=================
+  // 地面取持久地面层 G（不再用列内最低体素），然后：
+  //   - 上下沿：8 邻域高差 > tan(max_slope)·距离 + reach_step_tol 的一对格，高的一侧判障碍
+  //     （站在高处往下是悬崖，站在低处往上是台阶，挡住高侧格两个方向都不能跨）；
+  //   - 陡坡：5×5 局部平面坡度 > max_slope 且拟合残差小（真坡面而非杂乱物体）；
+  //   - 可达：从车所在格沿可跨越的边生长，只有可达格给平坦空闲证据；
+  //   - 车走过的格（TRAV）不因地面判据判障碍（仍受上方障碍点判据约束）；
+  //   - 下沿（可选）：可达格的未观测邻格，射线上界证明它比本格低 drop_thresh 以上。
+  const bool use_reach = config_.reach_en && ground_layer_ != nullptr;
+  using BoolArr = Eigen::Array<bool, Eigen::Dynamic, Eigen::Dynamic>;
+  BoolArr ground_obs = BoolArr::Constant(grid.width, grid.height, false);
+  BoolArr reach = ground_obs;
+  if (use_reach) {
+    const float gres = ground_layer_->config().resolution;
+    Eigen::ArrayXXf G = Eigen::ArrayXXf::Constant(grid.width, grid.height, nan);
+    Eigen::ArrayXXf UB = Eigen::ArrayXXf::Constant(grid.width, grid.height, nan);
+    BoolArr trav = ground_obs;
+    BoolArr seed = ground_obs;  // 种子地面（无真实量测）：不参与上下沿，生长时视为可跨越
+    for (int gy = 0; gy < grid.height; ++gy) {
+      for (int gx = 0; gx < grid.width; ++gx) {
+        const utils::Vec3f c = gridToWorld(grid, gx, gy);
+        const auto *cell = ground_layer_->cell(static_cast<int>(std::floor(c.x() / gres)),
+                                               static_cast<int>(std::floor(c.y() / gres)));
+        if (cell == nullptr) continue;
+        trav(gx, gy) = (cell->flags & GroundLayer::TRAV) != 0;
+        seed(gx, gy) = !(cell->flags & GroundLayer::OBS) && (cell->flags & GroundLayer::SEED);
+        if (cell->flags & (GroundLayer::OBS | GroundLayer::SEED)) {
+          G(gx, gy) = cell->h;
+        } else if (std::isfinite(cell->ub)) {
+          UB(gx, gy) = cell->ub;
+        }
+      }
+    }
+    const float tan_slope = std::tan(config_.max_slope_deg * static_cast<float>(M_PI) / 180.0f);
+    auto passable = [&](float a, float b, float dist) {
+      return std::fabs(a - b) <= tan_slope * dist + config_.reach_step_tol;
+    };
+    // 上下沿
+    for (int gy = 0; gy < grid.height; ++gy) {
+      for (int gx = 0; gx < grid.width; ++gx) {
+        const float g = G(gx, gy);
+        if (std::isnan(g) || seed(gx, gy)) continue;
+        for (int dy = -1; dy <= 1; ++dy) {
+          for (int dx = -1; dx <= 1; ++dx) {
+            if (dx == 0 && dy == 0) continue;
+            const int nx = gx + dx, ny = gy + dy;
+            if (nx < 0 || nx >= grid.width || ny < 0 || ny >= grid.height) continue;
+            const float gn = G(nx, ny);
+            if (std::isnan(gn) || gn >= g || seed(nx, ny)) continue;  // 只看比本格低的真实地面
+            if (!passable(g, gn, res * std::sqrt(static_cast<float>(dx * dx + dy * dy)))) {
+              ground_obs(gx, gy) = true;
+            }
+          }
+        }
+      }
+    }
+    // 陡坡：5×5 平面 z = a·x + b·y + c（x、y 以格为单位，相对中心）
+    for (int gy = 0; gy < grid.height; ++gy) {
+      for (int gx = 0; gx < grid.width; ++gx) {
+        if (std::isnan(G(gx, gy)) || ground_obs(gx, gy)) continue;
+        double sxx = 0, syy = 0, sxy = 0, sxz = 0, syz = 0, sx = 0, sy = 0, sz = 0;
+        int n = 0;
+        for (int dy = -2; dy <= 2; ++dy) {
+          for (int dx = -2; dx <= 2; ++dx) {
+            const int nx = gx + dx, ny = gy + dy;
+            if (nx < 0 || nx >= grid.width || ny < 0 || ny >= grid.height) continue;
+            const float z = G(nx, ny);
+            if (std::isnan(z) || seed(nx, ny)) continue;
+            sxx += dx * dx; syy += dy * dy; sxy += dx * dy;
+            sxz += dx * z; syz += dy * z; sx += dx; sy += dy; sz += z;
+            ++n;
+          }
+        }
+        if (n < 12) continue;
+        Eigen::Matrix3d A;
+        A << sxx, sxy, sx, sxy, syy, sy, sx, sy, n;
+        const Eigen::Vector3d sol = A.ldlt().solve(Eigen::Vector3d(sxz, syz, sz));
+        double sse = 0;
+        for (int dy = -2; dy <= 2; ++dy) {
+          for (int dx = -2; dx <= 2; ++dx) {
+            const int nx = gx + dx, ny = gy + dy;
+            if (nx < 0 || nx >= grid.width || ny < 0 || ny >= grid.height) continue;
+            const float z = G(nx, ny);
+            if (std::isnan(z) || seed(nx, ny)) continue;
+            const double e = z - (sol(0) * dx + sol(1) * dy + sol(2));
+            sse += e * e;
+          }
+        }
+        const double grad = std::hypot(sol(0), sol(1)) / res;  // m/m
+        if (grad > tan_slope && std::sqrt(sse / n) < config_.plane_rms_max) {
+          ground_obs(gx, gy) = true;
+        }
+      }
+    }
+    // 下沿（可选）
+    if (config_.drop_edge_en) {
+      for (int gy = 0; gy < grid.height; ++gy) {
+        for (int gx = 0; gx < grid.width; ++gx) {
+          const float g = G(gx, gy);
+          if (std::isnan(g) || ground_obs(gx, gy)) continue;
+          for (int dy = -1; dy <= 1 && !ground_obs(gx, gy); ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+              const int nx = gx + dx, ny = gy + dy;
+              if (nx < 0 || nx >= grid.width || ny < 0 || ny >= grid.height) continue;
+              if (!std::isnan(UB(nx, ny)) && UB(nx, ny) < g - config_.drop_thresh) {
+                ground_obs(gx, gy) = true;
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
+    for (int gy = 0; gy < grid.height; ++gy)
+      for (int gx = 0; gx < grid.width; ++gx)
+        if (trav(gx, gy)) ground_obs(gx, gy) = false;
+    // 可达生长：从车所在格出发，经可跨越的边、不进障碍格
+    if (auto start = worldToGrid(grid, robot_pose.p)) {
+      std::vector<std::pair<int, int>> stack {*start};
+      if (!std::isnan(G(start->first, start->second))) reach(start->first, start->second) = true;
+      else stack.clear();
+      while (!stack.empty()) {
+        const auto [cx, cy] = stack.back();
+        stack.pop_back();
+        for (int dy = -1; dy <= 1; ++dy) {
+          for (int dx = -1; dx <= 1; ++dx) {
+            const int nx = cx + dx, ny = cy + dy;
+            if (nx < 0 || nx >= grid.width || ny < 0 || ny >= grid.height) continue;
+            if (reach(nx, ny) || ground_obs(nx, ny) || std::isnan(G(nx, ny))) continue;
+            if (!seed(cx, cy) && !seed(nx, ny) &&
+                !passable(G(cx, cy), G(nx, ny), res * std::sqrt(static_cast<float>(dx * dx + dy * dy)))) continue;
+            reach(nx, ny) = true;
+            stack.emplace_back(nx, ny);
+          }
+        }
+      }
+    }
+    // 参考地面改用持久地面
+    for (int gy = 0; gy < grid.height; ++gy)
+      for (int gx = 0; gx < grid.width; ++gx)
+        if (!std::isnan(G(gx, gy))) z_ref(gx, gy) = G(gx, gy);
+  }
+  // =========================================================
+
   // =================计算参考地面的邻域高度梯度 =================
   // 只在 z_ref 上算梯度：地面本身不连续（台阶/陡坡）才会触发，
   // 限高杆靠近高台时 z_ref 是连续的低处地面，不会被误触发。
@@ -252,8 +396,22 @@ auto TerrainAnalyzer::analyze(const utils::RobotState &robot_pose,
       Eigen::Array<bool, Eigen::Dynamic, Eigen::Dynamic>::Constant(
           grid.width, grid.height, false);
 
+  if (use_reach) {
+    // 地面判据障碍：不依赖本格有没有占据体素（下沿外侧、被擦掉的台沿也要标）
+    for (int gy = 0; gy < grid.height; ++gy) {
+      for (int gx = 0; gx < grid.width; ++gx) {
+        if (!ground_obs(gx, gy)) continue;
+        auto world_pt = gridToWorld(grid, gx, gy);
+        world_pt.z() = std::isnan(max_height(gx, gy)) ? z_ref(gx, gy) : max_height(gx, gy);
+        output.push_back(world_pt);
+        is_obstacle(gx, gy) = true;
+      }
+    }
+  }
+
   for (int gy = 0; gy < grid.height; ++gy) {
     for (int gx = 0; gx < grid.width; ++gx) {
+      if (use_reach && ground_obs(gx, gy)) continue;
       if (floating(gx, gy)) {
         // 悬空列：下沿正下方净空已被射线证实一直通到地面，可从下方通过
         free_out.push_back(gridToWorld(grid, gx, gy));
@@ -277,7 +435,10 @@ auto TerrainAnalyzer::analyze(const utils::RobotState &robot_pose,
       if (std::isnan(z_low)) {
         // 全部点都贴着参考地面：地面本身
         // 地面在邻域内有明显跳变（台阶顶面、陡坡）时仍判障碍
-        if (gradient(gx, gy) > config_.steep_threshold) {
+        if (use_reach) {
+          // 地面判据已在 ground_obs 处理；只有可达格才给空闲证据
+          if (reach(gx, gy)) free_out.push_back(gridToWorld(grid, gx, gy));
+        } else if (gradient(gx, gy) > config_.steep_threshold) {
           auto world_pt = gridToWorld(grid, gx, gy);
           world_pt.z() = obstacle_max_z;
           output.push_back(world_pt);
@@ -324,6 +485,7 @@ auto TerrainAnalyzer::analyze(const utils::RobotState &robot_pose,
       for (int gx = 0; gx < grid.width; ++gx) {
         const int idx = gy * grid.width + gx;
         if (!height_lists[idx].empty()) continue;  // 有占据：已由上面判据处理
+        if (use_reach && !reach(gx, gy)) continue;  // 可达生长模式：不可达格不给空闲证据
         bool near_obstacle = false;
         for (int dy = -1; dy <= 1 && !near_obstacle; ++dy) {
           for (int dx = -1; dx <= 1; ++dx) {
