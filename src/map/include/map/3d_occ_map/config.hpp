@@ -207,6 +207,8 @@ public:
         loader.LoadParam(name_space + "/virtual_ground_height", virtual_ground_height, -0.1);
         loader.LoadParam(name_space + "/virtual_ceil_height", virtual_ceil_height, -0.1);
         loader.LoadParam(name_space + "/forget_threshold", forget_threshold, 10.0);
+        loader.LoadParam(name_space + "/nav_forget_threshold", nav_forget_threshold, -1.0);
+        loader.LoadParam(name_space + "/forget_keep_radius", forget_keep_radius, 0.0);
 
         loader.LoadParam(name_space + "/terrain/kernel_size", terrain_kernel_size, 5);
         loader.LoadParam(name_space + "/terrain/max_step_height", terrain_max_step_height, 0.17f);
@@ -384,6 +386,8 @@ public:
     double unk_thresh {};
     double map_sliding_thresh {};
     double forget_threshold {};  // 占据体素遗忘衰减时间（秒），≤0 禁用
+    double nav_forget_threshold {};  // 导航模式下的遗忘时间（秒），≤0 禁用；建图模式用 forget_threshold
+    double forget_keep_radius {};    // 车周多少米内不遗忘（水平距离）
 
     // ---------- terrain / 2D grid_map 参数 ----------
     int terrain_kernel_size{};

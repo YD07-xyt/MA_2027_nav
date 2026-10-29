@@ -351,7 +351,7 @@ void ProbMap::updateProbMap(const PointCloud& cloud, const Pose& pose) {
     static int forget_skip_counter = 0;
     if (++forget_skip_counter >= 5) {
         forget_skip_counter = 0;
-        applyForgetting();
+        applyForgetting(pos);
     }
 
     /* For the first frame, clear all unknown around the robot */
@@ -826,12 +826,14 @@ void ProbMap::resetLocalMap() {
     std::fill(raycast_data_.hit_cnt.begin(), raycast_data_.hit_cnt.end(), 0);
 }
 
-void ProbMap::applyForgetting() {
+void ProbMap::applyForgetting(const utils::Vec3f& robot_pos) {
     // forget_threshold_ <= 0 表示禁用衰减
     if (forget_threshold_ <= 0) {
         return;
     }
     double now = utils::get_current_dir_name();
+    // 车周 forget_keep_radius 内不遗忘：近处地面/障碍处于雷达盲区，遗忘后短时间内看不回来
+    const double keep_r2 = cfg_.forget_keep_radius * cfg_.forget_keep_radius;
     size_t cleared = 0;
     for (size_t i = 0; i < occupancy_buffer_.size(); ++i) {
         if (!isOccupied(occupancy_buffer_[i])) {
@@ -842,6 +844,13 @@ void ProbMap::applyForgetting() {
             continue;
         }
         if (now - occ_timestamp_buffer_[i] > forget_threshold_) {
+            if (keep_r2 > 0) {
+                utils::Vec3f p;
+                hashIdToPos(static_cast<int>(i), p);
+                if ((p - robot_pos).head<2>().squaredNorm() < keep_r2) {
+                    continue;
+                }
+            }
             resetCell(static_cast<int>(i));
             occ_timestamp_buffer_[i] = 0;  // 清除时间戳，防止重复检查
             ++cleared;

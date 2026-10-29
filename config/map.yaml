@@ -46,6 +46,10 @@ rog_map:
 
 
   forget_threshold: -1                  # 遗忘阈值(s)，小于等于0表示不进行遗忘衰减。关闭：按时间遗忘会误删被遮挡的静态障碍，改由射线清除动态障碍
+  # 导航模式（planner.yaml mapping_model: false）专用遗忘时间(s)。静态障碍由先验 global map 兜底，
+  # 动态障碍离开视野后 2 s 清掉；建图模式仍用上面的 forget_threshold。
+  nav_forget_threshold: 2.0
+  forget_keep_radius: 1.5               # 车周 1.5 m（水平）内不遗忘：近处处于雷达盲区，遗忘后看不回来
 
   terrain:
       # 3x3 滤波，如果发现台阶边缘 2D 漏检严重，可改为 1 关闭滤波

@@ -108,6 +108,11 @@ public:
 
     void updateProbMap(const PointCloud& cloud, const Pose& pose);
 
+    // 运行时切换遗忘阈值（秒，≤0 禁用）。导航模式开、建图模式关，由 MaMap 按模式设置。
+    void setForgetThreshold(double threshold) {
+        forget_threshold_ = threshold;
+    }
+
 public:
     auto get_esdf_map() -> std::shared_ptr<ESDFMap> {
         return esdf_map_;
@@ -191,6 +196,6 @@ protected:
 
     void resetLocalMap() override;
 
-    void applyForgetting();
+    void applyForgetting(const utils::Vec3f& robot_pos);
 };
 }

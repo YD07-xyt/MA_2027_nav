@@ -88,6 +88,8 @@ public:
     }
     auto set_mapping_model(bool mapping_model) -> void {
         mapping_model_ = mapping_model;
+        // 导航模式：动态障碍离开后 nav_forget_threshold 秒遗忘；建图模式按 forget_threshold（默认关）
+        rog_map_ptr_->setForgetThreshold(mapping_model ? cfg_.forget_threshold : cfg_.nav_forget_threshold);
     }
     auto update_map() -> void {
         if (map_empty_) {
