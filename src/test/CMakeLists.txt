@@ -37,3 +37,14 @@ target_link_libraries(test_astar_vs_jps
     ${OpenCV_LIBS}
     benchmark::benchmark # main 由 test_astar_vs_jps.cpp 提供(先输出对比图,再跑 benchmark)
 )
+
+# 地形分析离线回放（帧文件由 scripts/terrain_replay_extract.py 从 rosbag 导出）
+add_executable(test_terrain_replay src/test_terrain_replay.cpp)
+target_link_libraries(test_terrain_replay PUBLIC
+    spdlog::spdlog
+    utils
+    Eigen3::Eigen
+    3d_occ_map
+    yaml-cpp
+    ${PCL_LIBRARIES}
+)
