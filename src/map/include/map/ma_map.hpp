@@ -27,6 +27,9 @@ public:
         terrain_cfg.overhang_free_voxels = cfg_.terrain_overhang_free_voxels;
         terrain_cfg.overhang_unknown_skip = cfg_.terrain_overhang_unknown_skip;
         terrain_cfg.overhang_ground_radius = cfg_.terrain_overhang_ground_radius;
+        terrain_cfg.obstacle_band = cfg_.terrain_obstacle_band;
+        terrain_cfg.ground_jump_thresh = cfg_.terrain_ground_jump_thresh;
+        terrain_cfg.ground_min_radius = cfg_.terrain_ground_min_radius;
         terrain_cfg.resolution = cfg_.resolution;
         terrain_cfg.map_size_x = cfg_.local_update_box_d.x();
         terrain_cfg.map_size_y = cfg_.local_update_box_d.y();

@@ -326,7 +326,9 @@ void ProbMap::updateProbMap(const PointCloud& cloud, const Pose& pose) {
 
     updateLocalBox(pos);
     utils::TimeConsuming t_raycast("raycast", false);
-    raycastProcess(cloud, pos);
+    // 射线起点放在雷达处：base 贴地，从 base 出发的射线会贴着地面体素层穿过、把车周地面擦掉
+    const utils::Vec3f ray_origin = pos + pose.second * cfg_.sensor_offset;
+    raycastProcess(cloud, ray_origin);
     time_consuming_[1] = t_raycast.stop();
     raycast_data_.batch_update_counter++;
     if (raycast_data_.batch_update_counter >= cfg_.batch_update_size) {

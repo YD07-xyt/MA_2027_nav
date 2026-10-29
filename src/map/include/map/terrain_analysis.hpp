@@ -30,6 +30,9 @@ public:
         int   overhang_free_voxels = 3;      // 下沿正下方至少连续多少个已知空闲体素
         int   overhang_unknown_skip = 1;     // 下沿正下方允许跳过的未知体素数（杆底混合体素）
         int   overhang_ground_radius = 6;    // 悬空列找邻域地面的半径（格）
+        float obstacle_band = 0.08f;         // 高出参考地面多少以内算"贴地"
+        float ground_jump_thresh = 0.10f;    // 本格地面比邻域最低地面高出多少才认为被抬高
+        int   ground_min_radius = 2;         // 邻域最低地面的搜索半径（格）
     };
 
     // 体素状态查询：pos 为体素中心（世界系）。杆下方被射线扫空 → KNOWN_FREE；

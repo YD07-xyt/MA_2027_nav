@@ -195,6 +195,14 @@ public:
             throw std::invalid_argument("Update box size is not 3!");
         }
         local_update_box_d = utils::Vec3f(update_box[0], update_box[1], update_box[2]);
+        // 射线起点 = 机体位姿 + R * sensor_offset（机体系）。输入点云已是世界系，雷达位置只能由外参给出；
+        // 缺省 [0,0,0] 即旧行为（射线从 base 位姿出发）。
+        std::vector<double> sensor_offset_v;
+        loader.LoadParam(name_space + "/raycasting/sensor_offset", sensor_offset_v, std::vector<double> {0, 0, 0});
+        if (sensor_offset_v.size() != 3) {
+            throw std::invalid_argument("Sensor offset size is not 3!");
+        }
+        sensor_offset = utils::Vec3f(sensor_offset_v[0], sensor_offset_v[1], sensor_offset_v[2]);
 
         loader.LoadParam(name_space + "/virtual_ground_height", virtual_ground_height, -0.1);
         loader.LoadParam(name_space + "/virtual_ceil_height", virtual_ceil_height, -0.1);
@@ -208,6 +216,9 @@ public:
         loader.LoadParam(name_space + "/terrain/overhang_free_voxels", terrain_overhang_free_voxels, 3);
         loader.LoadParam(name_space + "/terrain/overhang_unknown_skip", terrain_overhang_unknown_skip, 1);
         loader.LoadParam(name_space + "/terrain/overhang_ground_radius", terrain_overhang_ground_radius, 6);
+        loader.LoadParam(name_space + "/terrain/obstacle_band", terrain_obstacle_band, 0.08f);
+        loader.LoadParam(name_space + "/terrain/ground_jump_thresh", terrain_ground_jump_thresh, 0.10f);
+        loader.LoadParam(name_space + "/terrain/ground_min_radius", terrain_ground_min_radius, 2);
         // 2D 栅格地图边界：原点向 x 左/右、y 左/右各延伸多少米（x ∈ [-x_left, +x_right], y ∈ [-y_left, +y_right]）
         loader.LoadParam(name_space + "/grid_map/x_left", grid_map_x_left, 20.5);
         loader.LoadParam(name_space + "/grid_map/x_right", grid_map_x_right, 20.5);
@@ -367,6 +378,10 @@ public:
     int terrain_overhang_free_voxels{};
     int terrain_overhang_unknown_skip{};
     int terrain_overhang_ground_radius{};
+    float terrain_obstacle_band{};
+    float terrain_ground_jump_thresh{};
+    int terrain_ground_min_radius{};
+    utils::Vec3f sensor_offset {utils::Vec3f::Zero()};
     double grid_map_x_left{20.5};
     double grid_map_x_right{20.5};
     double grid_map_y_left{8.0};

@@ -160,11 +160,11 @@ auto TerrainAnalyzer::analyze(const utils::RobotState &robot_pose,
   // 因此只有台阶边沿一圈会被判成障碍。
 
   // 高出参考地面多少以内算"贴地"（平地、平缓坡）
-  static constexpr float kObstacleBand = 0.08f;
+  const float kObstacleBand = config_.obstacle_band;
   // 本格地面比邻域最低地面高出多少，才认为本格地面被抬高了
-  static constexpr float kGroundJumpThresh = 0.10f;
+  const float kGroundJumpThresh = config_.ground_jump_thresh;
   // 邻域最低地面的搜索半径（格），2 对应 5×5、按 0.05 m 分辨率约 0.25 m
-  static constexpr int kGroundMinRadius = 2;
+  const int kGroundMinRadius = config_.ground_min_radius;
 
   Eigen::ArrayXXf z_ref = Eigen::ArrayXXf::Constant(
       grid.width, grid.height, std::numeric_limits<float>::quiet_NaN());

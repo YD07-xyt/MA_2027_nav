@@ -68,6 +68,10 @@ rog_map:
       overhang_free_voxels: 3          # 下沿正下方至少连续 3 个已知空闲体素（0.15 m）
       overhang_unknown_skip: 1         # 允许跳过 1 个未知体素（杆底混合体素）
       overhang_ground_radius: 6        # 悬空列找邻域地面的半径（格，0.3 m）
+      # 以下三项原为 terrain_analysis.cpp 硬编码常量，值不变
+      obstacle_band: 0.08              # 高出参考地面多少以内算"贴地"(m)
+      ground_jump_thresh: 0.10         # 本格地面比邻域最低地面高出多少才认为被抬高(m)
+      ground_min_radius: 2             # 邻域最低地面搜索半径（格）
 
   # 2D grid map (A* 规划用)。边界按原点向四个方向的延伸量设置：
   # x ∈ [-x_left, +x_right], y ∈ [-y_left, +y_right]，即 x,-x,y,-y
@@ -86,6 +90,10 @@ rog_map:
     local_update_box: [10, 10, 4]      # 局部更新范围(m)
     # The range of raycasting [m]
     ray_range: [0.5, 30]               # 射线范围，根据LiDAR实际探测距离调整
+    # 雷达相对 base_odom 的位置（机体系, m），射线从这里出发。点云已是世界系，雷达位置只能由此给出。
+    # 0.194：rosbag 10_23 中 /lio/odom 与 /lio/base_odom 的高度差（tf_static 写的是 0.15，未核实以哪个为准）。
+    # 设为 [0, 0, 0] 恢复旧行为（射线从 base 出发）。
+    sensor_offset: [0.0, 0.0, 0.194]
 
     # 概率参数
     p_min: 0.12
