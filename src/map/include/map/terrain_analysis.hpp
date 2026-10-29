@@ -1,6 +1,7 @@
 #pragma once
 
 #include "3d_occ_map/rog_map.h"
+#include "map/ground_layer.hpp"
 #include "utils/type_utils.hpp"
 #include <Eigen/Dense>
 #include <cmath>
@@ -43,6 +44,8 @@ public:
     explicit TerrainAnalyzer(const Config& cfg) : config_(cfg) {}
 
     void setConfig(const Config& cfg) { config_ = cfg; }
+    // 持久地面层（可为空）：非空时列内最低体素缺失或高于持久地面的格，以持久地面为准
+    void setGroundLayer(const GroundLayer* ground_layer) { ground_layer_ = ground_layer; }
 
     // 输入 occ_map：世界坐标系下的 3D 占据点云
     // robot_pose：机器人当前位姿（用于确定窗口中心与地面参考高度）
@@ -67,6 +70,7 @@ public:
 
 private:
     Config config_;
+    const GroundLayer* ground_layer_ = nullptr;
 
     // 中值滤波（仅考虑非 NaN 邻居）
     auto medianFilter(const Eigen::ArrayXXf& input, int kernel_size) -> Eigen::ArrayXXf;

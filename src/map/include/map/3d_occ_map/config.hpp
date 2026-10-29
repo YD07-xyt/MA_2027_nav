@@ -219,6 +219,16 @@ public:
         loader.LoadParam(name_space + "/terrain/obstacle_band", terrain_obstacle_band, 0.08f);
         loader.LoadParam(name_space + "/terrain/ground_jump_thresh", terrain_ground_jump_thresh, 0.10f);
         loader.LoadParam(name_space + "/terrain/ground_min_radius", terrain_ground_min_radius, 2);
+        // 持久地面层（阶段 1）与基于它的可达生长判定（阶段 2）
+        loader.LoadParam(name_space + "/terrain/ground_layer/enable", ground_layer_en, false);
+        loader.LoadParam(name_space + "/terrain/ground_layer/size", ground_layer_size, 20.0f);
+        loader.LoadParam(name_space + "/terrain/ground_layer/max_range", ground_layer_max_range, 7.5f);
+        loader.LoadParam(name_space + "/terrain/ground_layer/drop_votes", ground_layer_drop_votes, 2);
+        loader.LoadParam(name_space + "/terrain/ground_layer/rise_votes", ground_layer_rise_votes, 3);
+        loader.LoadParam(name_space + "/terrain/ground_layer/rise_max", ground_layer_rise_max, 0.24f);
+        loader.LoadParam(name_space + "/terrain/ground_layer/footprint_radius", ground_layer_footprint_radius, 0.20f);
+        loader.LoadParam(name_space + "/terrain/ground_layer/footprint_ground_offset", ground_layer_footprint_offset, 0.0f);
+        loader.LoadParam(name_space + "/terrain/ground_layer/seed_radius", ground_layer_seed_radius, 1.5f);
         // 2D 栅格地图边界：原点向 x 左/右、y 左/右各延伸多少米（x ∈ [-x_left, +x_right], y ∈ [-y_left, +y_right]）
         loader.LoadParam(name_space + "/grid_map/x_left", grid_map_x_left, 20.5);
         loader.LoadParam(name_space + "/grid_map/x_right", grid_map_x_right, 20.5);
@@ -382,6 +392,10 @@ public:
     float terrain_ground_jump_thresh{};
     int terrain_ground_min_radius{};
     utils::Vec3f sensor_offset {utils::Vec3f::Zero()};
+    bool ground_layer_en {false};
+    float ground_layer_size {}, ground_layer_max_range {}, ground_layer_rise_max {};
+    int ground_layer_drop_votes {}, ground_layer_rise_votes {};
+    float ground_layer_footprint_radius {}, ground_layer_footprint_offset {}, ground_layer_seed_radius {};
     double grid_map_x_left{20.5};
     double grid_map_x_right{20.5};
     double grid_map_y_left{8.0};

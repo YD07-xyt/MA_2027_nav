@@ -148,6 +148,26 @@ auto TerrainAnalyzer::analyze(const utils::RobotState &robot_pose,
   }
   // =========================================================
 
+  // ================= 持久地面层（阶段 1）=================
+  // ROG 射线会把车周掠射角下的地面体素擦掉，列内最低体素就变成了障碍本身/台面，或者整列为空。
+  // 持久地面层记着这些格以前看到的地面：列内最低高于持久地面（或列为空）时，以持久地面为准。
+  // 只往低处替换，不会把列内更低的真实地面抬高。
+  if (ground_layer_ != nullptr) {
+    const float gres = ground_layer_->config().resolution;
+    for (int gy = 0; gy < grid.height; ++gy) {
+      for (int gx = 0; gx < grid.width; ++gx) {
+        const utils::Vec3f c = gridToWorld(grid, gx, gy);
+        const auto *cell = ground_layer_->cell(static_cast<int>(std::floor(c.x() / gres)),
+                                               static_cast<int>(std::floor(c.y() / gres)));
+        if (cell == nullptr || !(cell->flags & (GroundLayer::OBS | GroundLayer::SEED))) continue;
+        float &g = ground_raw(gx, gy);
+        if (std::isnan(g) || cell->h < g) g = cell->h;
+      }
+    }
+    ground = ground_raw;
+  }
+  // =========================================================
+
   // 5. 中值滤波平滑地面高度（沿坡面连续，坡面靠它保持可通行）
   ground = medianFilter(ground, config_.kernel_size);
 

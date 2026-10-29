@@ -34,6 +34,22 @@ public:
         terrain_cfg.map_size_x = cfg_.local_update_box_d.x();
         terrain_cfg.map_size_y = cfg_.local_update_box_d.y();
         terrain_analyzer_.setConfig(terrain_cfg);
+        if (cfg_.ground_layer_en) {
+            Terrain::GroundLayer::Config gl;
+            gl.resolution = static_cast<float>(cfg_.resolution);
+            gl.size = cfg_.ground_layer_size;
+            gl.min_range = static_cast<float>(cfg_.raycast_range_min);
+            gl.max_range = cfg_.ground_layer_max_range;
+            gl.drop_votes = cfg_.ground_layer_drop_votes;
+            gl.rise_votes = cfg_.ground_layer_rise_votes;
+            gl.rise_max = cfg_.ground_layer_rise_max;
+            gl.footprint_radius = cfg_.ground_layer_footprint_radius;
+            gl.footprint_ground_offset = cfg_.ground_layer_footprint_offset;
+            gl.seed_radius = cfg_.ground_layer_seed_radius;
+            gl.float_free_voxels = cfg_.terrain_overhang_free_voxels;
+            ground_layer_.setConfig(gl);
+            terrain_analyzer_.setGroundLayer(&ground_layer_);
+        }
         grid_map_ptr_->init(
             cfg_.grid_map_x_left,
             cfg_.grid_map_x_right,
@@ -97,6 +113,13 @@ public:
         updete_lock.unlock();
 
         rog_map_ptr_->updateProbMap(temp_pc, temp_pose);
+        if (cfg_.ground_layer_en) {
+            // 用原始点云更新持久地面层（ROG 更新之后，悬空判据要用本帧射线结果）
+            const utils::Vec3f sensor = temp_pose.first + temp_pose.second * cfg_.sensor_offset;
+            ground_layer_.update(temp_pc, temp_pose, sensor, [this](const utils::Vec3f& pos) {
+                return rog_map_ptr_->getGridType(pos);
+            });
+        }
         update_terrain();
         if(!mapping_model_){
             // 导航模式：动态层每帧重建，静态信息来自先验 global_2d_occ_
@@ -250,6 +273,7 @@ private:
     mutable std::mutex front_mtx_;
     std::shared_ptr<rog_map::ROGMap> rog_map_ptr_;
     Terrain::TerrainAnalyzer terrain_analyzer_;
+    Terrain::GroundLayer ground_layer_;
     rog_map::Config cfg_;
     bool map_empty_ = true;
     int unfinished_frame_cnt {0};
