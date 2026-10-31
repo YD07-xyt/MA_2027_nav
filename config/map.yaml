@@ -87,6 +87,12 @@ rog_map:
         footprint_radius: 0.20         # 车走过的格按 base 高度记为地面(m)
         footprint_ground_offset: 0.0   # base_odom 到脚底的高度(m)，未核实，先取 0
         seed_radius: 1.5               # 启动时车周盲区按 base 平面给低置信地面(m)
+        # 姿态跳变门控：机体 z 轴相邻帧转角 > tilt_jump_deg(度) 时，本帧及其后 tilt_hold_frames 帧
+        # 点云配准不可信（压过凸起/上下坡瞬间），不更新地面层，避免平地被记成低洼坑。0 关闭
+        # 仿真 10Hz：正常行驶帧间转角 p90 0.4°，跳变帧 2.5~12°
+        tilt_jump_deg: 2.0
+        tilt_hold_frames: 2
+        drop_min_support: 2            # 地面下降需至少几个 8 邻格高度一致才生效（挡孤立坑），0 关闭
       # ---- 可达生长：以持久地面判上下沿/陡坡，只有从车所在格可达的地面给空闲证据（需 ground_layer）----
       reach:
         enable: true

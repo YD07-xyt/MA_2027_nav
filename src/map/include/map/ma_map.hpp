@@ -53,6 +53,9 @@ public:
             gl.footprint_ground_offset = cfg_.ground_layer_footprint_offset;
             gl.seed_radius = cfg_.ground_layer_seed_radius;
             gl.float_free_voxels = cfg_.terrain_overhang_free_voxels;
+            gl.tilt_jump_deg = cfg_.ground_layer_tilt_jump_deg;
+            gl.tilt_hold_frames = cfg_.ground_layer_tilt_hold_frames;
+            gl.drop_min_support = cfg_.ground_layer_drop_min_support;
             ground_layer_.setConfig(gl);
             terrain_analyzer_.setGroundLayer(&ground_layer_);
         }

@@ -104,6 +104,27 @@ void GroundLayer::update(
         seeded_ = true;
     }
 
+    // 0) 姿态跳变门控：机体 z 轴帧间转角过大时，点云与位姿多半没对齐（压过凸起/台阶瞬间），
+    //    错配的远处地面会被记成低洼坑，坑沿再被判成上沿障碍。本帧及其后几帧只更新足迹。
+    {
+        const utils::Vec3f up = base_pose.second * utils::Vec3f::UnitZ();
+        if (has_last_up_ && cfg_.tilt_jump_deg > 0.0f) {
+            const float c = std::clamp(static_cast<float>(up.dot(last_up_)), -1.0f, 1.0f);
+            const float deg = std::acos(c) * 180.0f / static_cast<float>(M_PI);
+            if (deg > cfg_.tilt_jump_deg) {
+                tilt_hold_ = cfg_.tilt_hold_frames + 1;
+            }
+        }
+        last_up_ = up;
+        has_last_up_ = true;
+        last_gated_ = tilt_hold_ > 0;
+        if (tilt_hold_ > 0) {
+            --tilt_hold_;
+            seedDisk(base_pose, cfg_.footprint_radius, true);
+            return;
+        }
+    }
+
     // 1) 每格本帧最低点
     touched_.clear();
     for (const auto& p: cloud) {
@@ -138,6 +159,7 @@ void GroundLayer::update(
     }
 
     // 2) 量测融合：方差加权，易降难升
+    drop_cand_.clear();
     for (const int idx: touched_) {
         const Scratch& s = scratch_[idx];
         const float z = s.m1;
@@ -185,9 +207,14 @@ void GroundLayer::update(
                 }
                 c.up = 0;
                 if (c.down >= cfg_.drop_votes) {
-                    c.h = c.vote_h;
-                    c.var = var_m;
-                    c.down = 0;
+                    c.down = static_cast<int8_t>(cfg_.drop_votes);  // 封顶，待邻域确认期间不溢出
+                    if (cfg_.drop_min_support > 0) {
+                        drop_cand_.push_back({s.kx, s.ky, var_m});  // 本帧结束后做邻域一致性确认
+                    } else {
+                        c.h = c.vote_h;
+                        c.var = var_m;
+                        c.down = 0;
+                    }
                 }
             } else {
                 if (d > cfg_.rise_max) {
@@ -210,6 +237,43 @@ void GroundLayer::update(
         }
         c.last_hit = frame_;
         c.ub = kInf;  // 有量测的格以量测为准，上界只对未观测格有意义
+    }
+
+    // 2b) 下降的空间一致性：真实的下降（下坡、台阶下沿、移走的物体）总是成片出现，
+    //     孤立单格下降多为远处噪声或错配，确认前保留原高度与投票，后续帧继续投票。
+    //     先统一判定再统一写入，判定只看本帧写入前的状态。
+    if (!drop_cand_.empty()) {
+        const float tol = 2.0f * cfg_.gate_min;
+        drop_ok_.assign(drop_cand_.size(), 0);
+        for (size_t i = 0; i < drop_cand_.size(); ++i) {
+            const auto& dc = drop_cand_[i];
+            const Cell* c = cell(dc.kx, dc.ky);
+            int support = 0;
+            for (int dx = -1; dx <= 1 && support < cfg_.drop_min_support; ++dx) {
+                for (int dy = -1; dy <= 1; ++dy) {
+                    if (dx == 0 && dy == 0) {
+                        continue;
+                    }
+                    const Cell* n = cell(dc.kx + dx, dc.ky + dy);
+                    if (n == nullptr || !(n->flags & (OBS | SEED))) {
+                        continue;
+                    }
+                    if (std::fabs(n->h - c->vote_h) <= tol || (n->down > 0 && std::fabs(n->vote_h - c->vote_h) <= tol)) {
+                        ++support;
+                    }
+                }
+            }
+            drop_ok_[i] = support >= cfg_.drop_min_support;
+        }
+        for (size_t i = 0; i < drop_cand_.size(); ++i) {
+            if (!drop_ok_[i]) {
+                continue;
+            }
+            Cell& c = slot(drop_cand_[i].kx, drop_cand_[i].ky);
+            c.h = c.vote_h;
+            c.var = drop_cand_[i].var;
+            c.down = 0;
+        }
     }
 
     // 3) 射线上界：下行射线经过的格，地面不可能高于射线

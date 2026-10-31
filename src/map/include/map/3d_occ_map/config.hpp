@@ -231,6 +231,9 @@ public:
         loader.LoadParam(name_space + "/terrain/ground_layer/footprint_radius", ground_layer_footprint_radius, 0.20f);
         loader.LoadParam(name_space + "/terrain/ground_layer/footprint_ground_offset", ground_layer_footprint_offset, 0.0f);
         loader.LoadParam(name_space + "/terrain/ground_layer/seed_radius", ground_layer_seed_radius, 1.5f);
+        loader.LoadParam(name_space + "/terrain/ground_layer/tilt_jump_deg", ground_layer_tilt_jump_deg, 2.0f);
+        loader.LoadParam(name_space + "/terrain/ground_layer/tilt_hold_frames", ground_layer_tilt_hold_frames, 2);
+        loader.LoadParam(name_space + "/terrain/ground_layer/drop_min_support", ground_layer_drop_min_support, 2);
         loader.LoadParam(name_space + "/terrain/reach/enable", terrain_reach_en, false);
         loader.LoadParam(name_space + "/terrain/reach/max_slope_deg", terrain_max_slope_deg, 25.0f);
         loader.LoadParam(name_space + "/terrain/reach/step_tol", terrain_reach_step_tol, 0.03f);
@@ -408,6 +411,8 @@ public:
     float ground_layer_size {}, ground_layer_max_range {}, ground_layer_rise_max {};
     int ground_layer_drop_votes {}, ground_layer_rise_votes {};
     float ground_layer_footprint_radius {}, ground_layer_footprint_offset {}, ground_layer_seed_radius {};
+    float ground_layer_tilt_jump_deg {};
+    int ground_layer_tilt_hold_frames {}, ground_layer_drop_min_support {};
     double grid_map_x_left{20.5};
     double grid_map_x_right{20.5};
     double grid_map_y_left{8.0};

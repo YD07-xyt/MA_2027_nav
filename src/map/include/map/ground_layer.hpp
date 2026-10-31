@@ -40,6 +40,13 @@ public:
         float ub_end_margin = 0.3f;      // 射线末端多少米内不算上界（掠射噪声）
         float ub_margin = 0.05f;         // ub 低于地面多少才算矛盾
         int   ub_stale_frames = 5;       // 地面最近这么多帧内被命中过则不因 ub 撤销
+        // 姿态跳变门控：机体 z 轴相邻帧夹角超过此值（度）时，本帧及其后 tilt_hold_frames 帧
+        // 点云配准不可信，不做量测融合与射线上界（只更新足迹）。0 关闭
+        float tilt_jump_deg = 2.0f;
+        int   tilt_hold_frames = 2;
+        // 下降空间一致性：投票达标的下降，需要至少这么多个 8 邻格支持（邻格地面或其待降高度
+        // 与新高度相差不超过 2*gate_min），否则暂不下降（孤立坑多为噪声/错配）。0 关闭
+        int   drop_min_support = 2;
     };
 
     enum Flag : uint8_t {
@@ -99,6 +106,24 @@ private:
     std::vector<Cell> cells_;
     std::vector<Scratch> scratch_;
     std::vector<int> touched_;
+    struct DropCand {
+        int kx, ky;
+        float var;
+    };
+    std::vector<DropCand> drop_cand_;  // 本帧投票达标、待邻域确认的下降格
+    std::vector<char> drop_ok_;
+    utils::Vec3f last_up_ {0, 0, 0};
+    bool has_last_up_ = false;
+    int tilt_hold_ = 0;
+
+public:
+    // 最近一帧是否因姿态跳变被门控（诊断用）
+    auto last_frame_gated() const -> bool {
+        return last_gated_;
+    }
+
+private:
+    bool last_gated_ = false;
 };
 
 }  // namespace Terrain
