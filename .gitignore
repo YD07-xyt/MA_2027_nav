@@ -9,3 +9,7 @@ log
 rosbag
 images/output/*.csv
 images/output/*.json
+images/output/post_processing/*.csv
+images/output/post_processing/*.json
+images/output/traj_optimize/*.csv
+images/output/traj_optimize/*.json

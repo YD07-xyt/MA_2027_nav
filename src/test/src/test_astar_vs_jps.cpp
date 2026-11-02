@@ -14,6 +14,7 @@
  */
 
 #include "cv2map.hpp"
+#include "cv_show.hpp"
 #include "path_planning/search/astar.h"
 #include "path_planning/search/jps.h"
 #include "utils/logger.hpp"
@@ -55,8 +56,10 @@ const std::string kImageDir = std::string(ROOT_DIR) + "images/";
 const std::string kOutputDir = kImageDir + "output/";
 const std::vector<std::string> kMapNames = {"rmuc2024", "rmuc2025"};
 
-const cv::Scalar kColorAStar(40, 40, 230); // BGR 红
-const cv::Scalar kColorJps(230, 120, 20);  // BGR 蓝
+namespace viz = test_utils::viz;
+using viz::strf;
+const cv::Scalar kColorAStar = viz::kRed;
+const cv::Scalar kColorJps = viz::kBlue;
 
 struct Query {
     Eigen::Vector2d start;
@@ -117,12 +120,6 @@ auto mean_of(const std::vector<RunResult>& rs, double RunResult::*field) -> doub
     return n > 0 ? sum / n : std::nan("");
 }
 
-auto strf(const char* f, double v) -> std::string {
-    char buf[64];
-    std::snprintf(buf, sizeof(buf), f, v);
-    return buf;
-}
-
 // 采样起终点:自由栅格(ESDF 留出一格余量)、直线距离足够远、JPS 可达。
 auto sample_queries(Case& c, std::mt19937& rng) -> std::vector<Query> {
     const auto& m = *c.map;
@@ -150,48 +147,29 @@ auto sample_queries(Case& c, std::mt19937& rng) -> std::vector<Query> {
 
 // ---------------- 绘图 ----------------
 
-auto draw_path(cv::Mat& img, const test_utils::Cv2Map& m, const std::vector<Eigen::Vector2d>& path,
-               const cv::Scalar& color, int thickness, bool mark_waypoints) -> void {
-    std::vector<cv::Point> pts;
-    pts.reserve(path.size());
-    for (const auto& p: path) pts.push_back(m.world_to_pixel(p, kDrawScale));
-    if (pts.size() >= 2) cv::polylines(img, pts, false, color, thickness, cv::LINE_AA);
-    if (mark_waypoints) {
-        for (const auto& pt: pts) cv::circle(img, pt, thickness + 2, color, 1, cv::LINE_AA);
-    }
-}
-
-auto draw_label(cv::Mat& img, const std::string& text, cv::Point org, const cv::Scalar& color) -> void {
-    int base = 0;
-    const auto sz = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &base);
-    cv::rectangle(img, org + cv::Point(-3, -sz.height - 4), org + cv::Point(sz.width + 3, base + 2),
-                  cv::Scalar(255, 255, 255), cv::FILLED);
-    cv::putText(img, text, org, cv::FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv::LINE_AA);
-}
-
 auto draw_query_panel(const Case& c, size_t qi) -> cv::Mat {
     const auto& m = *c.map;
-    cv::Mat img;
-    cv::resize(m.color(), img, cv::Size(), kDrawScale, kDrawScale, cv::INTER_NEAREST);
+    cv::Mat img = viz::base_image(m, kDrawScale);
 
     const auto& a = c.astar_res[qi];
     const auto& j = c.jps_res[qi];
-    draw_path(img, m, a.path, kColorAStar, 4, false);
-    draw_path(img, m, j.path, kColorJps, 2, true);
+    viz::draw_path(img, m, a.path, kColorAStar, 4, false, kDrawScale);
+    viz::draw_path(img, m, j.path, kColorJps, 2, true, kDrawScale);
 
     const auto& q = c.queries[qi];
-    cv::circle(img, m.world_to_pixel(q.start, kDrawScale), 7, cv::Scalar(0, 180, 0), cv::FILLED, cv::LINE_AA);
-    cv::circle(img, m.world_to_pixel(q.goal, kDrawScale), 7, cv::Scalar(200, 0, 200), cv::FILLED, cv::LINE_AA);
+    viz::draw_start_goal(img, m, q.start, q.goal, kDrawScale);
 
-    draw_label(img, c.name + "  query #" + std::to_string(qi) + "  (green=start, magenta=goal)", {8, 20},
-               cv::Scalar(0, 0, 0));
-    draw_label(img,
-               "A*  : " + (a.ok ? strf("%.3f ms", a.time_ms) + "  len " + strf("%.2f m", a.length) : std::string("FAIL")),
-               {8, 42}, kColorAStar);
-    draw_label(img,
-               "JPS : " + (j.ok ? strf("%.3f ms", j.time_ms) + "  len " + strf("%.2f m", j.length) : std::string("FAIL")),
-               {8, 64}, kColorJps);
-    cv::rectangle(img, {0, 0}, {img.cols - 1, img.rows - 1}, cv::Scalar(120, 120, 120), 2);
+    viz::draw_label(img, c.name + "  query #" + std::to_string(qi) + "  (green=start, magenta=goal)", {8, 20},
+                    viz::kBlack);
+    viz::draw_label(img,
+                    "A*  : " + (a.ok ? strf("%.3f ms", a.time_ms) + "  len " + strf("%.2f m", a.length)
+                                     : std::string("FAIL")),
+                    {8, 42}, kColorAStar);
+    viz::draw_label(img,
+                    "JPS : " + (j.ok ? strf("%.3f ms", j.time_ms) + "  len " + strf("%.2f m", j.length)
+                                     : std::string("FAIL")),
+                    {8, 64}, kColorJps);
+    viz::draw_frame(img);
     return img;
 }
 
@@ -206,116 +184,13 @@ auto draw_paths_mosaic(const Case& c) -> cv::Mat {
 
     std::vector<cv::Mat> panels;
     for (size_t i: idx) panels.push_back(draw_query_panel(c, i));
-    if (panels.empty()) return {};
-    while (panels.size() < 4) panels.push_back(cv::Mat(panels[0].size(), panels[0].type(), cv::Scalar(255, 255, 255)));
-
-    cv::Mat top, bottom, out;
-    cv::hconcat(panels[0], panels[1], top);
-    cv::hconcat(panels[2], panels[3], bottom);
-    cv::vconcat(top, bottom, out);
-    return out;
-}
-
-// 分组柱状图:每组两根柱(A* / JPS)。值 <=0 或 NaN 视为失败,画 "x"。
-auto draw_grouped_bars(const std::string& title, const std::vector<std::string>& labels, const std::vector<double>& a,
-                       const std::vector<double>& b, bool log_scale, const std::string& y_unit, int width, int height,
-                       bool annotate) -> cv::Mat {
-    cv::Mat img(height, width, CV_8UC3, cv::Scalar(255, 255, 255));
-    const int left = 90, right = 30, top = 70, bottom = 60;
-    const int pw = width - left - right;
-    const int ph = height - top - bottom;
-
-    auto valid = [](double v) { return std::isfinite(v) && v > 0.0; };
-    double vmin = std::numeric_limits<double>::max(), vmax = 0.0;
-    for (const auto* s: {&a, &b}) {
-        for (double v: *s) {
-            if (!valid(v)) continue;
-            vmin = std::min(vmin, v);
-            vmax = std::max(vmax, v);
-        }
-    }
-    if (vmax <= 0.0) vmin = vmax = 1.0;
-
-    double lo, hi;
-    if (log_scale) {
-        lo = std::floor(std::log10(vmin));
-        hi = std::ceil(std::log10(vmax));
-        if (hi <= lo) hi = lo + 1.0;
-    } else {
-        lo = 0.0;
-        hi = vmax * 1.15;
-    }
-    auto to_y = [&](double v) {
-        const double t = log_scale ? (std::log10(v) - lo) / (hi - lo) : (v - lo) / (hi - lo);
-        return top + ph - static_cast<int>(std::lround(std::clamp(t, 0.0, 1.0) * ph));
-    };
-
-    // 网格与纵轴刻度
-    std::vector<double> ticks;
-    if (log_scale) {
-        for (double e = lo; e <= hi + 1e-9; e += 1.0) ticks.push_back(std::pow(10.0, e));
-    } else {
-        for (int i = 0; i <= 5; ++i) ticks.push_back(hi * i / 5.0);
-    }
-    for (double t: ticks) {
-        const int y = log_scale ? to_y(t) : to_y(std::max(t, 1e-12));
-        cv::line(img, {left, y}, {left + pw, y}, cv::Scalar(225, 225, 225), 1);
-        const std::string s = (t >= 1.0 || t == 0.0) ? strf("%g", t) : strf("%.0e", t);
-        cv::putText(img, s, {8, y + 5}, cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(60, 60, 60), 1, cv::LINE_AA);
-    }
-    cv::line(img, {left, top}, {left, top + ph}, cv::Scalar(0, 0, 0), 1);
-    cv::line(img, {left, top + ph}, {left + pw, top + ph}, cv::Scalar(0, 0, 0), 1);
-    cv::putText(img, y_unit + (log_scale ? " (log)" : ""), {8, top - 12}, cv::FONT_HERSHEY_SIMPLEX, 0.45,
-                cv::Scalar(60, 60, 60), 1, cv::LINE_AA);
-
-    // 柱
-    const int n = static_cast<int>(labels.size());
-    const double group_w = n > 0 ? static_cast<double>(pw) / n : pw;
-    const int bar_w = std::max(2, static_cast<int>(group_w * 0.35));
-    for (int i = 0; i < n; ++i) {
-        const int cx = left + static_cast<int>(group_w * (i + 0.5));
-        const double vals[2] = {i < static_cast<int>(a.size()) ? a[i] : NAN, i < static_cast<int>(b.size()) ? b[i] : NAN};
-        const cv::Scalar colors[2] = {kColorAStar, kColorJps};
-        for (int k = 0; k < 2; ++k) {
-            const int x0 = (k == 0) ? cx - bar_w : cx;
-            if (!valid(vals[k])) {
-                cv::putText(img, "x", {x0 + bar_w / 2 - 4, top + ph - 4}, cv::FONT_HERSHEY_SIMPLEX, 0.5, colors[k], 1);
-                continue;
-            }
-            const int y = to_y(vals[k]);
-            cv::rectangle(img, {x0, y}, {x0 + bar_w - 1, top + ph}, colors[k], cv::FILLED);
-            if (annotate) {
-                const std::string s = vals[k] >= 1.0 ? strf("%.2f", vals[k]) : strf("%.3f", vals[k]);
-                cv::putText(img, s, {x0, y - 5}, cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(30, 30, 30), 1, cv::LINE_AA);
-            }
-        }
-        int base = 0;
-        const auto sz = cv::getTextSize(labels[i], cv::FONT_HERSHEY_SIMPLEX, 0.45, 1, &base);
-        cv::putText(img, labels[i], {cx - sz.width / 2, top + ph + 20}, cv::FONT_HERSHEY_SIMPLEX, 0.45,
-                    cv::Scalar(30, 30, 30), 1, cv::LINE_AA);
-    }
-
-    // 标题与图例
-    cv::putText(img, title, {left, 28}, cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 0, 0), 1, cv::LINE_AA);
-    const int lx = width - right - 170;
-    cv::rectangle(img, {lx, 40}, {lx + 14, 52}, kColorAStar, cv::FILLED);
-    cv::putText(img, "A*", {lx + 20, 52}, cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 1, cv::LINE_AA);
-    cv::rectangle(img, {lx + 70, 40}, {lx + 84, 52}, kColorJps, cv::FILLED);
-    cv::putText(img, "JPS", {lx + 90, 52}, cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 1, cv::LINE_AA);
-    return img;
+    return viz::mosaic_2x2(std::move(panels));
 }
 
 auto to_series(const std::vector<RunResult>& rs, double RunResult::*field) -> std::vector<double> {
     std::vector<double> v;
     for (const auto& r: rs) v.push_back(r.ok ? r.*field : NAN);
     return v;
-}
-
-auto save(const std::string& file, const cv::Mat& img) -> void {
-    if (img.empty()) return;
-    const std::string path = kOutputDir + file;
-    if (cv::imwrite(path, img)) std::printf("  saved %s\n", path.c_str());
-    else std::printf("  FAILED to save %s\n", path.c_str());
 }
 
 // ---------------- 对比运行 ----------------
@@ -413,17 +288,19 @@ int main(int argc, char** argv) {
         run_case(*c);
         print_summary(*c);
 
-        save(c->name + "_paths.png", draw_paths_mosaic(*c));
+        viz::save(kOutputDir, c->name + "_paths.png", draw_paths_mosaic(*c));
 
         std::vector<std::string> qlabels;
         for (size_t i = 0; i < c->queries.size(); ++i) qlabels.push_back(std::to_string(i));
         const double at = mean_of(c->astar_res, &RunResult::time_ms);
         const double jt = mean_of(c->jps_res, &RunResult::time_ms);
-        save(c->name + "_time.png",
-             draw_grouped_bars(c->name + " planning time per query   mean A* " + strf("%.3f", at) + " ms, JPS "
+        viz::save(kOutputDir, c->name + "_time.png",
+             viz::draw_grouped_bars(c->name + " planning time per query   mean A* " + strf("%.3f", at) + " ms, JPS "
                                    + strf("%.3f", jt) + " ms, speedup " + strf("%.1fx", at / jt),
-                               qlabels, to_series(c->astar_res, &RunResult::time_ms),
-                               to_series(c->jps_res, &RunResult::time_ms), true, "ms", 1200, 520, false));
+                               qlabels,
+                               {{"A*", kColorAStar, to_series(c->astar_res, &RunResult::time_ms)},
+                                {"JPS", kColorJps, to_series(c->jps_res, &RunResult::time_ms)}},
+                               true, "ms", 1200, 520, false));
 
         map_labels.push_back(c->name);
         sum_at.push_back(at);
@@ -433,12 +310,14 @@ int main(int argc, char** argv) {
     }
 
     const cv::Mat time_chart =
-        draw_grouped_bars("Mean planning time", map_labels, sum_at, sum_jt, true, "ms", 600, 450, true);
+        viz::draw_grouped_bars("Mean planning time", map_labels,
+                               {{"A*", kColorAStar, sum_at}, {"JPS", kColorJps, sum_jt}}, true, "ms", 600, 450, true);
     const cv::Mat len_chart =
-        draw_grouped_bars("Mean path length", map_labels, sum_al, sum_jl, false, "m", 600, 450, true);
+        viz::draw_grouped_bars("Mean path length", map_labels,
+                               {{"A*", kColorAStar, sum_al}, {"JPS", kColorJps, sum_jl}}, false, "m", 600, 450, true);
     cv::Mat summary;
     cv::hconcat(time_chart, len_chart, summary);
-    save("summary.png", summary);
+    viz::save(kOutputDir, "summary.png", summary);
     write_csv(cases);
 
     // ---- Google Benchmark ----
