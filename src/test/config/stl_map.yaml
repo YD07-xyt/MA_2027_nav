@@ -1,0 +1,59 @@
+# test_stl_to_map 专用配置：STL 场地 -> ROG 3D 占据 -> 2D 占据 -> 2D ESDF。
+# 与 config/map.yaml 的区别：固定原点、不滑窗，3D/2D 范围盖住整个 RMUC 场地；关闭 3D ESDF 与 ROS 回调。
+
+stl_test:
+  ground_to_zero: true          # 把 STL 最低点平移到 z = 0（x/y 不动）
+  sample_step: 0.0125           # 三角面采样间距(m)，取 3D 分辨率的 1/4，保证面经过的体素不漏
+  fill_solid: true              # 按法向奇偶填充实体内部；关闭则只插入表面体素
+  max_ground_height: 1.0        # 地面高度上限(m)：最低可站立面高于此值的列判障碍
+
+rog_map:
+  resolution: 0.05
+  inflation_resolution: 0.1
+  inflation_step: 1
+  unk_inflation_en: false
+  # 场地平移后约 x ∈ [-9.9, 18.1]、y ∈ [-3.7, 12.3]、z ∈ [0, 3.8]
+  map_size: [31, 19, 5]
+  fix_map_origin: [4.1, 4.3, 2.0]
+  frontier_extraction_en: false
+  virtual_ceil_height: 4.5
+  virtual_ground_height: -0.3
+  load_pcd_en: false
+
+  ros_callback:
+    enable: false
+
+  map_sliding:
+    enable: false
+
+  esdf:
+    enable: false               # 不生成 3D ESDF
+
+  visualization:
+    enable: false
+    range: [0, 0, 0]
+
+  intensity_thresh: -1
+  point_filt_num: 1
+  forget_threshold: -1
+
+  terrain:
+    max_step_height: 0.05       # 相邻格地面高差超过此值判障碍(m)
+    robot_height: 0.24          # 地面以上需要的净空(m)
+
+  grid_map:                     # x ∈ [-x_left, x_right], y ∈ [-y_left, y_right]
+    x_left: 10.5
+    x_right: 18.5
+    y_left: 4.5
+    y_right: 13.0
+    resolution: 0.05
+
+  raycasting:
+    enable: false
+    p_min: 0.12
+    p_miss: 0.45
+    p_free: 0.499
+    p_occ: 0.85
+    p_hit: 0.8
+    p_max: 0.93
+    unk_thresh: 1.0
