@@ -68,6 +68,7 @@ graph LR
 
 **建模**：体素 $\mathbf{x}$ 的对数几率 $L(\mathbf{x})$，$\operatorname{logit}(p)=\ln\frac{p}{1-p}$。
 
+
 $$
 L \leftarrow \operatorname{clamp}\!\big(L + n_{hit}\,l_{hit} \text{ 或 } n_{miss}\,l_{miss},\ l_{min},\ l_{max}\big),\quad
 l_{\ast}=\operatorname{logit}(p_{\ast})

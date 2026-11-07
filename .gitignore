@@ -13,3 +13,6 @@ images/output/post_processing/*.csv
 images/output/post_processing/*.json
 images/output/traj_optimize/*.csv
 images/output/traj_optimize/*.json
+docs/架构图
+.dsh
+.ocr_tmp
