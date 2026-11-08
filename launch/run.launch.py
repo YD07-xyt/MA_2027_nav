@@ -33,17 +33,17 @@ def generate_launch_description():
     )
     
     # 启动 RViz2 可视化
-    # rviz_config = os.path.join(pkg_share, 'config', 'nav.rviz')
-    # rviz_node = Node(
-    #     package='rviz2',
-    #     executable='rviz2',
-    #     name='rviz2',
-    #     arguments=['-d', rviz_config],
-    #     output='screen'
-    # )
+    rviz_config = os.path.join(pkg_share, 'config', 'nav.rviz')
+    rviz_node = Node(
+        package='rviz2',
+        executable='rviz2',
+        name='rviz2',
+        arguments=['-d', rviz_config],
+        output='screen'
+    )
     
     return LaunchDescription([
         params_file_arg,
         ma_nav_node,
-        # rviz_node,  
+        rviz_node,  
     ])

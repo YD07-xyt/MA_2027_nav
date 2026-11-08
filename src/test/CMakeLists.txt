@@ -6,17 +6,8 @@ file(GLOB_RECURSE sources CONFIGURE_DEPENDS "src/*.cpp")
 
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs)
 
-include(FetchContent)
-
-FetchContent_Declare(
-  benchmark
-  GIT_REPOSITORY https://github.com/google/benchmark.git
-  GIT_TAG        v1.8.3 # 建议指定稳定版本
-)
-
-# 关键：关闭 benchmark 自身的测试，可大幅减少构建时间
-set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE) 
-FetchContent_MakeAvailable(benchmark)
+# 使用系统/环境已安装的 Google Benchmark（需提前安装，见下方说明）
+find_package(benchmark CONFIG REQUIRED)
 
 add_executable(test_astar_vs_jps  src/test_astar_vs_jps.cpp)
 target_include_directories(test_astar_vs_jps PUBLIC include ${OpenCV_INCLUDE_DIRS})

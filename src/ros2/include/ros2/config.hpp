@@ -308,7 +308,6 @@ struct Config {
     std::string tunnel_regions_path;
     std::string save_tunnel_regions_srv_topic;
 
-    bool is_minco;
     bool mapping_model; // true: 建图模式，false: 规划模式
     std::string map_params_path;
     std::string global_map_path;
@@ -333,7 +332,7 @@ struct Config {
             save_map_srv_topic = config["ros2"]["save_map_srv_topic"].as<std::string>();
             tunnel_regions_path = config["ros2"]["tunnel_regions_path"].as<std::string>();
             save_tunnel_regions_srv_topic = config["ros2"]["save_tunnel_regions_srv_topic"].as<std::string>();
-            is_minco = config["ros2"]["is_minco"].as<bool>();
+
         }
 
         if (config["map"]) {
