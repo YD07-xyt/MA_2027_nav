@@ -1,0 +1,121 @@
+{
+  "schema": 1,
+  "revision": "3aac661b64f7c3d928ef2611001f5be9ce1efb0d",
+  "reason": "首次迁移：登记3aac661b版本现有启发式边界问题；仅约束新增问题，语法与格式不豁免",
+  "entries": {
+    "heavy-public-header:src/map/include/map/3d_occ_map/common_lib.hpp:e195356e6a7a43d0": 1,
+    "heavy-public-header:src/map/include/map/3d_occ_map/common_lib.hpp:697e302cad53908e": 1,
+    "heavy-public-header:src/map/include/map/3d_occ_map/config.hpp:7a283fc8a5c036d4": 1,
+    "heavy-public-header:src/map/include/map/3d_occ_map/esdf_map.h:7a283fc8a5c036d4": 1,
+    "heavy-public-header:src/map/include/map/3d_occ_map/esdf_map.h:e195356e6a7a43d0": 1,
+    "heavy-public-header:src/planner/controller/include/controller/mpc.h:4c895300141d466d": 1,
+    "eigen-auto-expression:src/planner/traj_optimize/include/traj_optimize/ma_spline_opt/SplineTrajectory/SplineOptimizer.hpp:db9fc9322e9c2cae": 1,
+    "eigen-auto-expression:src/planner/traj_optimize/include/traj_optimize/spline_opt/SplineTrajectory/SplineOptimizer.hpp:5c5ce1a86464e06a": 1,
+    "eigen-auto-expression:src/planner/traj_optimize/include/traj_optimize/spline_opt/SplineTrajectory/SplineOptimizer.hpp:ce5bca1858720f25": 1,
+    "heavy-public-header:src/test/include/cv2map.hpp:1dcd65822672ab06": 1,
+    "heavy-public-header:src/test/include/cv2map.hpp:8a2bdee18fb2a604": 1,
+    "heavy-public-header:src/test/include/cv2map.hpp:2e5d601fe6087ce1": 1,
+    "heavy-public-header:src/test/include/cv_show.hpp:8a2bdee18fb2a604": 1,
+    "heavy-public-header:src/test/include/cv_show.hpp:2e5d601fe6087ce1": 1
+  },
+  "findings": [
+    {
+      "key": "heavy-public-header:src/map/include/map/3d_occ_map/common_lib.hpp:e195356e6a7a43d0",
+      "rule": "heavy-public-header",
+      "path": "src/map/include/map/3d_occ_map/common_lib.hpp",
+      "line": 27,
+      "code": "#include <pcl/point_cloud.h>"
+    },
+    {
+      "key": "heavy-public-header:src/map/include/map/3d_occ_map/common_lib.hpp:697e302cad53908e",
+      "rule": "heavy-public-header",
+      "path": "src/map/include/map/3d_occ_map/common_lib.hpp",
+      "line": 28,
+      "code": "#include <pcl/point_types.h>"
+    },
+    {
+      "key": "heavy-public-header:src/map/include/map/3d_occ_map/config.hpp:7a283fc8a5c036d4",
+      "rule": "heavy-public-header",
+      "path": "src/map/include/map/3d_occ_map/config.hpp",
+      "line": 26,
+      "code": "#include <pcl/impl/point_types.hpp>"
+    },
+    {
+      "key": "heavy-public-header:src/map/include/map/3d_occ_map/esdf_map.h:7a283fc8a5c036d4",
+      "rule": "heavy-public-header",
+      "path": "src/map/include/map/3d_occ_map/esdf_map.h",
+      "line": 28,
+      "code": "#include <pcl/impl/point_types.hpp>"
+    },
+    {
+      "key": "heavy-public-header:src/map/include/map/3d_occ_map/esdf_map.h:e195356e6a7a43d0",
+      "rule": "heavy-public-header",
+      "path": "src/map/include/map/3d_occ_map/esdf_map.h",
+      "line": 29,
+      "code": "#include <pcl/point_cloud.h>"
+    },
+    {
+      "key": "heavy-public-header:src/planner/controller/include/controller/mpc.h:4c895300141d466d",
+      "rule": "heavy-public-header",
+      "path": "src/planner/controller/include/controller/mpc.h",
+      "line": 5,
+      "code": "#include <OsqpEigen/Solver.hpp>"
+    },
+    {
+      "key": "eigen-auto-expression:src/planner/traj_optimize/include/traj_optimize/ma_spline_opt/SplineTrajectory/SplineOptimizer.hpp:db9fc9322e9c2cae",
+      "rule": "eigen-auto-expression",
+      "path": "src/planner/traj_optimize/include/traj_optimize/ma_spline_opt/SplineTrajectory/SplineOptimizer.hpp",
+      "line": 1621,
+      "code": "const auto xi = x.segment(var.offset, var.dof);"
+    },
+    {
+      "key": "eigen-auto-expression:src/planner/traj_optimize/include/traj_optimize/spline_opt/SplineTrajectory/SplineOptimizer.hpp:5c5ce1a86464e06a",
+      "rule": "eigen-auto-expression",
+      "path": "src/planner/traj_optimize/include/traj_optimize/spline_opt/SplineTrajectory/SplineOptimizer.hpp",
+      "line": 503,
+      "code": "const auto value = spaceMap().toUnconstrained(reference.waypoints.row(variable.point_index).transpose(), variable.point_index);"
+    },
+    {
+      "key": "eigen-auto-expression:src/planner/traj_optimize/include/traj_optimize/spline_opt/SplineTrajectory/SplineOptimizer.hpp:ce5bca1858720f25",
+      "rule": "eigen-auto-expression",
+      "path": "src/planner/traj_optimize/include/traj_optimize/spline_opt/SplineTrajectory/SplineOptimizer.hpp",
+      "line": 636,
+      "code": "const auto point = spaceMap().toPhysical(x.segment(variable.offset, variable.dof), variable.point_index);"
+    },
+    {
+      "key": "heavy-public-header:src/test/include/cv2map.hpp:1dcd65822672ab06",
+      "rule": "heavy-public-header",
+      "path": "src/test/include/cv2map.hpp",
+      "line": 6,
+      "code": "#include <opencv2/core.hpp>"
+    },
+    {
+      "key": "heavy-public-header:src/test/include/cv2map.hpp:8a2bdee18fb2a604",
+      "rule": "heavy-public-header",
+      "path": "src/test/include/cv2map.hpp",
+      "line": 7,
+      "code": "#include <opencv2/imgcodecs.hpp>"
+    },
+    {
+      "key": "heavy-public-header:src/test/include/cv2map.hpp:2e5d601fe6087ce1",
+      "rule": "heavy-public-header",
+      "path": "src/test/include/cv2map.hpp",
+      "line": 8,
+      "code": "#include <opencv2/imgproc.hpp>"
+    },
+    {
+      "key": "heavy-public-header:src/test/include/cv_show.hpp:8a2bdee18fb2a604",
+      "rule": "heavy-public-header",
+      "path": "src/test/include/cv_show.hpp",
+      "line": 7,
+      "code": "#include <opencv2/imgcodecs.hpp>"
+    },
+    {
+      "key": "heavy-public-header:src/test/include/cv_show.hpp:2e5d601fe6087ce1",
+      "rule": "heavy-public-header",
+      "path": "src/test/include/cv_show.hpp",
+      "line": 8,
+      "code": "#include <opencv2/imgproc.hpp>"
+    }
+  ]
+}

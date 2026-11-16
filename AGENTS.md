@@ -7,6 +7,21 @@
 
 本仓库任何修改都必须以“保持可复现、最小改动、可审计”为第一原则。
 
+## 工作流入口与按需规范
+
+唯一工作区为 `/home/xyt/map/src/MA_2027_nav`。工具以本仓库为根，不发现或引入父目录中的其他项目。以下路由补充本文件，不改变后文构建授权、Git 操作与比赛逻辑约束。
+
+| 触发条件 | 必读文件 |
+| :--- | :--- |
+| 执行修改与验证 | `docs/WORKFLOW.md` |
+| 修改 `src/**` | `src/AGENTS.md`；`src/ros2/**` 另读 `src/ros2/AGENTS.md` |
+| 改变公开接口、状态、错误或所有权 | `docs/rules/interfaces.md`；先提出契约与调用方影响，确认后实现 |
+| 修改 YAML、参数加载或配置路径 | `docs/rules/yaml_params.md` |
+| 修改模块依赖、启动链路或通信关系 | `docs/ARCHITECTURE.md` |
+| 使用验证工具、声明工程能力 | `docs/TOOLCHAIN.md`、`docs/STANDARD_GAPS.md` |
+
+默认验证 `./scripts/verify.sh` 仅做静态检查，不授予构建许可。按声明范围分别报告通过、失败与未验证；静态通过不能替代编译、运行或实机验证。
+
 ---
 
 ## 0. 最高优先级限制：编译构建限制

@@ -17,3 +17,5 @@ docs/架构图
 .dsh
 .ocr_tmp
 docs/ai_refactor_records
+__pycache__/
+*.pyc

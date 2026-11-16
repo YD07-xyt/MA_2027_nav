@@ -1,6 +1,0 @@
-# docs/tools 是本仓库文档流水线的工具目录（不属于 ma_nav 本体构建）
-#
-# 这些是工具运行产物，不应进入版本库。
-__pycache__/
-_injection_tmp/
-cpp/inventory/build/
