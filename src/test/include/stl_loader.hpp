@@ -2,9 +2,9 @@
 //  - load_stl：支持二进制和 ASCII STL（文件长度等于 84 + 50 * N 时按二进制读）。
 //  - voxelize：在每个三角面上按重心坐标网格均匀采点（相邻采样间距 <= step），
 //    落入的体素记为表面体素，并按三角面法向记录朝上/朝下标志。
-//  - fill_solid：STL 是空壳，按列做奇偶填充把实体内部填满：
-//    自下而上扫描，遇到只含朝下面（实体底面）的体素进入实体，遇到只含朝上面（实体顶面）的体素离开。
-//    扫到列顶仍在实体内说明该列网格不闭合，整列退回只保留表面体素。
+//  - fill_solid：在原始三角网格上求每列中心竖直射线的交点，按有向绕数填充实体内部。
+//    先处理几何交点，再量化为体素，避免薄面的上下表面合并后丢失出入顺序。
+//    交点不闭合或方向异常的列退回只保留原采样表面，不推测内部。
 #pragma once
 
 #include <Eigen/Dense>
@@ -148,20 +148,64 @@ inline auto voxelize(const StlMesh& mesh, double res, double step, VoxelizeStat&
     return g;
 }
 
-inline auto fill_solid(VoxelGrid& g, VoxelizeStat& stat) -> void {
+inline auto fill_solid(const StlMesh& mesh, VoxelGrid& g, VoxelizeStat& stat) -> void {
+    struct Crossing {
+        double z;
+        int delta; // 朝下进入 +1，朝上离开 -1；重叠实体以绕数并集处理
+    };
+    std::vector<std::vector<Crossing>> columns(static_cast<size_t>(g.dim.x()) * g.dim.y());
+    for (size_t t = 0; t < mesh.triangle_num(); ++t) {
+        const Eigen::Vector3d& a = mesh.v[3 * t];
+        Eigen::Vector3d b = mesh.v[3 * t + 1], c = mesh.v[3 * t + 2];
+        const Eigen::Vector3d normal = (b - a).cross(c - a);
+        if (std::abs(normal.z()) <= 1e-12 * normal.norm()) continue; // 竖直面不穿越竖直射线
+        const int delta = normal.z() < 0.0 ? 1 : -1;
+        if (normal.z() < 0.0) std::swap(b, c); // XY 投影统一为逆时针，原法向仍由 delta 保留
+        const Eigen::Vector3i lo = (voxel_index(a.cwiseMin(b).cwiseMin(c), g.res) - g.min_id).cwiseMax(0);
+        const Eigen::Vector3i hi = (voxel_index(a.cwiseMax(b).cwiseMax(c), g.res) - g.min_id).cwiseMin(g.dim - Eigen::Vector3i::Ones());
+        for (int x = lo.x(); x <= hi.x(); ++x) {
+            for (int y = lo.y(); y <= hi.y(); ++y) {
+                const double px = (x + g.min_id.x() + 0.5) * g.res;
+                const double py = (y + g.min_id.y() + 0.5) * g.res;
+                // 半开边规则：共享三角边只归一侧，避免对角线交点被计数两次。
+                auto owns_edge = [px, py](const Eigen::Vector3d& u, const Eigen::Vector3d& v) {
+                    const double dx = v.x() - u.x(), dy = v.y() - u.y();
+                    const double edge = dx * (py - u.y()) - dy * (px - u.x());
+                    return edge > 0.0 || (edge == 0.0 && (dy > 0.0 || (dy == 0.0 && dx < 0.0)));
+                };
+                if (!owns_edge(a, b) || !owns_edge(b, c) || !owns_edge(c, a)) continue;
+                const double z = a.z() - (normal.x() * (px - a.x()) + normal.y() * (py - a.y())) / normal.z();
+                columns[static_cast<size_t>(x) * g.dim.y() + y].push_back({z, delta});
+            }
+        }
+    }
+    stat.open_column_num = 0;
     for (int x = 0; x < g.dim.x(); ++x) {
         for (int y = 0; y < g.dim.y(); ++y) {
-            bool inside = false;
-            for (int z = 0; z < g.dim.z(); ++z) {
-                uint8_t& f = g.flags[g.addr(x, y, z)];
-                if (inside && !(f & VoxelGrid::kSurface)) f |= VoxelGrid::kInside;
-                const bool up = f & VoxelGrid::kUp, down = f & VoxelGrid::kDown;
-                if (down && !up) inside = true;
-                if (up && !down) inside = false;
+            auto& hits = columns[static_cast<size_t>(x) * g.dim.y() + y];
+            std::sort(hits.begin(), hits.end(), [](const Crossing& a, const Crossing& b) { return a.z < b.z; });
+            int winding = 0;
+            bool invalid = false;
+            // 同高交点合并后再更新绕数，避免相接实体的处理依赖排序顺序。
+            for (size_t i = 0; i < hits.size();) {
+                size_t j = i + 1;
+                int delta = hits[i].delta;
+                while (j < hits.size() && std::abs(hits[j].z - hits[i].z) <= 1e-9) delta += hits[j++].delta;
+                winding += delta;
+                invalid = invalid || winding < 0;
+                i = j;
             }
-            if (inside) {
-                ++stat.open_column_num;
-                for (int z = 0; z < g.dim.z(); ++z) g.flags[g.addr(x, y, z)] &= ~VoxelGrid::kInside;
+            invalid = invalid || winding != 0;
+            if (invalid) ++stat.open_column_num;
+            winding = 0;
+            size_t i = 0;
+            for (int z = 0; z < g.dim.z(); ++z) {
+                uint8_t& flag = g.flags[g.addr(x, y, z)];
+                flag &= ~VoxelGrid::kInside; // 支持重复调用，始终保留原采样表面
+                if (invalid) continue;
+                const double center_z = (z + g.min_id.z() + 0.5) * g.res;
+                while (i < hits.size() && hits[i].z <= center_z) winding += hits[i++].delta;
+                if (winding > 0 && !(flag & VoxelGrid::kSurface)) flag |= VoxelGrid::kInside;
             }
         }
     }

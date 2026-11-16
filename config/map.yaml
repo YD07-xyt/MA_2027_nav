@@ -49,14 +49,14 @@ rog_map:
   # 导航模式（planner.yaml mapping_model: false）专用遗忘时间(s)。静态障碍由先验 global map 兜底，
   # 动态障碍离开视野后 2 s 清掉；建图模式仍用上面的 forget_threshold。
   nav_forget_threshold: 2.0
-  forget_keep_radius: 1.5               # 车周 1.5 m（水平）内不遗忘：近处处于雷达盲区，遗忘后看不回来
+  forget_keep_radius: 0.0               # 车周 1.5 m（水平）内不遗忘
 
   terrain:
       # 3x3 滤波，如果发现台阶边缘 2D 漏检严重，可改为 1 关闭滤波
       kernel_size: 3                    
       # 超过 5cm 就不当平地，必须做间隙分析
       max_step_height: 0.05              
-      # 机器狗实际高度 + 安全余量。
+      # 实际高度 + 安全余量。
       # 改为 0.24：限高杆实测净空约 250mm，判据是"间隙 >= robot_height 才放行"，
       # 取 0.26 时 0.25 >= 0.26 不成立，限高杆必然判障碍。0.24 可放行，20cm 台阶仍判障碍。
       robot_height: 0.24                 

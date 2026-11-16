@@ -174,7 +174,7 @@ int main(int argc, char** argv) {
     t0 = Clock::now();
     test_utils::VoxelizeStat vstat;
     auto vg = test_utils::voxelize(mesh, res, sample_step, vstat);
-    if (do_fill) test_utils::fill_solid(vg, vstat);
+    if (do_fill) test_utils::fill_solid(mesh, vg, vstat);
     const double t_vox = ms_since(t0);
     std::printf("[stl] samples %zu, surface voxels %zu, inside voxels %zu, open columns (fallback surface) %zu\n",
                 vstat.sample_num, vstat.surface_num, vstat.inside_num, vstat.open_column_num);
