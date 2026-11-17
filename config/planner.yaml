@@ -9,7 +9,7 @@ ros2:
   cmd_vel_name: "/cmd_vel_chassis" #"/cmd_vel" #"/cmd_vel_chassis" 
   save_global_map_path:  "src/navigation/map"
   save_map_srv_topic: "/save_global_map"
-  map_params_path: "src/navigation/config/map.yaml"   # 地图参数
+  map_params_path: "config/map.yaml"   # 地图参数
   global_map_path: "src/navigation/map/global_maps.pgm" # 全局栅格地图
   # 点击隧道区域保存/加载
   tunnel_regions_path: "src/navigation/map/maps/tunnel_regions.yaml"
@@ -101,9 +101,6 @@ planner_config:
     min_replan_interval: 0.5           # 最小重规划间隔 (s)，防止频繁重规划
     goal_reached_radius: 0.3           # 到达判定半径 (m)：距目标小于 0.3m 直接认为到达
     #hard_clearance: 0.2               # 已注释：硬安全距离检查，暂时不用
-    minco_traj_validity_duration: 2.0  # MINCO 轨迹有效期 (s)，超过后不再用旧轨迹做热启动
-    minco_traj_continuity_threshold: 0.3 # 热启动连续性阈值 (m)：
-                                         # 机器人距旧轨迹投影点小于 0.3m 时，用旧轨迹 PVA 热启动
     projection_search_resolution: 0.02   # 投影点搜索时间分辨率 (s)，越小越精确但计算量越大
     # 反向重规划（目标在速度反方向，夹角 > 90°）：先沿当前速度方向匀减速刹停，再从刹停点反向规划
     brake_acc: 6.0         # 常规刹车减速度 (m/s²)

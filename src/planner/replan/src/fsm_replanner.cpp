@@ -14,40 +14,33 @@
 namespace replan {
 class FsmReplan::Impl {
 public:
-    Impl() {}
+    Impl() = default;
 
     auto plan(
         const utils::RobotState& goal_pose,
         const utils::RobotState& current_pose,
-        std::shared_ptr<grid_map::GridMap> grid_map,
-        const PlannerConfig& planner_config_
-    ) -> path;
-    auto one_plan(
-        const utils::RobotState& goal_pose,
-        const utils::RobotState& current_pose,
         std::shared_ptr<grid_map::GridMap> grid_map
     ) -> path;
-
+    auto set_param(const PlannerConfig& planner_config) -> void;
     path_planning::PathPlanning path_planning;
     ma_spline_opt::MaSplineTrajectoryOptimizer<minco_opt::GridMapESDF> ma_opt_;
 
 private:
-    PathState path_state_ = PathState::IDLE;
-    bool need_replan_ = true;
-    utils::RobotState old_goal_pose_;
-    std::vector<Eigen::Vector2d> last_opt_path_;
-    ResultPath result_;
-    enum MincoError { OPTFAIL, TIMEDOUT };
+    // 失败进入 RETRY_PENDING，下一次调用继续尝试。
+    enum class State { IDLE, PLANNING, MONITORING, RETRY_PENDING };
+    enum class Event { START, PLAN_SUCCEEDED, PLAN_FAILED, GOAL_REACHED, KEEP_MONITORING };
 
-    /**replan */
-    bool has_valid_trajectory_ = false; ///< 是否有有效的历史轨迹
+    State state_ = State::IDLE;
+    PlannerConfig planner_config_;
+    utils::RobotState old_goal_pose_;
+    ResultPath result_;
     std::chrono::steady_clock::time_point last_trajectory_time_; ///< 上一条轨迹的发布时间戳（刹车段按时间推进用）
+
+    auto transition(Event event) -> void;
 
     // 将过于靠近障碍物的点沿 ESDF 梯度外推到安全距离，确保 A*/碰撞检测可通过
     auto get_safe_pos(const Eigen::Vector2d& pos, const grid_map::GridMap& grid_map, const double& safe_threshold)
         -> Eigen::Vector2d;
-    auto check_point_equal(const Eigen::Vector3d& pos1, const Eigen::Vector3d& pos2, const Eigen::Vector3d& deviation)
-        -> bool;
     auto check_collision(
         path_planning::PathPostProcessing::Trajectory traj,
         const grid_map::GridMap& grid_map,
@@ -63,26 +56,6 @@ private:
         const double& safe_threshold,
         const PlannerConfig& planner_config_
     ) -> ma_spline_opt::BrakeSegment;
-
-    /**
-     * @brief 轨迹投影结果结构体
-     *
-     * 存储在历史轨迹上查找投影点的结果，包括投影时间、距离、
-     * 以及投影点处的位置、速度和加速度信息。
-     */
-    struct TrajectoryProjectionResult {
-        bool valid = false; ///< 投影是否有效
-        double projection_time = 0.0; ///< 投影点在轨迹上的时间参数
-        double distance = 0.0; ///< 机器人当前位置到投影点的距离
-        Eigen::Vector2d position; ///< 投影点位置
-        Eigen::Vector2d velocity; ///< 投影点速度
-        Eigen::Vector2d acceleration; ///< 投影点加速度 (S=3 热启动)
-
-        TrajectoryProjectionResult():
-            position(Eigen::Vector2d::Zero()),
-            velocity(Eigen::Vector2d::Zero()),
-            acceleration(Eigen::Vector2d::Zero()) {}
-    };
 };
 
 FsmReplan::FsmReplan(): impl_(std::make_unique<Impl>()) {}
@@ -90,15 +63,39 @@ FsmReplan::~FsmReplan() = default;
 FsmReplan::FsmReplan(FsmReplan&&) noexcept = default;
 FsmReplan& FsmReplan::operator=(FsmReplan&&) noexcept = default;
 
-FsmReplan::FsmReplan(const PlannerConfig& planner_config): FsmReplan() {
+auto FsmReplan::Impl::transition(Event event) -> void {
+    // START: 可规划态 -> PLANNING；成功回 MONITORING，失败回 RETRY_PENDING。
+    switch (event) {
+        case Event::START:
+            if (state_ == State::IDLE || state_ == State::MONITORING || state_ == State::RETRY_PENDING) {
+                state_ = State::PLANNING;
+            }
+            break;
+        case Event::PLAN_SUCCEEDED:
+            if (state_ == State::PLANNING) state_ = State::MONITORING;
+            break;
+        case Event::PLAN_FAILED:
+            if (state_ == State::PLANNING) state_ = State::RETRY_PENDING;
+            break;
+        case Event::GOAL_REACHED:
+        case Event::KEEP_MONITORING:
+            state_ = State::MONITORING;
+            break;
+    }
+}
+
+auto FsmReplan::Impl::set_param(const PlannerConfig& planner_config) -> void {
     planner_config_ = planner_config;
-    impl_->path_planning.set_param(planner_config_.path_planning_params);
+    ma_opt_.set_config(planner_config_.ma_spline_opt_params);
+    path_planning.set_param(planner_config_.path_planning_params);
+}
+
+FsmReplan::FsmReplan(const PlannerConfig& planner_config): FsmReplan() {
+    impl_->set_param(planner_config);
 }
 
 auto FsmReplan::set_param(const PlannerConfig& planner_config) -> void {
-    planner_config_ = planner_config;
-    impl_->ma_opt_.set_config(planner_config_.ma_spline_opt_params);
-    impl_->path_planning.set_param(planner_config_.path_planning_params);
+    impl_->set_param(planner_config);
 }
 
 auto FsmReplan::plan(
@@ -106,18 +103,10 @@ auto FsmReplan::plan(
     const utils::RobotState& current_pose,
     std::shared_ptr<grid_map::GridMap> grid_map
 ) -> path {
-    return impl_->plan(goal_pose, current_pose, std::move(grid_map), planner_config_);
+    return impl_->plan(goal_pose, current_pose, std::move(grid_map));
 }
 
-auto FsmReplan::one_plan(
-    const utils::RobotState& goal_pose,
-    const utils::RobotState& current_pose,
-    std::shared_ptr<grid_map::GridMap> grid_map
-) -> path {
-    return impl_->one_plan(goal_pose, current_pose, std::move(grid_map));
-}
-
-// 折线碰撞检测辅助函数
+// 折线碰撞检测辅助函数。
 static bool check_path_collision(
     const std::vector<Eigen::Vector2d>& path,
     const grid_map::GridMap& grid_map,
@@ -127,15 +116,14 @@ static bool check_path_collision(
 auto FsmReplan::Impl::plan(
     const utils::RobotState& goal_pose,
     const utils::RobotState& current_pose,
-    std::shared_ptr<grid_map::GridMap> grid_map,
-    const PlannerConfig& planner_config_
+    std::shared_ptr<grid_map::GridMap> grid_map
 ) -> path {
     result_.is_new_trajectory = false;
 
     // 起点≈终点（机器人已到达目标附近）：直接退出，不规划。
     if ((current_pose.p.head<2>() - goal_pose.p.head<2>()).norm() < planner_config_.replan_params.goal_reached_radius) {
-        path_state_ = PathState::SUCCESSED;
-        result_.path_state = path_state_;
+        result_.path_state = PathState::SUCCESSED;
+        transition(Event::GOAL_REACHED);
         return result_;
     }
 
@@ -148,31 +136,29 @@ auto FsmReplan::Impl::plan(
 
     Eigen::Vector2d diff = (old_goal_pose_.p - goal_pose.p).head<2>();
     Eigen::Vector2d threshold = planner_config_.replan_params.goal_deviation.head<2>();
-    if (diff.cwiseAbs().x() > threshold.x() || diff.cwiseAbs().y() > threshold.y()) {
-        need_replan_ = true;
-    }
+    const bool goal_changed = diff.cwiseAbs().x() > threshold.x() || diff.cwiseAbs().y() > threshold.y();
 
     const bool path_collision = result_.planning_traj.optimized_path.empty()
         || check_collision(result_.planning_traj, *grid_map, hard_clearance, planner_config_);
 
-    if (path_collision) {
-        need_replan_ = true;
-    }
-
     //机器人偏离参考路径超过 replan_lateral_dev_
     // 有刹车段时把刹车起点接到路径前面（刹车段是 p0 -> 刹停点的直线），避免刹车过程中被判为横向偏离
-    std::vector<Eigen::Vector2d> ref_path =
-        last_opt_path_.empty() ? result_.planning_traj.optimized_path : last_opt_path_;
+    std::vector<Eigen::Vector2d> ref_path = result_.planning_traj.optimized_path;
     if (result_.ma_spline_traj.brake.duration > 0.0 && !ref_path.empty()) {
         ref_path.insert(ref_path.begin(), result_.ma_spline_traj.brake.p0);
     }
     const double lateral_dev = lateral_deviation(Eigen::Vector2d(current_pose.p.x(), current_pose.p.y()), ref_path);
 
-    if (lateral_dev > planner_config_.replan_params.replan_lateral_dev) {
-        need_replan_ = true;
+    const bool path_deviation = lateral_dev > planner_config_.replan_params.replan_lateral_dev;
+    const bool must_replan =
+        state_ == State::IDLE || state_ == State::RETRY_PENDING || goal_changed || path_collision || path_deviation;
+    if (!must_replan) {
+        transition(Event::KEEP_MONITORING);
+        return result_;
     }
-    // 暂时不考虑加入 路径年龄超过 replan_interval_
-    if (need_replan_) {
+
+    transition(Event::START);
+    {
         utils::TimeConsuming timer("planner_fsm", true); // true 表示允许打印
         path_planning.set_map(*grid_map);
 
@@ -231,7 +217,7 @@ auto FsmReplan::Impl::plan(
 
         if (!trajectory.has_value()) {
             logger::warn(logger::fsm_replan, "planning failed");
-            need_replan_ = true;
+            transition(Event::PLAN_FAILED);
             return tl::make_unexpected(PathError::PLANNING_FAILED);
         }
 
@@ -271,7 +257,7 @@ auto FsmReplan::Impl::plan(
                 trajectory = path_planning.path_planning(start, goal, current_pose.yaw, goal_pose.yaw, 5000);
                 if (!trajectory.has_value()) {
                     logger::warn(logger::fsm_replan, "planning from brake stop point failed");
-                    need_replan_ = true;
+                    transition(Event::PLAN_FAILED);
                     return tl::make_unexpected(PathError::PLANNING_FAILED);
                 }
                 first_dir = path_first_dir(trajectory->optimized_path);
@@ -285,9 +271,9 @@ auto FsmReplan::Impl::plan(
             start_acc.setZero();
         }
 
-        // MINCO 五阶轨迹优化(时间 + 平滑 + ESDF 避障 + 速度/加速度软约束)。
-        // 优化失败或安全检查不过时保持 path_planning 原始轨迹,安全兜底。
-        result_.planning_traj = trajectory.value();
+        // 先生成候选，优化成功后再整体提交。
+        ResultPath candidate = result_;
+        candidate.planning_traj = trajectory.value();
         // 打印 raw_path / optimized_path 点数,确认直线/近距离时的短路情况
         // logger::info(logger::fsm_replan,
         //     "path points: raw={} optimized={} total_time={:.2f}s",
@@ -324,63 +310,19 @@ auto FsmReplan::Impl::plan(
         auto ma_output = ma_opt_.optimize(ma_intput);
         if (ma_output.success == false) {
             logger::info(logger::fsm_replan, "ma opt failed");
+            transition(Event::PLAN_FAILED);
             return tl::make_unexpected(PathError::MINCO_OPT_FIALED);
         }
         ma_output.brake = brake; // 刹车段拼在样条前面（无刹车时 duration=0）
-        result_.ma_spline_traj = ma_output;
+        candidate.ma_spline_traj = ma_output;
         last_trajectory_time_ = std::chrono::steady_clock::now();
-        result_.is_new_trajectory = true;
-        result_.path_state = PathState::SUCCESSED;
+        candidate.is_new_trajectory = true;
+        candidate.path_state = PathState::SUCCESSED;
+        result_ = std::move(candidate);
         old_goal_pose_ = goal_pose;
-        need_replan_ = false;
+        transition(Event::PLAN_SUCCEEDED);
         return result_;
     }
-    return result_;
-}
-auto FsmReplan::Impl::one_plan(
-    const utils::RobotState& goal_pose,
-    const utils::RobotState& current_pose,
-    std::shared_ptr<grid_map::GridMap> grid_map
-) -> path {
-    utils::TimeConsuming timer("planner_fsm", true); // true 表示允许打印
-    path_planning.set_map(*grid_map);
-    Eigen::Vector2d start(current_pose.p.x(), current_pose.p.y());
-    Eigen::Vector2d goal(goal_pose.p.x(), goal_pose.p.y());
-
-    path_planning.set_use_jps(true);
-
-    const Eigen::Vector3d& current_vel = Eigen::Vector3d(current_pose.v.x(), current_pose.v.y(), current_pose.wz);
-    path_planning.set_velocity(current_vel, Eigen::Vector3d::Zero());
-
-    auto trajectory = path_planning.path_planning(start, goal, current_pose.yaw, goal_pose.yaw, 5000);
-    if (!trajectory.has_value()) {
-        logger::warn(logger::fsm_replan, "planning failed");
-        return tl::make_unexpected(PathError::PLANNING_FAILED);
-    }
-    logger::info(
-        logger::fsm_replan,
-        "path points: raw={} optimized={} total_time={:.2f}s",
-        result_.planning_traj.raw_path.size(),
-        result_.planning_traj.optimized_path.size(),
-        result_.planning_traj.total_time
-    );
-    const auto& timed = result_.planning_traj.timed_trajectory;
-    logger::info(
-        logger::fsm_replan,
-        "timed_trajectory: size={}, first_t={:.3f}, last_t={:.3f}, total_time={:.3f}",
-        timed.size(),
-        timed.empty() ? -1.0 : timed.front().time,
-        timed.empty() ? -1.0 : timed.back().time,
-        result_.planning_traj.total_time
-    );
-    result_.planning_traj = trajectory.value();
-    utils::TimeConsuming opt_timer("ma_opt", true);
-    minco_opt::GridMapESDF grid_map_esdf(grid_map);
-    ma_opt_.set_esdf_interface(&grid_map_esdf);
-    auto ma_intput = ma_spline_opt::from_path_planning_trajectory(trajectory.value());
-    auto ma_output = ma_opt_.optimize(ma_intput);
-    result_.ma_spline_traj = ma_output;
-    return result_;
 }
 
 auto FsmReplan::Impl::lateral_deviation(const Eigen::Vector2d& pos, const std::vector<Eigen::Vector2d>& path)
@@ -553,23 +495,4 @@ auto FsmReplan::Impl::plan_brake_segment(
     brake.duration = speed / a_brake;
     return brake;
 }
-auto FsmReplan::Impl::check_point_equal(
-    const Eigen::Vector3d& pos1,
-    const Eigen::Vector3d& pos2,
-    const Eigen::Vector3d& deviation
-) -> bool {
-    if (deviation == Eigen::Vector3d::Zero()) {
-        if (std::abs(pos1.x() - pos2.x()) < std::numeric_limits<double>::epsilon()
-            && std::abs(pos1.y() - pos2.y()) < std::numeric_limits<double>::epsilon())
-        {
-            return true;
-        }
-        return false;
-    }
-    if (std::abs(pos1.x() - pos2.x()) < deviation.x() && std::abs(pos1.y() - pos2.y()) < deviation.y()) {
-        return true;
-    }
-    return false;
-}
-
 }

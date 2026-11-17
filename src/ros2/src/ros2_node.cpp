@@ -279,9 +279,21 @@ void GlobalPlanner2d::plan_omni() {
         logger::debug(logger::ros2, "no current_pose");
         return;
     }
-    // 1. 每帧先判断是否到达，不受 plan_start_time_ 是否为空影响
-    const double dist_to_goal = (current_pose->p.head<2>() - goal_pose->p.head<2>()).norm();
+    const auto now = std::chrono::steady_clock::now();
+    if (!plan_start_time_.has_value()) {
+        plan_start_time_ = now;
+    }
+    const auto deadline = plan_start_time_.value() + std::chrono::seconds(20);
+    if (now >= deadline) {
+        logger::warn(logger::ros2, "navigation task exceeded 20s -> nav:failed");
+        nav_state = replan::FsmReplan::PathState::FAILED;
+        nav_feedback_pub_->publish(pub_nav_feedback());
+        goal_pose.reset();
+        plan_start_time_.reset();
+        return;
+    }
 
+    const double dist_to_goal = (current_pose->p.head<2>() - goal_pose->p.head<2>()).norm();
     if (dist_to_goal < config.planner_config.replan_params.goal_reached_radius) {
         nav_state = replan::FsmReplan::PathState::SUCCESSED;
 
@@ -290,124 +302,127 @@ void GlobalPlanner2d::plan_omni() {
 
         // 到达后收尾，避免重复触发
         goal_pose.reset();
+        plan_start_time_.reset();
         return;
     }
-    const auto now = std::chrono::steady_clock::now();
-    const bool timeout = (now - plan_start_time_.value()) >= std::chrono::seconds(20);
-        // 本次规划全程使用同一份地图快照（双缓冲），地图线程的更新不会改写它
-        const auto plan_map = ma_map_->get_grid_map();
-        auto result = fsm_replanner.plan(goal_pose.value(), current_pose.value(), plan_map);
-        if (!result) {
-            if (timeout) {
-                plan_start_time_ = now; // 第一次失败开始计时
-                logger::warn(logger::ros2, "plan_omni 20s timeout, no path -> nav:failed");
-                nav_state = replan::FsmReplan::PathState::FAILED;
-            }
-            return;
+
+    // 本次规划全程使用同一份地图快照（双缓冲），地图线程的更新不会改写它。
+    const auto plan_map = ma_map_->get_grid_map();
+    auto result = fsm_replanner.plan(goal_pose.value(), current_pose.value(), plan_map);
+    const auto finished_at = std::chrono::steady_clock::now();
+    if (finished_at >= deadline) {
+        logger::warn(logger::ros2, "planning result arrived after 20s -> nav:failed");
+        nav_state = replan::FsmReplan::PathState::FAILED;
+        nav_feedback_pub_->publish(pub_nav_feedback());
+        goal_pose.reset();
+        plan_start_time_.reset();
+        return;
+    }
+    if (!result) {
+        nav_state = replan::FsmReplan::PathState::RUNNING;
+        return;
+    }
+    auto path_result = result.value();
+
+    // 规划失败保留当前任务，下一帧继续重试；20 秒期限由上方统一处理。
+    if (path_result.path_state != replan::FsmReplan::PathState::SUCCESSED) {
+        logger::debug(logger::ros2, "PathState not SUCCESSED, waiting...");
+        nav_state = replan::FsmReplan::PathState::RUNNING;
+        return;
+    }
+
+    // 交接前再次检查，过期结果不能下发给控制器。
+    if (std::chrono::steady_clock::now() >= deadline) {
+        logger::warn(logger::ros2, "planning result expired before handoff -> nav:failed");
+        nav_state = replan::FsmReplan::PathState::FAILED;
+        nav_feedback_pub_->publish(pub_nav_feedback());
+        goal_pose.reset();
+        plan_start_time_.reset();
+        return;
+    }
+
+    visualizer.PubGlobalPath(path_result.planning_traj.raw_path, frame_id);
+    visualizer.PubOptPath(path_result.ma_spline_traj.trajectory, frame_id);
+
+    std::vector<Eigen::Vector3d> route;
+    for (auto point: path_result.planning_traj.optimized_path) {
+        route.emplace_back(point.x(), point.y(), 0.0);
+    }
+
+    // 新轨迹下发：把 MPC 跟踪游标定位到新轨迹上离机器人最近的点。
+    if (path_result.is_new_trajectory && path_result.ma_spline_traj.success
+        && path_result.ma_spline_traj.trajectory.isInitialized())
+    {
+        ma_traj_interface_ = std::make_shared<control::MaSplineTrajectoryInterface>(path_result.ma_spline_traj);
+
+        mpc_.set_trajectory(ma_traj_interface_);
+
+        fold_events_ = generate_fold_events(
+            path_result.ma_spline_traj,
+            *plan_map,
+            config.planner_config.path_planning_params.fold_time,
+            config.planner_config.path_planning_params.unfold_time,
+            config.planner_config.path_planning_params.fold_margin
+        );
+
+        next_fold_event_idx_ = 0;
+
+        // 跳过新轨迹上已经过去的折叠事件。
+        bool desired_fold_state = current_fold_state_;
+
+        while (next_fold_event_idx_ < fold_events_.size() && fold_events_[next_fold_event_idx_].time <= t_track_) {
+            desired_fold_state = fold_events_[next_fold_event_idx_].fold;
+            ++next_fold_event_idx_;
         }
-        auto path_result = result.value();
 
-        // ---- 情况 2: PathState 不为 SUCCESSED ----
-        if (path_result.path_state != replan::FsmReplan::PathState::SUCCESSED) {
-            
-            if (timeout) {
-                plan_start_time_ = now; // 第一次失败开始计时
-                logger::warn(logger::ros2, "PathState != SUCCESSED after 20s -> nav:failed");
-                nav_state = replan::FsmReplan::PathState::FAILED;
-            } else {
-                logger::debug(logger::ros2, "PathState not SUCCESSED, waiting...");
-                nav_state = replan::FsmReplan::PathState::RUNNING;
-            }
-            return;
+        if (desired_fold_state != current_fold_state_) {
+            //publish_fold_cmd(desired_fold_state);
+            current_fold_state_ = desired_fold_state;
+        }
+        if (current_XYTheta.has_value()) {
+            Eigen::Vector2d pos(current_XYTheta->x(), current_XYTheta->y());
+            t_track_ = ma_traj_interface_->nearest_time(pos);
+        } else {
+            t_track_ = 0.0;
         }
 
-        plan_start_time_ = now;
-        visualizer.PubGlobalPath(path_result.planning_traj.raw_path,frame_id);
-        visualizer.PubOptPath(path_result.ma_spline_traj.trajectory,frame_id);
-
-        std::vector<Eigen::Vector3d> route;
-        for (auto point: path_result.planning_traj.optimized_path) {
-            route.emplace_back(point.x(), point.y(), 0.0);
+        // 反向刹车距离不够：刹车段时长内急停发零速。
+        if (ma_traj_interface_->brake_emergency()) {
+            const auto brake_ms = static_cast<int64_t>(ma_traj_interface_->brake_duration() * 1000.0);
+            emergency_stop_until_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(brake_ms);
+            logger::warn(logger::ros2, "brake distance not enough, emergency stop {} ms", brake_ms);
+        } else {
+            emergency_stop_until_.reset();
         }
 
-        //visualizer.visualize(result->ma_spline_traj, route);
-        // // 新轨迹下发:把 MPC 跟踪游标定位到新轨迹上离机器人最近的点
-        if (path_result.is_new_trajectory && result->ma_spline_traj.success
-            && result->ma_spline_traj.trajectory.isInitialized())
-        {
-            ma_traj_interface_ = std::make_shared<control::MaSplineTrajectoryInterface>(result->ma_spline_traj);
+        // 可视化。
+        std::vector<Eigen::Vector3d> fold_pts, unfold_pts;
 
-            mpc_.set_trajectory(ma_traj_interface_);
+        if (path_result.ma_spline_traj.success && path_result.ma_spline_traj.trajectory.isInitialized()) {
+            for (const auto& event: fold_events_) {
+                const double local_t = std::clamp(
+                    event.time - path_result.ma_spline_traj.brake.duration,
+                    0.0,
+                    path_result.ma_spline_traj.trajectory.getDuration()
+                );
 
-            fold_events_ = generate_fold_events(
-                result->ma_spline_traj,
-                *plan_map,
-                config.planner_config.path_planning_params.fold_time,
-                config.planner_config.path_planning_params.unfold_time,
-                config.planner_config.path_planning_params.fold_margin
-            );
+                const double t = path_result.ma_spline_traj.trajectory.getStartTime() + local_t;
 
-            next_fold_event_idx_ = 0;
+                const Eigen::Vector3d p = path_result.ma_spline_traj.trajectory.getTrajectory().evaluate(t, 0);
 
-            // 跳过新轨迹上已经过去的折叠事件
-            // 并确定当前时刻“应该处于什么状态”
-            bool desired_fold_state = current_fold_state_;
-
-            while (next_fold_event_idx_ < fold_events_.size() && fold_events_[next_fold_event_idx_].time <= t_track_) {
-                desired_fold_state = fold_events_[next_fold_event_idx_].fold;
-                ++next_fold_event_idx_;
-            }
-
-            // 如果新轨迹当前时刻应该的状态和实际下发状态不一致，立即补发一次
-            if (desired_fold_state != current_fold_state_) {
-                //publish_fold_cmd(desired_fold_state);
-                current_fold_state_ = desired_fold_state;
-            }
-            if (current_XYTheta.has_value()) {
-                Eigen::Vector2d pos(current_XYTheta->x(), current_XYTheta->y());
-                t_track_ = ma_traj_interface_->nearest_time(pos);
-            } else {
-                t_track_ = 0.0;
-            }
-
-            // 反向刹车距离不够：刹车段时长内急停发零速
-            if (ma_traj_interface_->brake_emergency()) {
-                const auto brake_ms = static_cast<int64_t>(ma_traj_interface_->brake_duration() * 1000.0);
-                emergency_stop_until_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(brake_ms);
-                logger::warn(logger::ros2, "brake distance not enough, emergency stop {} ms", brake_ms);
-            } else {
-                emergency_stop_until_.reset();
-            }
-
-            //可视化
-            std::vector<Eigen::Vector3d> fold_pts, unfold_pts;
-
-            if (result->ma_spline_traj.success && result->ma_spline_traj.trajectory.isInitialized()) {
-                for (const auto& event: fold_events_) {
-                    const double local_t = std::clamp(
-                        event.time - result->ma_spline_traj.brake.duration,
-                        0.0,
-                        result->ma_spline_traj.trajectory.getDuration()
-                    );
-
-                    const double t = result->ma_spline_traj.trajectory.getStartTime() + local_t;
-
-                    const Eigen::Vector3d p = result->ma_spline_traj.trajectory.getTrajectory().evaluate(t, 0);
-
-                    if (event.fold) {
-                        fold_pts.push_back(p);
-                    } else {
-                        unfold_pts.push_back(p);
-                    }
+                if (event.fold) {
+                    fold_pts.push_back(p);
+                } else {
+                    unfold_pts.push_back(p);
                 }
             }
-
-            visualizer
-                .visualizeTunnelAndFold(result->ma_spline_traj, route, *plan_map, fold_pts, unfold_pts,frame_id);
         }
-        auto msg = pub_nav_feedback();
 
-        nav_feedback_pub_->publish(msg);
+        visualizer.visualizeTunnelAndFold(path_result.ma_spline_traj, route, *plan_map, fold_pts, unfold_pts, frame_id);
+    }
+    auto msg = pub_nav_feedback();
+
+    nav_feedback_pub_->publish(msg);
 }
 auto GlobalPlanner2d::pub_nav_feedback() -> std_msgs::msg::Int16 {
     std_msgs::msg::Int16 msg;

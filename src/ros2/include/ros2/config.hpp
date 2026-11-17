@@ -212,11 +212,7 @@ inline void load_replan_param(const YAML::Node& node, replan::FsmReplan::ReplanP
     if (!node) return;
     if (node["goal_deviation"]) param.goal_deviation = load_vector3d(node["goal_deviation"]);
     if (node["replan_lateral_dev"]) param.replan_lateral_dev = node["replan_lateral_dev"].as<double>();
-    if (node["minco_traj_validity_duration"])
-        param.minco_traj_validity_duration = node["minco_traj_validity_duration"].as<double>();
     if (node["goal_reached_radius"]) param.goal_reached_radius = node["goal_reached_radius"].as<double>();
-    if (node["minco_traj_continuity_threshold"])
-        param.minco_traj_continuity_threshold = node["minco_traj_continuity_threshold"].as<double>();
     if (node["projection_search_resolution"])
         param.projection_search_resolution = node["projection_search_resolution"].as<double>();
     if (node["brake_acc"]) param.brake_acc = node["brake_acc"].as<double>();
