@@ -1,8 +1,122 @@
 #include "replan/fsm_replanner.h"
+#include "path_planning/path_planning.hpp"
+#include "traj_optimize/grid_map_esdf.hpp"
+#include "traj_optimize/ma_spline_opt/traj_optimizer.h"
 #include "utils/expected.hpp"
 #include "utils/logger.hpp"
 #include "utils/type_utils.hpp"
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <limits>
+#include <utility>
+#include <vector>
 namespace replan {
+class FsmReplan::Impl {
+public:
+    Impl() {}
+
+    auto plan(
+        const utils::RobotState& goal_pose,
+        const utils::RobotState& current_pose,
+        std::shared_ptr<grid_map::GridMap> grid_map,
+        const PlannerConfig& planner_config_
+    ) -> path;
+    auto one_plan(
+        const utils::RobotState& goal_pose,
+        const utils::RobotState& current_pose,
+        std::shared_ptr<grid_map::GridMap> grid_map
+    ) -> path;
+
+    path_planning::PathPlanning path_planning;
+    ma_spline_opt::MaSplineTrajectoryOptimizer<minco_opt::GridMapESDF> ma_opt_;
+
+private:
+    PathState path_state_ = PathState::IDLE;
+    bool need_replan_ = true;
+    utils::RobotState old_goal_pose_;
+    std::vector<Eigen::Vector2d> last_opt_path_;
+    ResultPath result_;
+    enum MincoError { OPTFAIL, TIMEDOUT };
+
+    /**replan */
+    bool has_valid_trajectory_ = false; ///< 是否有有效的历史轨迹
+    std::chrono::steady_clock::time_point last_trajectory_time_; ///< 上一条轨迹的发布时间戳（刹车段按时间推进用）
+
+    // 将过于靠近障碍物的点沿 ESDF 梯度外推到安全距离，确保 A*/碰撞检测可通过
+    auto get_safe_pos(const Eigen::Vector2d& pos, const grid_map::GridMap& grid_map, const double& safe_threshold)
+        -> Eigen::Vector2d;
+    auto check_point_equal(const Eigen::Vector3d& pos1, const Eigen::Vector3d& pos2, const Eigen::Vector3d& deviation)
+        -> bool;
+    auto check_collision(
+        path_planning::PathPostProcessing::Trajectory traj,
+        const grid_map::GridMap& grid_map,
+        const double& safe_threshold,
+        const PlannerConfig& planner_config_
+    ) -> bool;
+    auto lateral_deviation(const Eigen::Vector2d& pos, const std::vector<Eigen::Vector2d>& path) -> double;
+    // 反向重规划：沿速度方向生成匀减速刹车段（ESDF 射线检测可用距离）
+    auto plan_brake_segment(
+        const Eigen::Vector2d& p0,
+        const Eigen::Vector2d& v0,
+        const grid_map::GridMap& grid_map,
+        const double& safe_threshold,
+        const PlannerConfig& planner_config_
+    ) -> ma_spline_opt::BrakeSegment;
+
+    /**
+     * @brief 轨迹投影结果结构体
+     *
+     * 存储在历史轨迹上查找投影点的结果，包括投影时间、距离、
+     * 以及投影点处的位置、速度和加速度信息。
+     */
+    struct TrajectoryProjectionResult {
+        bool valid = false; ///< 投影是否有效
+        double projection_time = 0.0; ///< 投影点在轨迹上的时间参数
+        double distance = 0.0; ///< 机器人当前位置到投影点的距离
+        Eigen::Vector2d position; ///< 投影点位置
+        Eigen::Vector2d velocity; ///< 投影点速度
+        Eigen::Vector2d acceleration; ///< 投影点加速度 (S=3 热启动)
+
+        TrajectoryProjectionResult():
+            position(Eigen::Vector2d::Zero()),
+            velocity(Eigen::Vector2d::Zero()),
+            acceleration(Eigen::Vector2d::Zero()) {}
+    };
+};
+
+FsmReplan::FsmReplan(): impl_(std::make_unique<Impl>()) {}
+FsmReplan::~FsmReplan() = default;
+FsmReplan::FsmReplan(FsmReplan&&) noexcept = default;
+FsmReplan& FsmReplan::operator=(FsmReplan&&) noexcept = default;
+
+FsmReplan::FsmReplan(const PlannerConfig& planner_config): FsmReplan() {
+    planner_config_ = planner_config;
+    impl_->path_planning.set_param(planner_config_.path_planning_params);
+}
+
+auto FsmReplan::set_param(const PlannerConfig& planner_config) -> void {
+    planner_config_ = planner_config;
+    impl_->ma_opt_.set_config(planner_config_.ma_spline_opt_params);
+    impl_->path_planning.set_param(planner_config_.path_planning_params);
+}
+
+auto FsmReplan::plan(
+    const utils::RobotState& goal_pose,
+    const utils::RobotState& current_pose,
+    std::shared_ptr<grid_map::GridMap> grid_map
+) -> path {
+    return impl_->plan(goal_pose, current_pose, std::move(grid_map), planner_config_);
+}
+
+auto FsmReplan::one_plan(
+    const utils::RobotState& goal_pose,
+    const utils::RobotState& current_pose,
+    std::shared_ptr<grid_map::GridMap> grid_map
+) -> path {
+    return impl_->one_plan(goal_pose, current_pose, std::move(grid_map));
+}
+
 // 折线碰撞检测辅助函数
 static bool check_path_collision(
     const std::vector<Eigen::Vector2d>& path,
@@ -10,10 +124,11 @@ static bool check_path_collision(
     const double& safe_threshold,
     const double step
 );
-auto FsmReplan::plan(
+auto FsmReplan::Impl::plan(
     const utils::RobotState& goal_pose,
     const utils::RobotState& current_pose,
-    std::shared_ptr<grid_map::GridMap> grid_map
+    std::shared_ptr<grid_map::GridMap> grid_map,
+    const PlannerConfig& planner_config_
 ) -> path {
     result_.is_new_trajectory = false;
 
@@ -23,11 +138,10 @@ auto FsmReplan::plan(
         result_.path_state = path_state_;
         return result_;
     }
-    
+
     // if(grid_map->is_tunnel(current_pose.p.head<2>())){
     //     logger::fsm_replan->error("now robot in tunnel");
     // }
-
 
     const auto safe_threshold = planner_config_.path_planning_params.safe_threshold;
     const double hard_clearance = std::max(0.05, safe_threshold * 0.2);
@@ -39,7 +153,7 @@ auto FsmReplan::plan(
     }
 
     const bool path_collision = result_.planning_traj.optimized_path.empty()
-        || check_collision(result_.planning_traj, *grid_map, hard_clearance);
+        || check_collision(result_.planning_traj, *grid_map, hard_clearance, planner_config_);
 
     if (path_collision) {
         need_replan_ = true;
@@ -89,7 +203,8 @@ auto FsmReplan::plan(
             // （机器人没完全跟到刹停点时还会再生成一次前向刹车段，循环卡死）。
             // 刹车段与控制器一致按时间推进：发布后还在刹车时长内就取该时刻的刹车状态；否则只在样条上找。
             const double brake_T = last_out.brake.duration;
-            const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - last_trajectory_time_).count();
+            const double elapsed =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - last_trajectory_time_).count();
             if (brake_T > 0.0 && elapsed < brake_T) {
                 best_t = std::max(0.0, elapsed);
             } else {
@@ -115,7 +230,7 @@ auto FsmReplan::plan(
         auto trajectory = path_planning.path_planning(start, goal, current_pose.yaw, goal_pose.yaw, 5000);
 
         if (!trajectory.has_value()) {
-            logger::warn(logger::fsm_replan,"planning failed");
+            logger::warn(logger::fsm_replan, "planning failed");
             need_replan_ = true;
             return tl::make_unexpected(PathError::PLANNING_FAILED);
         }
@@ -137,14 +252,20 @@ auto FsmReplan::plan(
         const double speed = start_vel.norm();
         if (first_dir.norm() > 0.5 && speed > 1e-6 && start_vel.dot(first_dir) < 0.0) {
             if (speed > kMinBrakeSpeed) {
-                brake = plan_brake_segment(robot_pos, start_vel, *grid_map, safe_threshold);
+                brake = plan_brake_segment(robot_pos, start_vel, *grid_map, safe_threshold, planner_config_);
 
                 const Eigen::Vector2d stop =
                     brake.p0 + brake.v0 * brake.duration + 0.5 * brake.acc * brake.duration * brake.duration;
                 start = get_safe_pos(stop, *grid_map, safe_threshold);
-                logger::info(logger::fsm_replan,
+                logger::info(
+                    logger::fsm_replan,
                     "reverse replan: v={:.2f} brake a={:.2f} T={:.2f}s dist={:.2f}m emergency={}",
-                    speed, brake.acc.norm(), brake.duration, (stop - robot_pos).norm(), brake.emergency);
+                    speed,
+                    brake.acc.norm(),
+                    brake.duration,
+                    (stop - robot_pos).norm(),
+                    brake.emergency
+                );
 
                 path_planning.set_velocity(Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
                 trajectory = path_planning.path_planning(start, goal, current_pose.yaw, goal_pose.yaw, 5000);
@@ -187,21 +308,28 @@ auto FsmReplan::plan(
 
         ma_intput.start_vel = start_vel;
         ma_intput.start_acc = start_acc;
-        logger::debug(logger::fsm_replan, "start state: hot={} moved={} v=({:.2f},{:.2f}) a=({:.2f},{:.2f})",
-            hot_start, start_moved, start_vel.x(), start_vel.y(), start_acc.x(), start_acc.y());
+        logger::debug(
+            logger::fsm_replan,
+            "start state: hot={} moved={} v=({:.2f},{:.2f}) a=({:.2f},{:.2f})",
+            hot_start,
+            start_moved,
+            start_vel.x(),
+            start_vel.y(),
+            start_acc.x(),
+            start_acc.y()
+        );
 
-        ma_intput.model=ma_spline_opt::OptModel::OMNI_XY;
-        
-        
+        ma_intput.model = ma_spline_opt::OptModel::OMNI_XY;
+
         auto ma_output = ma_opt_.optimize(ma_intput);
-        if(ma_output.success==false){
-            logger::info(logger::fsm_replan,"ma opt failed");
+        if (ma_output.success == false) {
+            logger::info(logger::fsm_replan, "ma opt failed");
             return tl::make_unexpected(PathError::MINCO_OPT_FIALED);
         }
         ma_output.brake = brake; // 刹车段拼在样条前面（无刹车时 duration=0）
         result_.ma_spline_traj = ma_output;
         last_trajectory_time_ = std::chrono::steady_clock::now();
-        result_.is_new_trajectory = true; 
+        result_.is_new_trajectory = true;
         result_.path_state = PathState::SUCCESSED;
         old_goal_pose_ = goal_pose;
         need_replan_ = false;
@@ -209,7 +337,7 @@ auto FsmReplan::plan(
     }
     return result_;
 }
-auto FsmReplan::one_plan(
+auto FsmReplan::Impl::one_plan(
     const utils::RobotState& goal_pose,
     const utils::RobotState& current_pose,
     std::shared_ptr<grid_map::GridMap> grid_map
@@ -226,17 +354,19 @@ auto FsmReplan::one_plan(
 
     auto trajectory = path_planning.path_planning(start, goal, current_pose.yaw, goal_pose.yaw, 5000);
     if (!trajectory.has_value()) {
-        logger::warn(logger::fsm_replan,"planning failed");
+        logger::warn(logger::fsm_replan, "planning failed");
         return tl::make_unexpected(PathError::PLANNING_FAILED);
     }
-    logger::info(logger::fsm_replan,
+    logger::info(
+        logger::fsm_replan,
         "path points: raw={} optimized={} total_time={:.2f}s",
         result_.planning_traj.raw_path.size(),
         result_.planning_traj.optimized_path.size(),
         result_.planning_traj.total_time
     );
     const auto& timed = result_.planning_traj.timed_trajectory;
-    logger::info(logger::fsm_replan,
+    logger::info(
+        logger::fsm_replan,
         "timed_trajectory: size={}, first_t={:.3f}, last_t={:.3f}, total_time={:.3f}",
         timed.size(),
         timed.empty() ? -1.0 : timed.front().time,
@@ -253,7 +383,8 @@ auto FsmReplan::one_plan(
     return result_;
 }
 
-auto FsmReplan::lateral_deviation(const Eigen::Vector2d& pos, const std::vector<Eigen::Vector2d>& path) -> double {
+auto FsmReplan::Impl::lateral_deviation(const Eigen::Vector2d& pos, const std::vector<Eigen::Vector2d>& path)
+    -> double {
     if (path.size() < 2) {
         return std::numeric_limits<double>::max();
     }
@@ -320,10 +451,11 @@ static bool check_path_collision(
     return false;
 }
 
-auto FsmReplan::check_collision(
+auto FsmReplan::Impl::check_collision(
     path_planning::PathPostProcessing::Trajectory traj,
     const grid_map::GridMap& grid_map,
-    const double& safe_threshold
+    const double& safe_threshold,
+    const PlannerConfig& planner_config_
 ) -> bool {
     // 同时检查 planning原始网格路径与优化后航点路径：
     // 原始路径可发现两个优化航点之间被新障碍挡住的情况；
@@ -332,7 +464,7 @@ auto FsmReplan::check_collision(
     return check_path_collision(traj.optimized_path, grid_map, safe_threshold, step)
         || check_path_collision(traj.raw_path, grid_map, safe_threshold, step);
 }
-auto FsmReplan::get_safe_pos(
+auto FsmReplan::Impl::get_safe_pos(
     const Eigen::Vector2d& pos,
     const grid_map::GridMap& grid_map,
     const double& safe_threshold
@@ -373,11 +505,12 @@ auto FsmReplan::get_safe_pos(
 // 2. 常规刹车距离 L = v²/(2·brake_acc) 放得下就用 brake_acc；
 // 3. 放不下就把减速度提到 v²/(2·L_geo)，上限 brake_acc_max；
 // 4. 上限仍放不下：emergency=true，控制器在刹车段内直接发零速，参考段仍按 brake_acc_max 生成。
-auto FsmReplan::plan_brake_segment(
+auto FsmReplan::Impl::plan_brake_segment(
     const Eigen::Vector2d& p0,
     const Eigen::Vector2d& v0,
     const grid_map::GridMap& grid_map,
-    const double& safe_threshold
+    const double& safe_threshold,
+    const PlannerConfig& planner_config_
 ) -> ma_spline_opt::BrakeSegment {
     ma_spline_opt::BrakeSegment brake;
     const double speed = v0.norm();
@@ -420,7 +553,7 @@ auto FsmReplan::plan_brake_segment(
     brake.duration = speed / a_brake;
     return brake;
 }
-auto FsmReplan::check_point_equal(
+auto FsmReplan::Impl::check_point_equal(
     const Eigen::Vector3d& pos1,
     const Eigen::Vector3d& pos2,
     const Eigen::Vector3d& deviation
