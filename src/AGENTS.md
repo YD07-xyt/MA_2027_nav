@@ -19,4 +19,4 @@
 
 ## 风格与验收
 
-沿周边命名与现有 `.clang-format`、`.clang-tidy`。运行 `./scripts/verify.sh` 检查增量；已有代码只修本任务范围，任何配置、算法及通信变化按根规范确认并留记录。
+沿周边命名与现有 `.clang-format`、`.clang-tidy`。运行 `./scripts/verify.sh` 检查增量；修改 `src/map/**`、`src/planner/**`、`src/utils/**` 核心逻辑前后须按根 `AGENTS.md` 与 `docs/WORKFLOW.md` 用 `bench_nav_pipeline` 和 `scripts/compare_bench.py` 执行改前/改后基准对比。已有代码只修本任务范围，任何配置、算法及通信变化按根规范确认并留记录。

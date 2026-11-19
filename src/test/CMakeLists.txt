@@ -87,3 +87,24 @@ target_link_libraries(test_terrain_replay PUBLIC
     yaml-cpp
     ${PCL_LIBRARIES}
 )
+
+# NAV 核心管线离线基准测试（无 ROS、零仓库副作用，供 AI 改前/改后对比）
+add_executable(bench_nav_pipeline src/bench_nav_pipeline.cpp)
+target_include_directories(bench_nav_pipeline PUBLIC include ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(bench_nav_pipeline PUBLIC
+    spdlog::spdlog
+    utils
+    Eigen3::Eigen
+    3d_occ_map
+    yaml-cpp
+    ${PCL_LIBRARIES}
+    path_planning
+    controller
+    traj_optimize
+    replan
+)
+target_link_libraries(bench_nav_pipeline
+  PRIVATE
+    ${OpenCV_LIBS}
+    benchmark::benchmark
+)

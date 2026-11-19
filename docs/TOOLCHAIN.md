@@ -46,6 +46,33 @@ bash scripts/format.sh src/明确文件.cpp
 
 基线中的 `extract_params.py`、`extract_launch.py`、`extract_ros2.py` 为按需静态证据提取器；若后续重新引入，应显式限定本仓库 root、输入及产物目录，并验证路径和失败传播。`verify_docs.py`、`test_injection.py` 还依赖缺失的 docs/nav 与 docs/_evidence 等输入。`cpp/inventory` 是需授权编译、运行时依赖 clangd 的独立 C++ 工具。以上均未接入本轮门禁。
 
+## 离线基准与对比工具
+
+核心管线离线基准目标为 `src/test/src/bench_nav_pipeline.cpp`（CMake 目标 `bench_nav_pipeline`），依赖系统已安装的 Google Benchmark、OpenCV、Eigen3、yaml-cpp、PCL 与 OSQP/OsqpEigen，不依赖 ROS。只读输入为 `images/rmuc2024.png`、`config/map.yaml`、`config/planner.yaml`，默认零仓库副作用（报告显式输出到被 `.gitignore` 忽略的 `.cache/bench/`）。
+
+```bash
+# 仅增量编译基准目标（依赖已有 build/ma_nav）
+cmake --build build/ma_nav --target bench_nav_pipeline -j
+
+# 仅跑正确性自检（零基准计时）
+./build/ma_nav/src/test/bench_nav_pipeline --sanity-only
+
+# 采集改前/改后 JSON（可用 --benchmark_filter 按前缀筛选：GridMap|MaMap|PathPlanning|TrajOptimize|FsmReplan|Controller）
+./build/ma_nav/src/test/bench_nav_pipeline \
+  --benchmark_repetitions=5 \
+  --benchmark_out=.cache/bench/before.json \
+  --benchmark_out_format=json
+
+# 只读对比（默认比较 real_time median，阈值 +/-5%；--fail-on-regression 在超阈值回退时返回 1）
+python3 scripts/compare_bench.py .cache/bench/before.json .cache/bench/after.json
+python3 scripts/compare_bench.py --metric cpu_time --threshold 5.0 --fail-on-regression \
+  .cache/bench/before.json .cache/bench/after.json
+```
+
+`scripts/compare_bench.py` 仅依赖 Python 3.10+ 标准库，默认只读（仅在显式提供 `--json-out` 时写文件），自动归一化 `ns/us/ms/s`、检查环境上下文差异（`library_build_type`/`host_name`/`num_cpus`/`cpu_scaling_enabled`）并拒绝 `error_occurred` 样本；其隔离单元测试位于 `scripts/tests/test_compare_bench.py`，随 `./scripts/verify.sh` 一并执行。在开启 CPU 变频或大小核（P/E 核）调度的机器上，单线程微基准与并发锁争用项（如 `Controller/Mpc_Solve`、`MaMap/ConcurrentGetSnapshot`）可能出现 5%~9% 的调度抖动；精细对比时建议对单线程项加 `taskset -c 0` 绑核或先确认 CPU 频点一致，并在报告中结合 `cv` 与上下文警告解读。
+
+限制：离线基准覆盖核心 C++ 模块（`GridMap`、`MaMap`、`PathPlanning`、`TrajOptimize`、`FsmReplan`、`Controller`），不替代 ROS 节点回调、rosbag 回放、TSan/ASan 并发插桩或实机验证。
+
 ## 后续模式
 
-构建、clang-tidy、ASan/UBSan、TSan、Benchmark 尚未接入 NAV 入口。它们需要独立确认 CMake、输入、数据库和测试条件。当前脚本不会因为传入扩展选项而生成代码或构建。
+`./scripts/verify.sh` 保持纯静态，不执行构建或动态基准；全量构建预设、clang-tidy、ASan/UBSan、TSan 尚未接入统一入口。它们需要独立确认 CMake、输入、数据库和测试条件。当前静态脚本不会因为传入扩展选项而生成代码或构建。

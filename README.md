@@ -9,9 +9,15 @@
 ./scripts/verify.sh --full-scan     # 全量现状扫描，存量问题也返回失败
 ./scripts/verify.sh --static-only --report .cache/verify/latest.json
 bash scripts/format.sh src/明确文件.cpp  # 显式格式修复，使用现有风格
+
+# 核心代码改前/改后离线基准对比（流程见 docs/WORKFLOW.md 与 docs/TOOLCHAIN.md）
+cmake --build build/ma_nav --target bench_nav_pipeline -j
+./build/ma_nav/src/test/bench_nav_pipeline --benchmark_repetitions=5 \
+  --benchmark_out=.cache/bench/before.json --benchmark_out_format=json
+python3 scripts/compare_bench.py .cache/bench/before.json .cache/bench/after.json
 ```
 
-依赖 Python 3.10+、PyYAML、clang-format 18、Git。范围与返回码见 [工具链](docs/TOOLCHAIN.md)，当前能力见 [架构索引](docs/ARCHITECTURE.md) 和 [规范缺口](docs/STANDARD_GAPS.md)。静态通过不代表构建或功能测试通过；以下构建和安装命令供人工使用，Agent 执行仍须单独授权。
+依赖 Python 3.10+、PyYAML、clang-format 18、Git。范围与返回码见 [工具链](docs/TOOLCHAIN.md)，当前能力见 [架构索引](docs/ARCHITECTURE.md) 和 [规范缺口](docs/STANDARD_GAPS.md)。静态通过不代表构建或功能测试通过；除 [AGENTS.md](AGENTS.md) 约定的 `bench_nav_pipeline` 离线基准常驻授权外，以下构建和安装命令供人工使用，Agent 执行仍须单独授权。
 
 ## env
 

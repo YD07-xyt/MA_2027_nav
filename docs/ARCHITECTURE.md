@@ -22,7 +22,7 @@ path_planning → 3d_occ_map + utils
 3d_occ_map → utils
 ```
 
-`src/test/` 构建离线比较、优化、地图转换和地形回放程序；当前无 CTest 注册闭环。
+`src/test/` 构建离线比较、优化、地图转换、地形回放与核心管线基准程序（`bench_nav_pipeline`，配合 `scripts/compare_bench.py` 做改前/改后对比）；当前无 CTest 注册闭环。
 
 ## 通信与执行边界
 

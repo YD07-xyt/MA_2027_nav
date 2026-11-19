@@ -8,7 +8,8 @@
 
 - 唯一修改工作区为 `/home/xyt/map/src/MA_2027_nav`。工具以本仓库为根，不自动发现父目录或其他项目。用户明确指定的外部参考路径可按需只读查阅，不在其中修改文件或执行工具链。
 - **构建必须先取得用户明确许可**：包括 CMake 配置/探测、编译、链接、代码生成及 `colcon build`、`catkin build`、`catkin_make`、`make`、`ninja`、`cargo build/check`、`npm/yarn build` 等。CMake 配置也可能编译探测程序，不属于静态检查。不确定命令是否触发这些操作时先询问。
-- 无需构建授权的检查包括只读搜索、Git 状态/差异、Python AST、XML/YAML 解析及本仓库的静态验证入口与隔离工具测试。导航离线程序、ROS 节点/launch、回放或实机运行须获得相应运行范围的明确授权；构建许可不自动包含运行许可。
+- **离线基准常驻授权（例外）**：修改 `src/map/**`、`src/planner/**`、`src/utils/**` 或 `src/test/src/bench_nav_pipeline.cpp` 前后，已常驻授权直接执行 `bench_nav_pipeline` 增量编译（`cmake --build build/ma_nav --target bench_nav_pipeline -j`）、离线运行 `./build/ma_nav/src/test/bench_nav_pipeline`（报告仅写 `.cache/bench/`）与只读对比脚本 `python3 scripts/compare_bench.py`。若 `build/ma_nav` 不存在或需重新 `colcon build`/首次 CMake 配置，仍须先取得构建许可。其他编译目标、ROS 节点/launch、回放/实机运行仍须单独授权，Git 写操作限制不变。
+- 无需构建授权的检查包括只读搜索、Git 状态/差异、Python AST、XML/YAML 解析及本仓库的静态验证入口与隔离工具测试。除上述常驻离线基准外，其他导航离线程序、ROS 节点/launch、回放或实机运行须获得相应运行范围的明确授权；构建许可不自动包含运行许可。
 - **Agent 只修改工作区文件，不执行版本控制写操作**：禁止更改 Git 索引、历史、远端、分支、标签或通过 Git 命令覆盖工作区文件。包括 `git add/commit/push/tag/merge/rebase/cherry-pick/revert`、`git reset`、`git checkout`、`git restore`、`git clean`、分支写操作、`gh pr merge`、`gh release create` 等；用户授权构建不改变此限制。只读 `git status/diff/log/show` 等允许使用。
 - **禁止 writingplans 及类似计划说明工具**，不生成独立计划文件。需求与边界明确后直接执行，必要的简短说明不阻塞修改，事后补充审计记录。
 - **只有用户明确要求时才启动子 Agent**；复杂度本身不构成授权。角色与交接按 [工作流](docs/WORKFLOW.md#5-用户明确要求时的多-agent-流程) 执行。
@@ -39,6 +40,7 @@
 ## 4. 验证与交付底线
 
 - `./scripts/verify.sh` 默认仅做静态检查；参数不授予构建或运行许可。静态通过不代表编译、导航运行、并发、性能或实机验证通过。
+- **核心代码改前/改后基准对比（必选）**：修改 `src/map/**`、`src/planner/**`、`src/utils/**` 的算法、数据结构、并发、内存或核心逻辑前，须先用 `bench_nav_pipeline` 采集改前基线（`.cache/bench/<task>_before.json`），改动后以同参数重编重跑采集改后结果（`.cache/bench/<task>_after.json`），并用 `scripts/compare_bench.py` 输出前后对比；执行步骤与例外见 [工作流](docs/WORKFLOW.md#3-修改与验证)。仅文档/注释/纯格式/静态脚本修改标记基准对比 `N/A`。
 - 修改完成后检查本次 diff 与受影响链路；记录触发条件、模板和交付格式统一见 [工作流](docs/WORKFLOW.md#4-审查记录与交付)。普通问答无需生成记录或套用修改交付模板。
 - 结果必须带范围。逐项使用 `PASS`（通过）、`NEEDS_FIX`（明确失败/缺陷）、`NOT_VERIFIED`（未验证）、`N/A`（不适用），不把缺失证据写成通过。
-- 修改交付中若未获构建许可，明确写：**未执行构建：AGENTS.md 禁止在未获用户明确许可前运行构建命令。**
+- 修改交付中若未获构建许可（且未触发离线基准常驻授权），明确写：**未执行构建：AGENTS.md 禁止在未获用户明确许可前运行构建命令。**
