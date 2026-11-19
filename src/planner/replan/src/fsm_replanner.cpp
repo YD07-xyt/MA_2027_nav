@@ -14,7 +14,9 @@
 namespace replan {
 class FsmReplan::Impl {
 public:
-    Impl() = default;
+    Impl() {
+        path_planning.set_use_jps(true);
+    }
 
     auto plan(
         const utils::RobotState& goal_pose,
@@ -42,20 +44,18 @@ private:
     auto get_safe_pos(const Eigen::Vector2d& pos, const grid_map::GridMap& grid_map, const double& safe_threshold)
         -> Eigen::Vector2d;
     auto check_collision(
-        path_planning::PathPostProcessing::Trajectory traj,
+        const path_planning::PathPostProcessing::Trajectory& traj,
         const grid_map::GridMap& grid_map,
-        const double& safe_threshold,
-        const PlannerConfig& planner_config_
-    ) -> bool;
-    auto lateral_deviation(const Eigen::Vector2d& pos, const std::vector<Eigen::Vector2d>& path) -> double;
+        const double& safe_threshold
+    ) const -> bool;
+    auto lateral_deviation(const Eigen::Vector2d& pos, const std::vector<Eigen::Vector2d>& path) const -> double;
     // 反向重规划：沿速度方向生成匀减速刹车段（ESDF 射线检测可用距离）
     auto plan_brake_segment(
         const Eigen::Vector2d& p0,
         const Eigen::Vector2d& v0,
         const grid_map::GridMap& grid_map,
-        const double& safe_threshold,
-        const PlannerConfig& planner_config_
-    ) -> ma_spline_opt::BrakeSegment;
+        const double& safe_threshold
+    ) const -> ma_spline_opt::BrakeSegment;
 };
 
 FsmReplan::FsmReplan(): impl_(std::make_unique<Impl>()) {}
@@ -113,6 +113,17 @@ static bool check_path_collision(
     const double& safe_threshold,
     const double step
 );
+// 点到线段 [a, b] 的最短距离。
+static double point_to_segment_dist(const Eigen::Vector2d& pos, const Eigen::Vector2d& a, const Eigen::Vector2d& b) {
+    const Eigen::Vector2d ab = b - a;
+    const double len2 = ab.squaredNorm();
+    double t = 0.0;
+    if (len2 > 1e-12) {
+        t = std::max(0.0, std::min(1.0, (pos - a).dot(ab) / len2));
+    }
+    const Eigen::Vector2d closest = a + t * ab;
+    return (pos - closest).norm();
+}
 auto FsmReplan::Impl::plan(
     const utils::RobotState& goal_pose,
     const utils::RobotState& current_pose,
@@ -138,20 +149,24 @@ auto FsmReplan::Impl::plan(
     Eigen::Vector2d threshold = planner_config_.replan_params.goal_deviation.head<2>();
     const bool goal_changed = diff.cwiseAbs().x() > threshold.x() || diff.cwiseAbs().y() > threshold.y();
 
-    const bool path_collision = result_.planning_traj.optimized_path.empty()
-        || check_collision(result_.planning_traj, *grid_map, hard_clearance, planner_config_);
-
-    //机器人偏离参考路径超过 replan_lateral_dev_
-    // 有刹车段时把刹车起点接到路径前面（刹车段是 p0 -> 刹停点的直线），避免刹车过程中被判为横向偏离
-    std::vector<Eigen::Vector2d> ref_path = result_.planning_traj.optimized_path;
-    if (result_.ma_spline_traj.brake.duration > 0.0 && !ref_path.empty()) {
-        ref_path.insert(ref_path.begin(), result_.ma_spline_traj.brake.p0);
+    bool must_replan = state_ == State::IDLE || state_ == State::RETRY_PENDING || goal_changed;
+    if (!must_replan) {
+        const bool path_collision = result_.planning_traj.optimized_path.empty()
+            || check_collision(result_.planning_traj, *grid_map, hard_clearance);
+        must_replan = path_collision;
     }
-    const double lateral_dev = lateral_deviation(Eigen::Vector2d(current_pose.p.x(), current_pose.p.y()), ref_path);
-
-    const bool path_deviation = lateral_dev > planner_config_.replan_params.replan_lateral_dev;
-    const bool must_replan =
-        state_ == State::IDLE || state_ == State::RETRY_PENDING || goal_changed || path_collision || path_deviation;
+    if (!must_replan) {
+        // 机器人偏离参考路径超过 replan_lateral_dev；有刹车段时一并检查 p0 -> 首航点直线，避免拷贝路径。
+        const Eigen::Vector2d current_xy(current_pose.p.x(), current_pose.p.y());
+        const auto& opt_path = result_.planning_traj.optimized_path;
+        double lateral_dev = lateral_deviation(current_xy, opt_path);
+        if (result_.ma_spline_traj.brake.duration > 0.0 && !opt_path.empty()) {
+            const double brake_dev =
+                point_to_segment_dist(current_xy, result_.ma_spline_traj.brake.p0, opt_path.front());
+            lateral_dev = std::min(lateral_dev, brake_dev);
+        }
+        must_replan = lateral_dev > planner_config_.replan_params.replan_lateral_dev;
+    }
     if (!must_replan) {
         transition(Event::KEEP_MONITORING);
         return result_;
@@ -170,8 +185,6 @@ auto FsmReplan::Impl::plan(
         start = get_safe_pos(start, *grid_map, safe_threshold);
         goal = get_safe_pos(goal, *grid_map, safe_threshold);
         const bool start_moved = (start - robot_pos).norm() > 1e-6;
-
-        path_planning.set_use_jps(true);
 
         // 起点速度/加速度：取机器人在上一条参考（刹车段 + 样条）上最近投影时刻的计划 v(t)、a(t)
         // （同 navkit prepareHotStart）。不使用里程计速度；没有可用的上一条参考时按静止处理。
@@ -238,7 +251,7 @@ auto FsmReplan::Impl::plan(
         const double speed = start_vel.norm();
         if (first_dir.norm() > 0.5 && speed > 1e-6 && start_vel.dot(first_dir) < 0.0) {
             if (speed > kMinBrakeSpeed) {
-                brake = plan_brake_segment(robot_pos, start_vel, *grid_map, safe_threshold, planner_config_);
+                brake = plan_brake_segment(robot_pos, start_vel, *grid_map, safe_threshold);
 
                 const Eigen::Vector2d stop =
                     brake.p0 + brake.v0 * brake.duration + 0.5 * brake.acc * brake.duration * brake.duration;
@@ -271,9 +284,6 @@ auto FsmReplan::Impl::plan(
             start_acc.setZero();
         }
 
-        // 先生成候选，优化成功后再整体提交。
-        ResultPath candidate = result_;
-        candidate.planning_traj = trajectory.value();
         // 打印 raw_path / optimized_path 点数,确认直线/近距离时的短路情况
         // logger::info(logger::fsm_replan,
         //     "path points: raw={} optimized={} total_time={:.2f}s",
@@ -314,10 +324,13 @@ auto FsmReplan::Impl::plan(
             return tl::make_unexpected(PathError::MINCO_OPT_FIALED);
         }
         ma_output.brake = brake; // 刹车段拼在样条前面（无刹车时 duration=0）
-        candidate.ma_spline_traj = ma_output;
-        last_trajectory_time_ = std::chrono::steady_clock::now();
+        // 优化成功后再组装并整体提交，失败时保持旧轨迹不变。
+        ResultPath candidate;
+        candidate.planning_traj = std::move(trajectory.value());
+        candidate.ma_spline_traj = std::move(ma_output);
         candidate.is_new_trajectory = true;
         candidate.path_state = PathState::SUCCESSED;
+        last_trajectory_time_ = std::chrono::steady_clock::now();
         result_ = std::move(candidate);
         old_goal_pose_ = goal_pose;
         transition(Event::PLAN_SUCCEEDED);
@@ -325,7 +338,7 @@ auto FsmReplan::Impl::plan(
     }
 }
 
-auto FsmReplan::Impl::lateral_deviation(const Eigen::Vector2d& pos, const std::vector<Eigen::Vector2d>& path)
+auto FsmReplan::Impl::lateral_deviation(const Eigen::Vector2d& pos, const std::vector<Eigen::Vector2d>& path) const
     -> double {
     if (path.size() < 2) {
         return std::numeric_limits<double>::max();
@@ -333,18 +346,7 @@ auto FsmReplan::Impl::lateral_deviation(const Eigen::Vector2d& pos, const std::v
     // 点到折线各段的最短距离（逐段投影并夹紧到线段内）
     double min_dist = std::numeric_limits<double>::max();
     for (size_t i = 1; i < path.size(); ++i) {
-        const Eigen::Vector2d a = path[i - 1];
-        const Eigen::Vector2d b = path[i];
-        const Eigen::Vector2d ab = b - a;
-        const double len2 = ab.squaredNorm();
-        double t = 0.0;
-        if (len2 > 1e-12) {
-            //计算点 pos 到线段 [a, b] 的投影参数 t，并将其限制在 [0, 1] 区间内
-            t = std::max(0.0, std::min(1.0, (pos - a).dot(ab) / len2));
-        }
-        //点 pos 到线段 [a, b] 的投影点
-        const Eigen::Vector2d closest = a + t * ab;
-        min_dist = std::min(min_dist, (pos - closest).norm());
+        min_dist = std::min(min_dist, point_to_segment_dist(pos, path[i - 1], path[i]));
     }
     return min_dist;
 }
@@ -394,11 +396,10 @@ static bool check_path_collision(
 }
 
 auto FsmReplan::Impl::check_collision(
-    path_planning::PathPostProcessing::Trajectory traj,
+    const path_planning::PathPostProcessing::Trajectory& traj,
     const grid_map::GridMap& grid_map,
-    const double& safe_threshold,
-    const PlannerConfig& planner_config_
-) -> bool {
+    const double& safe_threshold
+) const -> bool {
     // 同时检查 planning原始网格路径与优化后航点路径：
     // 原始路径可发现两个优化航点之间被新障碍挡住的情况；
     // 再对每段折线做密集采样，避免长直线中间漏检。
@@ -451,9 +452,8 @@ auto FsmReplan::Impl::plan_brake_segment(
     const Eigen::Vector2d& p0,
     const Eigen::Vector2d& v0,
     const grid_map::GridMap& grid_map,
-    const double& safe_threshold,
-    const PlannerConfig& planner_config_
-) -> ma_spline_opt::BrakeSegment {
+    const double& safe_threshold
+) const -> ma_spline_opt::BrakeSegment {
     ma_spline_opt::BrakeSegment brake;
     const double speed = v0.norm();
     if (speed < 1e-6) return brake;
