@@ -156,7 +156,7 @@ auto sample_queries(Case& c, double safe, std::mt19937& rng) -> void {
          ++attempt) {
         const Query q {free_cells[pick(rng)], free_cells[pick(rng)]};
         if ((q.goal - q.start).norm() < kMinQueryDist) continue;
-        auto path = c.jps.jps_search(q.start, q.goal, kTimeoutMs);
+        auto path = c.jps.jps_search(gm, q.start, q.goal, kTimeoutMs);
         if (path.size() < 2) continue; // 不连通
         c.queries.push_back(q);
         c.raw_paths.push_back(std::move(path));
@@ -174,13 +174,18 @@ auto ms_since(std::chrono::steady_clock::time_point t0) -> double {
 }
 
 // 跑一次完整后处理（与 path_planning.cpp 的调用顺序一致）
-auto run_pipeline(PostProc& post, const Query& q, const std::vector<Eigen::Vector2d>& raw,
-                  std::array<double, kNumStages>* stage_ms) -> PostProc::Trajectory {
+auto run_pipeline(
+    PostProc& post,
+    const grid_map::GridMap& gm,
+    const Query& q,
+    const std::vector<Eigen::Vector2d>& raw,
+    std::array<double, kNumStages>* stage_ms
+) -> PostProc::Trajectory {
     PostProc::Trajectory traj;
     traj.raw_path = raw;
 
     auto t0 = std::chrono::steady_clock::now();
-    traj.optimized_path = post.optimize_path(traj.raw_path);
+    traj.optimized_path = post.optimize_path(gm, traj.raw_path);
     if (stage_ms) (*stage_ms)[0] = ms_since(t0);
 
     t0 = std::chrono::steady_clock::now();
@@ -188,7 +193,7 @@ auto run_pipeline(PostProc& post, const Query& q, const std::vector<Eigen::Vecto
     if (stage_ms) (*stage_ms)[1] = ms_since(t0);
 
     t0 = std::chrono::steady_clock::now();
-    post.assign_trajectory_timing(traj);
+    post.assign_trajectory_timing(gm, traj);
     if (stage_ms) (*stage_ms)[2] = ms_since(t0);
 
     t0 = std::chrono::steady_clock::now();
@@ -206,13 +211,14 @@ auto timed_points(const PostProc::Trajectory& traj) -> std::vector<Eigen::Vector
 
 auto run_case(Case& c, const PostProc::PathPostProcessingParams& p) -> void {
     c.results.clear();
+    const auto& gm = c.map->grid_map();
     for (size_t qi = 0; qi < c.queries.size(); ++qi) {
         Result r;
         std::array<std::vector<double>, kNumStages> samples;
         std::vector<double> totals;
         for (int k = 0; k < kRepeat; ++k) {
             std::array<double, kNumStages> st {};
-            auto traj = run_pipeline(c.post, c.queries[qi], c.raw_paths[qi], &st);
+            auto traj = run_pipeline(c.post, gm, c.queries[qi], c.raw_paths[qi], &st);
             double sum = 0.0;
             for (int s = 0; s < kNumStages; ++s) {
                 samples[s].push_back(st[s]);
@@ -227,7 +233,7 @@ auto run_case(Case& c, const PostProc::PathPostProcessingParams& p) -> void {
         const auto& t = r.traj;
         r.ok = t.timed_trajectory.size() >= 2 && t.total_time > 1e-6;
         for (size_t i = 1; i < t.optimized_path.size(); ++i) {
-            if (c.post.check_line_collision(t.optimized_path[i - 1], t.optimized_path[i])) r.line_free = false;
+            if (c.post.check_line_collision(gm, t.optimized_path[i - 1], t.optimized_path[i])) r.line_free = false;
         }
         const int n_seg = static_cast<int>(t.timed_trajectory.size()) - 1;
         r.count_ok = n_seg >= p.min_traj_num && n_seg <= p.max_traj_num;
@@ -378,9 +384,7 @@ int main(int argc, char** argv) {
             std::printf("skip %s: %s\n", name.c_str(), e.what());
             continue;
         }
-        c->jps.set_map(c->map->grid_map());
         c->jps.set_safe_threshold(params.safe_threshold);
-        c->post.set_map(c->map->grid_map());
         c->post.set_params(params);
 
         const auto level = logger::planning->level();
@@ -431,9 +435,10 @@ int main(int argc, char** argv) {
         Case* cp = c.get();
         const auto nq = static_cast<int64_t>(cp->queries.size());
         benchmark::RegisterBenchmark(("PostProcessing/" + cp->name).c_str(), [cp, nq](benchmark::State& st) {
+            const auto& gm = cp->map->grid_map();
             for (auto _: st) {
                 for (size_t i = 0; i < cp->queries.size(); ++i) {
-                    auto t = run_pipeline(cp->post, cp->queries[i], cp->raw_paths[i], nullptr);
+                    auto t = run_pipeline(cp->post, gm, cp->queries[i], cp->raw_paths[i], nullptr);
                     benchmark::DoNotOptimize(t.total_time);
                 }
             }

@@ -11,54 +11,67 @@ constexpr double K_SQRT2 = 1.4142135623730951; // 对角步长(栅格单位)
 constexpr int K_TIMEOUT_CHECK_INTERVAL = 256;  // 每展开 N 个节点检查一次超时
 }
 
-AStar::AStar(grid_map::GridMap& map, double safe_threshold): map_(map), safe_threshold_(safe_threshold) {
-    set_map(map);
-};
+auto AStar::sync_map_cache(const grid_map::GridMap& map) -> bool {
+    const Eigen::Vector2i voxel_num = map.getVoxelNum();
+    nx_ = voxel_num.x();
+    ny_ = voxel_num.y();
+    origin_ = map.getOrigin();
+    resolution_ = map.getResolution();
 
+    if (nx_ <= 0 || ny_ <= 0 || resolution_ <= 0.0) {
+        return false;
+    }
 
-auto AStar::set_map(const grid_map::GridMap& map) -> void {
-    map_ = map;
-    nx_ = map_.getVoxelNum().x();
-    ny_ = map_.getVoxelNum().y();
-    origin_ = map_.getOrigin();
-    resolution_ = map_.getResolution();
-
-    const int n = nx_ * ny_;
-    blocked_cache_.assign(static_cast<size_t>(n), 0); // 地图更新后占用缓存失效
-    if (static_cast<int>(open_gen_.size()) != n) {
-        open_gen_.assign(static_cast<size_t>(n), 0);
-        closed_gen_.assign(static_cast<size_t>(n), 0);
-        g_score_.assign(static_cast<size_t>(n), 0.0);
-        parent_.assign(static_cast<size_t>(n), -1);
+    const size_t n = static_cast<size_t>(nx_) * static_cast<size_t>(ny_);
+    if (open_gen_.size() != n) {
+        open_gen_.assign(n, 0);
+        closed_gen_.assign(n, 0);
+        g_score_.assign(n, 0.0);
+        parent_.assign(n, -1);
         search_gen_ = 0; // 数组刚被整体清零,代际可以安全复位
     }
     // 尺寸不变时不能复位 search_gen_,否则上一轮的 open/closed 标记会被误认为本轮记录。
+
+    const uint64_t esdf_rev = map.esdf_revision();
+    const bool cache_hit = cache_valid_ && esdf_rev != 0 && cached_esdf_revision_ == esdf_rev
+        && cached_safe_threshold_ == safe_threshold_ && blocked_cache_.size() == n;
+    if (!cache_hit) {
+        blocked_cache_.assign(n, 0); // ESDF/阈值/尺寸变化时清空占用缓存
+        cached_esdf_revision_ = esdf_rev;
+        cached_safe_threshold_ = safe_threshold_;
+        cache_valid_ = (esdf_rev != 0);
+    }
+    return true;
 }
 
-auto AStar::original_astar_search(const Eigen::Vector2d& start, const Eigen::Vector2d& goal, int timeout_ms)
-    -> std::vector<Eigen::Vector2d> {
+auto AStar::original_astar_search(
+    const grid_map::GridMap& map,
+    const Eigen::Vector2d& start,
+    const Eigen::Vector2d& goal,
+    int timeout_ms
+) -> std::vector<Eigen::Vector2d> {
     auto start_time = std::chrono::steady_clock::now();
 
-    if (nx_ <= 0 || ny_ <= 0) {
+    if (!sync_map_cache(map)) {
         logger::error(logger::planning, "A*: map is not set!");
         return {};
     }
 
     // Check start/goal validity
-    if (check_collision(start)) {
-       logger::error(logger::planning,"start point in collision!");
+    if (check_collision(map, start)) {
+        logger::error(logger::planning, "start point in collision!");
         return {};
     }
-    if (check_collision(goal)) {
-       logger::error(logger::planning,"Goal point in collision!");
+    if (check_collision(map, goal)) {
+        logger::error(logger::planning, "Goal point in collision!");
         return {};
     }
 
     // 起点/终点吸附到栅格,并限制在地图范围内
     Eigen::Vector2i start_idx;
     Eigen::Vector2i goal_idx;
-    map_.posToIndex(start, start_idx);
-    map_.posToIndex(goal, goal_idx);
+    map.posToIndex(start, start_idx);
+    map.posToIndex(goal, goal_idx);
     start_idx.x() = std::clamp(start_idx.x(), 0, nx_ - 1);
     start_idx.y() = std::clamp(start_idx.y(), 0, ny_ - 1);
     goal_idx.x() = std::clamp(goal_idx.x(), 0, nx_ - 1);
@@ -132,7 +145,7 @@ auto AStar::original_astar_search(const Eigen::Vector2d& start, const Eigen::Vec
                 if (closed_gen_[nlin] == gen) continue;
 
                 // 终点栅格即使中心落在膨胀区内也允许进入(精确终点已在入口校验)
-                if (nlin != goal_lin && blocked(nx, ny)) continue;
+                if (nlin != goal_lin && blocked(map, nx, ny)) continue;
 
                 const double step_cost = (dx != 0 && dy != 0) ? K_SQRT2 : 1.0; // Orthogonal/diagonal cost
                 const double tentative_g = g_cur + step_cost;
@@ -153,7 +166,7 @@ auto AStar::original_astar_search(const Eigen::Vector2d& start, const Eigen::Vec
     return {}; // Open set empty, no path found
 }
 
-auto AStar::blocked(int x, int y) const -> bool {
+auto AStar::blocked(const grid_map::GridMap& map, int x, int y) const -> bool {
     if (x < 0 || x >= nx_ || y < 0 || y >= ny_) return true;
 
     const int a = x * ny_ + y;
@@ -162,7 +175,7 @@ auto AStar::blocked(int x, int y) const -> bool {
 
     // 在栅格中心求值 ESDF
     const Eigen::Vector2d center((x + 0.5) * resolution_ + origin_.x(), (y + 0.5) * resolution_ + origin_.y());
-    blocked_cache_[a] = (map_.getDistance(center) < safe_threshold_) ? -1 : 1;
+    blocked_cache_[a] = (map.getDistance(center) < safe_threshold_) ? -1 : 1;
     return blocked_cache_[a] < 0;
 }
 
@@ -189,11 +202,11 @@ auto AStar::reconstruct_path(int goal_lin) const -> std::vector<Eigen::Vector2d>
     return path;
 }
 
-auto AStar::check_collision(const Eigen::Vector2d& pos) const -> bool {
+auto AStar::check_collision(const grid_map::GridMap& map, const Eigen::Vector2d& pos) const -> bool {
     // Points outside map are considered collision-free
-    if (!map_.isInsideMap(pos)) return false;
+    if (!map.isInsideMap(pos)) return false;
 
     // Points inside map use safety distance check
-    return map_.getDistance(pos) < safe_threshold_;
+    return map.getDistance(pos) < safe_threshold_;
 }
 }

@@ -69,7 +69,7 @@ private:
     rclcpp::CallbackGroup::SharedPtr planner_cb_group_;
     rclcpp::CallbackGroup::SharedPtr control_cb_group_; // 控制器 + 可视化
 
-    // 保护 ma_map_ 的读写锁（读共享，写独占）
+    // 保护 clicked_regions_ 与语义区域写入临界区（MaMap 快照读写由内部锁保护）
     mutable std::shared_mutex map_mutex_;
 
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr map_sub_;
@@ -102,7 +102,6 @@ private:
 private:
     Eigen::Vector3d old_goal_pose_=Eigen::Vector3d::Zero();
     //地图
-    std::shared_ptr<grid_map::GridMap> grid_map_;
     std::shared_ptr<ma_map::MaMap> ma_map_;
     //重规划
     replan::FsmReplan fsm_replanner;

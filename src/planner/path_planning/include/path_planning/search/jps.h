@@ -27,33 +27,35 @@ namespace path_planning {
  */
 class JPS {
 public:
-    //初始化方式1
-    JPS(grid_map::GridMap& map, double safe_threshold);
-    
-    //=======初始化方式2=======//
     JPS() = default;
-    auto set_map(const grid_map::GridMap& map) -> void;
     auto set_safe_threshold(const double& safe_threshold) -> void {
         safe_threshold_ = safe_threshold;
-        std::fill(blocked_cache_.begin(), blocked_cache_.end(), 0); // 安全阈值变化后占用可能改变
     }
-    //=======================//
 
+    // 同步只读借用外部 GridMap 快照（调用期间须保持 map 有效且不被并发修改）。
     // JPS 搜索。返回航点路径(栅格中心,首点为精确起点,与
     // AStar::original_astar_search 的约定一致)。
-    // 返回空 vector = 起点/终点无效、无路径或超时。
-    auto jps_search(const Eigen::Vector2d& start, const Eigen::Vector2d& goal, int timeout_ms = 1000)
-        -> std::vector<Eigen::Vector2d>;
+    // 返回空 vector = 地图未初始化、起点/终点无效、无路径或超时。
+    auto jps_search(
+        const grid_map::GridMap& map,
+        const Eigen::Vector2d& start,
+        const Eigen::Vector2d& goal,
+        int timeout_ms = 1000
+    ) -> std::vector<Eigen::Vector2d>;
 
 private:
-    grid_map::GridMap map_;
     double safe_threshold_ = 0.0;
 
-    // 缓存的栅格几何信息(与 grid_map::GridMap map_ 保持一致)
+    // 缓存的栅格几何信息(每次搜索入口与传入 map 同步)
     int nx_ = 0;
     int ny_ = 0;
     Eigen::Vector2d origin_ = Eigen::Vector2d::Zero();
     double resolution_ = 0.1;
+
+    // 占用缓存元数据：仅当 (esdf_revision, safe_threshold, nx, ny) 全部一致时复用 blocked_cache_
+    uint64_t cached_esdf_revision_ = 0;
+    double cached_safe_threshold_ = 0.0;
+    bool cache_valid_ = false;
 
     // 终点所在栅格(jump_ray 热路径使用)
     int goal_x_ = -1;
@@ -77,35 +79,38 @@ private:
         return x >= 0 && x < nx_ && y >= 0 && y < ny_;
     }
 
+    // 同步本次搜索的地图几何与缓存数组（按需惰性分配，不拷贝 GridMap）
+    auto sync_map_cache(const grid_map::GridMap& map) -> bool;
+
     // 带缓存的逐栅格占用判定;越界栅格一律视为被占用。
-    bool blocked(int x, int y) const;
+    bool blocked(const grid_map::GridMap& map, int x, int y) const;
 
     // 八叉距离(以栅格为单位),是 8 连通栅格的一致启发函数。
     static double heuristic_cells(int dx, int dy);
 
     // 判断 (x, y) 相对来向 (dx, dy) 是否存在强制邻居。
-    bool has_forced_neighbor(int x, int y, int dx, int dy) const;
+    bool has_forced_neighbor(const grid_map::GridMap& map, int x, int y, int dx, int dy) const;
 
     // 从 (x, y) 沿 (dx, dy) 扫描直线射线。成功时把第一个跳点(或终点所在
     // 栅格)写入 jp 并返回 true。
-    bool jump_ray(int x, int y, int dx, int dy, Eigen::Vector2i& jp) const;
+    bool jump_ray(const grid_map::GridMap& map, int x, int y, int dx, int dy, Eigen::Vector2i& jp) const;
 
     // 展开 (x, y) 时需要扫描的方向,由来向决定(父节点剪枝)。
     // 起点节点(in == 0,0)扫描全部 8 个方向。
-    int neighbor_directions(int x, int y, int in_dx, int in_dy, int dirs[8][2]) const;
+    int neighbor_directions(const grid_map::GridMap& map, int x, int y, int in_dx, int in_dy, int dirs[8][2]) const;
 
     // 8 个邻居中是否至少有一个自由栅格。
-    bool has_free_neighbor(int x, int y) const;
+    bool has_free_neighbor(const grid_map::GridMap& map, int x, int y) const;
 
     // 8 个邻居中被占用栅格的个数(用于诊断日志)。
-    int blocked_neighbor_count(int x, int y) const;
+    int blocked_neighbor_count(const grid_map::GridMap& map, int x, int y) const;
 
     // 环形搜索在 max_radius 个栅格内最近的"可通行"栅格(自由且至少有一个
     // 自由邻居)。用于从被占用 / 孤立 / 地图外的起点恢复搜索,与 A* 对地图外
     // 点的容忍行为保持一致。
-    bool find_navigable_cell(int x, int y, int max_radius, Eigen::Vector2i& out) const;
+    bool find_navigable_cell(const grid_map::GridMap& map, int x, int y, int max_radius, Eigen::Vector2i& out) const;
 
-    bool check_collision(const Eigen::Vector2d& pos) const;
+    bool check_collision(const grid_map::GridMap& map, const Eigen::Vector2d& pos) const;
 
     std::vector<Eigen::Vector2d> reconstruct_path(int goal_lin) const;
 };

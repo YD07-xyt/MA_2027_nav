@@ -21,7 +21,7 @@ public:
     auto plan(
         const utils::RobotState& goal_pose,
         const utils::RobotState& current_pose,
-        std::shared_ptr<grid_map::GridMap> grid_map
+        grid_map::GridMap::ConstPtr grid_map
     ) -> path;
     auto set_param(const PlannerConfig& planner_config) -> void;
     path_planning::PathPlanning path_planning;
@@ -101,7 +101,7 @@ auto FsmReplan::set_param(const PlannerConfig& planner_config) -> void {
 auto FsmReplan::plan(
     const utils::RobotState& goal_pose,
     const utils::RobotState& current_pose,
-    std::shared_ptr<grid_map::GridMap> grid_map
+    grid_map::GridMap::ConstPtr grid_map
 ) -> path {
     return impl_->plan(goal_pose, current_pose, std::move(grid_map));
 }
@@ -127,8 +127,13 @@ static double point_to_segment_dist(const Eigen::Vector2d& pos, const Eigen::Vec
 auto FsmReplan::Impl::plan(
     const utils::RobotState& goal_pose,
     const utils::RobotState& current_pose,
-    std::shared_ptr<grid_map::GridMap> grid_map
+    grid_map::GridMap::ConstPtr grid_map
 ) -> path {
+    if (!grid_map) {
+        logger::warn(logger::fsm_replan, "grid_map snapshot is null");
+        return tl::make_unexpected(PathError::PLANNING_FAILED);
+    }
+
     result_.is_new_trajectory = false;
 
     // 起点≈终点（机器人已到达目标附近）：直接退出，不规划。
@@ -175,7 +180,6 @@ auto FsmReplan::Impl::plan(
     transition(Event::START);
     {
         utils::TimeConsuming timer("planner_fsm", true); // true 表示允许打印
-        path_planning.set_map(*grid_map);
 
         Eigen::Vector2d start(current_pose.p.x(), current_pose.p.y());
         Eigen::Vector2d goal(goal_pose.p.x(), goal_pose.p.y());
@@ -226,7 +230,7 @@ auto FsmReplan::Impl::plan(
         const Eigen::Vector3d current_vel(start_vel.x(), start_vel.y(), current_pose.wz);
         path_planning.set_velocity(current_vel, Eigen::Vector3d::Zero());
 
-        auto trajectory = path_planning.path_planning(start, goal, current_pose.yaw, goal_pose.yaw, 5000);
+        auto trajectory = path_planning.path_planning(*grid_map, start, goal, current_pose.yaw, goal_pose.yaw, 5000);
 
         if (!trajectory.has_value()) {
             logger::warn(logger::fsm_replan, "planning failed");
@@ -267,7 +271,7 @@ auto FsmReplan::Impl::plan(
                 );
 
                 path_planning.set_velocity(Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
-                trajectory = path_planning.path_planning(start, goal, current_pose.yaw, goal_pose.yaw, 5000);
+                trajectory = path_planning.path_planning(*grid_map, start, goal, current_pose.yaw, goal_pose.yaw, 5000);
                 if (!trajectory.has_value()) {
                     logger::warn(logger::fsm_replan, "planning from brake stop point failed");
                     transition(Event::PLAN_FAILED);
@@ -292,7 +296,6 @@ auto FsmReplan::Impl::plan(
         //     result_.planning_traj.total_time
         // );
         minco_opt::GridMapESDF grid_map_esdf(grid_map);
-        ma_opt_.set_esdf_interface(&grid_map_esdf);
         auto ma_intput = ma_spline_opt::from_path_planning_trajectory(trajectory.value());
 
         // 起点被挪开：速度只保留沿新路径首段方向的分量（反向置 0），加速度置 0
@@ -317,7 +320,7 @@ auto FsmReplan::Impl::plan(
 
         ma_intput.model = ma_spline_opt::OptModel::OMNI_XY;
 
-        auto ma_output = ma_opt_.optimize(ma_intput);
+        auto ma_output = ma_opt_.optimize(ma_intput, grid_map_esdf);
         if (ma_output.success == false) {
             logger::info(logger::fsm_replan, "ma opt failed");
             transition(Event::PLAN_FAILED);

@@ -64,11 +64,12 @@ public:
         MINCO_OPT_FIALED,
     };
     using path = tl::expected<ResultPath, PathError>;
+    // 接收不可变地图快照；grid_map 为空时返回 PLANNING_FAILED，不改变内部状态与已提交轨迹。
     // 失败只返回单次错误，已提交的轨迹保持不变。
     auto plan(
         const utils::RobotState& goal_pose,
         const utils::RobotState& current_pose,
-        std::shared_ptr<grid_map::GridMap> grid_map
+        grid_map::GridMap::ConstPtr grid_map
     ) -> path;
 
 private:

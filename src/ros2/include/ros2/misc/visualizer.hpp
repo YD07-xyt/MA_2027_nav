@@ -878,7 +878,10 @@ void PubOptPath(SplineTrajectory::PPolyND<2, 6> traj, const std::string& frame_i
         const Eigen::Vector2i voxel_num = grid_map.getVoxelNum();
         const double res = grid_map.getResolution();
         const Eigen::Vector2d origin = grid_map.getOrigin();
-        const grid_map::RowMatrixXd esdf = grid_map.getMap(); // (x, y) 索引
+        const auto esdf = grid_map.esdfData(); // 行主序 (x * ny + y)，零拷贝只读视图
+        const size_t expected_size =
+            (voxel_num.x() > 0 && voxel_num.y() > 0) ? static_cast<size_t>(voxel_num.x()) * voxel_num.y() : 0;
+        if (expected_size == 0 || esdf.size() != expected_size) return;
 
         nav_msgs::msg::OccupancyGrid grid_msg;
         grid_msg.header.stamp = node->now();
@@ -890,12 +893,12 @@ void PubOptPath(SplineTrajectory::PPolyND<2, 6> traj, const std::string& frame_i
         grid_msg.info.origin.position.y = origin.y();
         grid_msg.info.origin.position.z = 0.0;
         grid_msg.info.origin.orientation.w = 1.0;
-        grid_msg.data.resize(voxel_num.x() * voxel_num.y(), 0);
+        grid_msg.data.resize(expected_size, 0);
 
         // 距离缩放：1m -> 10，饱和 100（10m）；障碍内部（d<0）按 0 显示（黑色）
         for (int x = 0; x < voxel_num.x(); ++x) {
             for (int y = 0; y < voxel_num.y(); ++y) {
-                double d = esdf(x, y);
+                const double d = esdf[static_cast<size_t>(x) * voxel_num.y() + y];
                 double scaled = (d < 0.0) ? 0.0 : d * 30.0;
                 if (scaled > 100.0) scaled = 100.0;
                 grid_msg.data[y * voxel_num.x() + x] = static_cast<int8_t>(scaled);

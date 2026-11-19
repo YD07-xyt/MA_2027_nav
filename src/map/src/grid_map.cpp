@@ -1,5 +1,19 @@
 #include "map/grid_map.hpp"
+
+#include <atomic>
+
 namespace grid_map {
+
+auto GridMap::nextRevision() -> uint64_t {
+    static std::atomic<uint64_t> counter {1};
+    return counter.fetch_add(1, std::memory_order_relaxed);
+}
+
+auto GridMap::nextEsdfRevision() -> uint64_t {
+    static std::atomic<uint64_t> counter {1};
+    return counter.fetch_add(1, std::memory_order_relaxed);
+}
+
 auto GridMap::init(double x_left, double x_right, double y_left, double y_right, double resolution) -> void {
     resolution_ = resolution;
     resolution_inv_ = 1.0 / resolution;
@@ -9,11 +23,13 @@ auto GridMap::init(double x_left, double x_right, double y_left, double y_right,
     map_size_ = max_boundary_ - min_boundary_;
 
     voxel_num_ = (map_size_ / resolution_).array().ceil().cast<int>();
-    buffer_size_ = voxel_num_.x() * voxel_num_.y();
+    buffer_size_ = (voxel_num_.x() > 0 && voxel_num_.y() > 0) ? voxel_num_.x() * voxel_num_.y() : 0;
 
-    occ_buffer_.resize(buffer_size_, 0);
-    esdf_buffer_.resize(buffer_size_, 0.0);
-    semantics_buffer_.resize(buffer_size_, static_cast<uint8_t>(Semantics::NONE));
+    occ_buffer_.assign(static_cast<size_t>(buffer_size_), 0);
+    esdf_buffer_.assign(static_cast<size_t>(buffer_size_), 0.0);
+    semantics_buffer_.assign(static_cast<size_t>(buffer_size_), static_cast<uint8_t>(Semantics::NONE));
+    esdf_revision_ = nextEsdfRevision();
+    revision_ = nextRevision();
 }
 auto GridMap::direct_set_map(const RowMatrixXi& map) -> void {
     setMap(map);
@@ -33,22 +49,77 @@ auto GridMap::inflate(double radius) -> void {
 
     setMap(inflated);
 }
-auto GridMap::setMap(const RowMatrixXi& map) -> void {
-    if (!checkMapSize(map)) return;
+auto GridMap::setMap(const RowMatrixXi& map) -> bool {
+    if (!checkMapSize(map)) return false;
     bool changed = false;
-    for (int x = 0; x < voxel_num_.x(); ++x) {
-        for (int y = 0; y < voxel_num_.y(); ++y) {
-            int addr = toAddress(Eigen::Vector2i(x, y));
-            char new_val = static_cast<char>(map(x, y));
-            if (occ_buffer_[addr] != new_val) {
-                occ_buffer_[addr] = new_val;
-                changed = true;
-            }
+    const int* src = map.data();
+    for (int i = 0; i < buffer_size_; ++i) {
+        const char new_val = static_cast<char>(src[i]);
+        if (occ_buffer_[i] != new_val) {
+            occ_buffer_[i] = new_val;
+            changed = true;
         }
     }
     if (changed) {
         updateESDF();
+        esdf_revision_ = nextEsdfRevision();
+        revision_ = nextRevision();
     }
+    return changed;
+}
+
+auto GridMap::overwriteMapAndUpdateEsdf(const RowMatrixXi& map, EsdfWorkspace* workspace) -> bool {
+    if (!checkMapSize(map)) return false;
+    const int* src = map.data();
+    for (int i = 0; i < buffer_size_; ++i) {
+        occ_buffer_[i] = static_cast<char>(src[i]);
+    }
+    updateESDF(workspace);
+    esdf_revision_ = nextEsdfRevision();
+    revision_ = nextRevision();
+    return true;
+}
+
+auto GridMap::copyOccAndEsdfFrom(const GridMap& src) -> bool {
+    if (voxel_num_ != src.voxel_num_ || buffer_size_ != src.buffer_size_ || resolution_ != src.resolution_
+        || map_origin_ != src.map_origin_)
+    {
+        logger::error(logger::GirdMap2D, "copyOccAndEsdfFrom: map geometry mismatch");
+        return false;
+    }
+    occ_buffer_ = src.occ_buffer_;
+    esdf_buffer_ = src.esdf_buffer_;
+    esdf_revision_ = src.esdf_revision_;
+    revision_ = nextRevision();
+    return true;
+}
+
+auto GridMap::copySemanticsFrom(std::span<const uint8_t> semantics) -> bool {
+    if (semantics.size() != semantics_buffer_.size()) {
+        logger::error(
+            logger::GirdMap2D,
+            "copySemanticsFrom: size mismatch: got {}, expected {}",
+            semantics.size(),
+            semantics_buffer_.size()
+        );
+        return false;
+    }
+    std::copy(semantics.begin(), semantics.end(), semantics_buffer_.begin());
+    revision_ = nextRevision();
+    return true;
+}
+
+auto GridMap::equalsOccupancy(const RowMatrixXi& map) const -> bool {
+    if (map.rows() != voxel_num_.x() || map.cols() != voxel_num_.y()) {
+        return false;
+    }
+    const int* src = map.data();
+    for (int i = 0; i < buffer_size_; ++i) {
+        if (occ_buffer_[i] != static_cast<char>(src[i])) {
+            return false;
+        }
+    }
+    return true;
 }
 
 auto GridMap::sampleEsdf(const Eigen::Vector2d& pos, double& distance, Eigen::Vector2d* gradient) const -> bool {
@@ -201,24 +272,41 @@ auto GridMap::inflateOccupancy(const RowMatrixXi& occ, double inflate_radius, do
 
     return inflated;
 }
-auto GridMap::updateESDF() -> void {
-    int rows = voxel_num_.x();
-    int cols = voxel_num_.y();
+auto GridMap::updateESDF(EsdfWorkspace* workspace) -> void {
+    const int rows = voxel_num_.x();
+    const int cols = voxel_num_.y();
+    if (rows <= 0 || cols <= 0) {
+        return;
+    }
 
-    RowMatrixXd tmp_buffer(rows, cols);
-    RowMatrixXd neg_buffer(rows, cols);
-    RowMatrixXi neg_map(rows, cols);
-    RowMatrixXd dist_buffer(rows, cols);
+    EsdfWorkspace local_ws;
+    EsdfWorkspace& ws = workspace != nullptr ? *workspace : local_ws;
+
+    if (ws.tmp_buffer.rows() != rows || ws.tmp_buffer.cols() != cols) {
+        ws.tmp_buffer.resize(rows, cols);
+        ws.neg_buffer.resize(rows, cols);
+        ws.dist_buffer.resize(rows, cols);
+    }
+    const int max_dim = std::max(rows, cols);
+    if (static_cast<int>(ws.v.size()) < max_dim) {
+        ws.v.resize(static_cast<size_t>(max_dim));
+    }
+    if (static_cast<int>(ws.z.size()) < max_dim + 1) {
+        ws.z.resize(static_cast<size_t>(max_dim + 1));
+    }
+
+    RowMatrixXd& tmp_buffer = ws.tmp_buffer;
+    RowMatrixXd& neg_buffer = ws.neg_buffer;
+    RowMatrixXd& dist_buffer = ws.dist_buffer;
 
     for (int x = 0; x < rows; ++x) {
         fillESDF(
-            [&](int y) {
-                return occ_buffer_[toAddress(Eigen::Vector2i(x, y))] ? 0 : std::numeric_limits<double>::max();
-            },
+            [&](int y) { return occ_buffer_[toAddress(x, y)] ? 0.0 : std::numeric_limits<double>::max(); },
             [&](int y, double val) { tmp_buffer(x, y) = val; },
             0,
             cols - 1,
-            cols
+            ws.v,
+            ws.z
         );
     }
 
@@ -228,23 +316,19 @@ auto GridMap::updateESDF() -> void {
             [&](int x, double val) { dist_buffer(x, y) = resolution_ * std::sqrt(val); },
             0,
             rows - 1,
-            rows
+            ws.v,
+            ws.z
         );
     }
 
     for (int x = 0; x < rows; ++x) {
-        for (int y = 0; y < cols; ++y) {
-            neg_map(x, y) = (occ_buffer_[toAddress(Eigen::Vector2i(x, y))] == 0) ? 1 : 0;
-        }
-    }
-
-    for (int x = 0; x < rows; ++x) {
         fillESDF(
-            [&](int y) { return neg_map(x, y) ? 0 : std::numeric_limits<double>::max(); },
+            [&](int y) { return occ_buffer_[toAddress(x, y)] == 0 ? 0.0 : std::numeric_limits<double>::max(); },
             [&](int y, double val) { tmp_buffer(x, y) = val; },
             0,
             cols - 1,
-            cols
+            ws.v,
+            ws.z
         );
     }
 
@@ -254,14 +338,15 @@ auto GridMap::updateESDF() -> void {
             [&](int x, double val) { neg_buffer(x, y) = resolution_ * std::sqrt(val); },
             0,
             rows - 1,
-            rows
+            ws.v,
+            ws.z
         );
     }
 
-    for (int x = 0; x < voxel_num_.x(); ++x) {
-        for (int y = 0; y < voxel_num_.y(); ++y) {
-            double pos_dist = dist_buffer(x, y);
-            double neg_dist = std::abs(neg_buffer(x, y));
+    for (int x = 0; x < rows; ++x) {
+        for (int y = 0; y < cols; ++y) {
+            const double pos_dist = dist_buffer(x, y);
+            const double neg_dist = std::abs(neg_buffer(x, y));
 
             if (neg_dist > 0.0) {
                 esdf_buffer_[toAddress(x, y)] = -neg_dist + resolution_;

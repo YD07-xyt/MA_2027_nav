@@ -139,7 +139,7 @@ auto sample_queries(Case& c, std::mt19937& rng) -> std::vector<Query> {
     for (int attempt = 0; attempt < kNumQueries * 200 && static_cast<int>(qs.size()) < kNumQueries; ++attempt) {
         const Query q {free_cells[pick(rng)], free_cells[pick(rng)]};
         if ((q.goal - q.start).norm() < kMinQueryDist) continue;
-        if (c.jps.jps_search(q.start, q.goal, kTimeoutMs).empty()) continue; // 不连通
+        if (c.jps.jps_search(gm, q.start, q.goal, kTimeoutMs).empty()) continue; // 不连通
         qs.push_back(q);
     }
     return qs;
@@ -198,9 +198,11 @@ auto to_series(const std::vector<RunResult>& rs, double RunResult::*field) -> st
 auto run_case(Case& c) -> void {
     c.astar_res.clear();
     c.jps_res.clear();
+    const auto& gm = c.map->grid_map();
     for (const auto& q: c.queries) {
-        c.astar_res.push_back(run_timed([&] { return c.astar.original_astar_search(q.start, q.goal, kTimeoutMs); }));
-        c.jps_res.push_back(run_timed([&] { return c.jps.jps_search(q.start, q.goal, kTimeoutMs); }));
+        c.astar_res.push_back(run_timed([&] { return c.astar.original_astar_search(gm, q.start, q.goal, kTimeoutMs); })
+        );
+        c.jps_res.push_back(run_timed([&] { return c.jps.jps_search(gm, q.start, q.goal, kTimeoutMs); }));
     }
 }
 
@@ -258,9 +260,7 @@ int main(int argc, char** argv) {
             std::printf("skip %s: %s\n", name.c_str(), e.what());
             continue;
         }
-        c->astar.set_map(c->map->grid_map());
         c->astar.set_safe_threshold(kSafeThreshold);
-        c->jps.set_map(c->map->grid_map());
         c->jps.set_safe_threshold(kSafeThreshold);
 
         // 采样时不连通的查询会让 JPS 打 error 日志,先静音
@@ -326,9 +326,10 @@ int main(int argc, char** argv) {
         Case* cp = c.get();
         const auto nq = static_cast<int64_t>(cp->queries.size());
         benchmark::RegisterBenchmark(("AStar/" + cp->name).c_str(), [cp, nq](benchmark::State& st) {
+            const auto& gm = cp->map->grid_map();
             for (auto _: st) {
                 for (const auto& q: cp->queries) {
-                    auto p = cp->astar.original_astar_search(q.start, q.goal, kTimeoutMs);
+                    auto p = cp->astar.original_astar_search(gm, q.start, q.goal, kTimeoutMs);
                     benchmark::DoNotOptimize(p.data());
                 }
             }
@@ -336,9 +337,10 @@ int main(int argc, char** argv) {
             st.counters["queries"] = static_cast<double>(nq);
         })->Unit(benchmark::kMillisecond);
         benchmark::RegisterBenchmark(("JPS/" + cp->name).c_str(), [cp, nq](benchmark::State& st) {
+            const auto& gm = cp->map->grid_map();
             for (auto _: st) {
                 for (const auto& q: cp->queries) {
-                    auto p = cp->jps.jps_search(q.start, q.goal, kTimeoutMs);
+                    auto p = cp->jps.jps_search(gm, q.start, q.goal, kTimeoutMs);
                     benchmark::DoNotOptimize(p.data());
                 }
             }

@@ -22,13 +22,14 @@ public:
     PathPlanning(const PathPlanning&) = delete;
     PathPlanning& operator=(const PathPlanning&) = delete;
 public:
-    auto set_map(const grid_map::GridMap& grid_map) -> void;
     auto set_param(const PathPostProcessing::PathPostProcessingParams& params) -> void;
-    auto set_velocity(const Eigen::Vector3d& start_vel, const Eigen::Vector3d& end_vel)->void;
+    auto set_velocity(const Eigen::Vector3d& start_vel, const Eigen::Vector3d& end_vel) -> void;
 
     // 选择底层图搜索算法:默认 A*,开启后改用 JPS
     auto set_use_jps(bool use_jps) -> void;
+    // 同步只读借用外部 GridMap 快照（调用期间须保持 grid_map 有效且不被并发修改）。
     auto path_planning(
+        const grid_map::GridMap& grid_map,
         const Eigen::Vector2d& start,
         const Eigen::Vector2d& goal,
         double start_yaw,

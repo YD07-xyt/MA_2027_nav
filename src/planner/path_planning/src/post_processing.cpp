@@ -1,7 +1,8 @@
 #include "path_planning/post_processing.h"
 
 namespace path_planning {
-auto PathPostProcessing::optimize_path(const std::vector<Eigen::Vector2d>& path) -> std::vector<Eigen::Vector2d> {
+auto PathPostProcessing::optimize_path(const grid_map::GridMap& map, const std::vector<Eigen::Vector2d>& path)
+    -> std::vector<Eigen::Vector2d> {
     if (path.size() < 2) {
         return path;
     }
@@ -11,7 +12,7 @@ auto PathPostProcessing::optimize_path(const std::vector<Eigen::Vector2d>& path)
     double cost1, cost2, cost3;
 
     // Check first path segment
-    if (!check_line_collision(path[0], path[1])) {
+    if (!check_line_collision(map, path[0], path[1])) {
         cost1 = (path[0] - path[1]).norm();
     } else {
         cost1 = std::numeric_limits<double>::infinity();
@@ -21,13 +22,13 @@ auto PathPostProcessing::optimize_path(const std::vector<Eigen::Vector2d>& path)
         const auto& pose2 = path[i + 1];
 
         // Calculate current segment cost
-        if (!check_line_collision(pose1, pose2)) {
+        if (!check_line_collision(map, pose1, pose2)) {
             cost2 = (pose1 - pose2).norm();
         } else {
             cost2 = std::numeric_limits<double>::infinity();
         }
         // Calculate skip current point cost
-        if (!check_line_collision(prev_pose, pose2)) {
+        if (!check_line_collision(map, prev_pose, pose2)) {
             cost3 = (prev_pose - pose2).norm();
         } else {
             cost3 = std::numeric_limits<double>::infinity();
@@ -45,21 +46,25 @@ auto PathPostProcessing::optimize_path(const std::vector<Eigen::Vector2d>& path)
     optimized_path.push_back(path.back());
     return optimized_path;
 }
-auto PathPostProcessing::check_collision(const Eigen::Vector2d& pos) const -> bool {
+auto PathPostProcessing::check_collision(const grid_map::GridMap& map, const Eigen::Vector2d& pos) const -> bool {
     // Points outside map are considered collision-free
-    if (!map_.isInsideMap(pos)) return false;
+    if (!map.isInsideMap(pos)) return false;
 
     // Points inside map use safety distance check
-    return map_.getDistance(pos) < params_.safe_threshold;
+    return map.getDistance(pos) < params_.safe_threshold;
 }
 
 /*  Bresenham 直线算法 枚举线段经过的所有栅格索引，
     并逐一调用 check_collision，判断两点间的直线段是否穿过障碍物，
     用于后续路径优化时的跳过可行性判断*/
-auto PathPostProcessing::check_line_collision(const Eigen::Vector2d& start, const Eigen::Vector2d& end) const -> bool {
+auto PathPostProcessing::check_line_collision(
+    const grid_map::GridMap& map,
+    const Eigen::Vector2d& start,
+    const Eigen::Vector2d& end
+) const -> bool {
     Eigen::Vector2i start_idx, end_idx;
-    map_.posToIndex(start, start_idx);
-    map_.posToIndex(end, end_idx);
+    map.posToIndex(start, start_idx);
+    map.posToIndex(end, end_idx);
 
     int dx = abs(end_idx.x() - start_idx.x());
     int dy = abs(end_idx.y() - start_idx.y());
@@ -69,8 +74,8 @@ auto PathPostProcessing::check_line_collision(const Eigen::Vector2d& start, cons
 
     while (true) {
         Eigen::Vector2d pos;
-        map_.indexToPos(start_idx, pos);
-        if (check_collision(pos)) return true;
+        map.indexToPos(start_idx, pos);
+        if (check_collision(map, pos)) return true;
         if (start_idx == end_idx) break;
 
         int e2 = 2 * err;
@@ -118,7 +123,7 @@ auto PathPostProcessing::normalize_angle(double ref_angle, double& angle) const 
         angle -= 2 * M_PI;
 }
 
-auto PathPostProcessing::assign_trajectory_timing(Trajectory& traj) -> void {
+auto PathPostProcessing::assign_trajectory_timing(const grid_map::GridMap& map, Trajectory& traj) -> void {
     /**1. 高密度采样
         -> 保留路径细节，避免拐角信息丢失
 
@@ -214,7 +219,7 @@ auto PathPostProcessing::assign_trajectory_timing(Trajectory& traj) -> void {
     // ============================================================
     // 折叠降速
     // ============================================================
-    std::vector<TunnelInterval> tunnel_intervals = detect_tunnel_intervals(dense);
+    std::vector<TunnelInterval> tunnel_intervals = detect_tunnel_intervals(map, dense);
 
     apply_fold_speed_limits(vmax, dense, tunnel_intervals);
     ///==================================================
@@ -423,8 +428,8 @@ auto PathPostProcessing::apply_fold_speed_limits(
     }
 }
 //用状态机扫描：
-auto PathPostProcessing::detect_tunnel_intervals(const std::vector<DenseSample>& dense) const
-    -> std::vector<TunnelInterval> {
+auto PathPostProcessing::detect_tunnel_intervals(const grid_map::GridMap& map, const std::vector<DenseSample>& dense)
+    const -> std::vector<TunnelInterval> {
     std::vector<TunnelInterval> intervals;
 
     if (dense.empty()) {
@@ -435,7 +440,7 @@ auto PathPostProcessing::detect_tunnel_intervals(const std::vector<DenseSample>&
     TunnelInterval current;
 
     for (int i = 0; i < static_cast<int>(dense.size()); ++i) {
-        const bool in_tunnel = map_.is_tunnel(dense[i].pos);
+        const bool in_tunnel = map.is_tunnel(dense[i].pos);
 
         if (!inside && in_tunnel) {
             // 进入隧道

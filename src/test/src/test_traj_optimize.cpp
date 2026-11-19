@@ -248,7 +248,7 @@ auto sample_queries(Case& c, double safe, std::mt19937& rng) -> void {
          ++attempt) {
         const Query q {free_cells[pick(rng)], free_cells[pick(rng)]};
         if ((q.goal - q.start).norm() < kMinQueryDist) continue;
-        auto path = c.jps.jps_search(q.start, q.goal, kTimeoutMs);
+        auto path = c.jps.jps_search(*c.gm, q.start, q.goal, kTimeoutMs);
         if (path.size() < 2) continue; // 不连通
         c.queries.push_back(q);
         c.raw_paths.push_back(std::move(path));
@@ -259,7 +259,6 @@ auto sample_queries(Case& c, double safe, std::mt19937& rng) -> void {
 auto post_process(const grid_map::GridMap& gm, const PostProc::PathPostProcessingParams& params, const Query& q,
                   const std::vector<Eigen::Vector2d>& raw, const Eigen::Vector2d& start_vel) -> PostProc::Trajectory {
     PostProc post;
-    post.set_map(gm);
     post.set_params(params);
     post.set_start_vel(start_vel.norm());
     post.set_end_vel(0.0);
@@ -268,9 +267,9 @@ auto post_process(const grid_map::GridMap& gm, const PostProc::PathPostProcessin
 
     PostProc::Trajectory traj;
     traj.raw_path = raw;
-    traj.optimized_path = post.optimize_path(traj.raw_path);
+    traj.optimized_path = post.optimize_path(gm, traj.raw_path);
     traj.path_states = post.sample_path_states(traj.optimized_path);
-    post.assign_trajectory_timing(traj);
+    post.assign_trajectory_timing(gm, traj);
     post.fill_additional_trajectory_info(traj, q.start, q.goal, 0.0, 0.0);
     return traj;
 }
@@ -538,7 +537,6 @@ int main(int argc, char** argv) {
         }
         c->gm = std::make_shared<const grid_map::GridMap>(c->map->grid_map());
         c->esdf = std::make_unique<minco_opt::GridMapESDF>(c->gm);
-        c->jps.set_map(*c->gm);
         c->jps.set_safe_threshold(pp.safe_threshold);
 
         const auto level = logger::planning->level();

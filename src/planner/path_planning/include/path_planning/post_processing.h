@@ -89,15 +89,10 @@ public:
 
 private:
     PathPostProcessingParams params_;
-    grid_map::GridMap map_;
     Eigen::Vector3d start_velocity_vector_ = Eigen::Vector3d::Zero();
     Eigen::Vector3d final_velocity_vector_ = Eigen::Vector3d::Zero();
 
 public:
-    auto set_map(const grid_map::GridMap& map) -> void {
-        map_ = map;
-    }
-
     auto set_start_velocity_vector(const Eigen::Vector3d& vel) -> void {
         start_velocity_vector_ = vel;
     }
@@ -119,12 +114,15 @@ public:
     }
 
 public:
-    auto check_collision(const Eigen::Vector2d& pos) const -> bool;
-    auto optimize_path(const std::vector<Eigen::Vector2d>& path) -> std::vector<Eigen::Vector2d>;
-    auto check_line_collision(const Eigen::Vector2d& start, const Eigen::Vector2d& end) const -> bool;
+    // 下列需要查询地图的方法按调用同步只读借用外部 GridMap 快照（不保存引用）。
+    auto check_collision(const grid_map::GridMap& map, const Eigen::Vector2d& pos) const -> bool;
+    auto optimize_path(const grid_map::GridMap& map, const std::vector<Eigen::Vector2d>& path)
+        -> std::vector<Eigen::Vector2d>;
+    auto check_line_collision(const grid_map::GridMap& map, const Eigen::Vector2d& start, const Eigen::Vector2d& end)
+        const -> bool;
     auto sample_path_states(const std::vector<Eigen::Vector2d>& path) -> std::vector<PathState>;
     auto normalize_angle(double ref_angle, double& angle) const -> void;
-    auto assign_trajectory_timing(Trajectory& traj) -> void;
+    auto assign_trajectory_timing(const grid_map::GridMap& map, Trajectory& traj) -> void;
 
     auto fill_additional_trajectory_info(
         Trajectory& traj,
@@ -150,9 +148,10 @@ public:
     // ============================================================
     // 折叠方案
     // ============================================================
-    
+
     // 检测 dense 路径上所有隧道区间
-    auto detect_tunnel_intervals(const std::vector<DenseSample>& dense) const -> std::vector<TunnelInterval>;
+    auto detect_tunnel_intervals(const grid_map::GridMap& map, const std::vector<DenseSample>& dense) const
+        -> std::vector<TunnelInterval>;
 
     // 根据隧道区间，在 vmax 上施加入口前降速
     auto apply_fold_speed_limits(

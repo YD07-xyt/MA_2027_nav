@@ -501,8 +501,10 @@ void GlobalPlanner2d::map_callback(const sensor_msgs::msg::PointCloud2::SharedPt
     pcl::fromROSMsg(*msg, pc);
     ma_map_->update_cloud(pc);
     ma_map_->update_map();
-    grid_map_ = ma_map_->get_grid_map();
-    visualizer.visualize_occupied_map(*grid_map_,frame_id);
+    const auto grid_map = ma_map_->get_grid_map();
+    if (grid_map) {
+        visualizer.visualize_occupied_map(*grid_map, frame_id);
+    }
     mapInitialized = true;
 }
 void GlobalPlanner2d::pub_callback() {
@@ -523,8 +525,10 @@ void GlobalPlanner2d::pub_callback() {
     // 取当前快照（与地图线程不共享同一个 shared_ptr 变量，避免并发读写指针本身）
     if (mapInitialized) {
         const auto viz_map = ma_map_->get_grid_map();
-        visualizer.visualize_occupied_grid(*viz_map,frame_id);
-        visualizer.visualize_esdf_grid(*viz_map,frame_id);
+        if (viz_map) {
+            visualizer.visualize_occupied_grid(*viz_map, frame_id);
+            visualizer.visualize_esdf_grid(*viz_map, frame_id);
+        }
     }
 }
 
@@ -741,6 +745,10 @@ void GlobalPlanner2d::load_global_map(const std::string& pgm_path) {
     // 换算成 PGM 像素坐标，仅当像素落在 PGM 范围内时取值（否则保持 0/自由）。
     // 这样无论当前地图尺寸/分辨率与保存时是否一致，障碍物都落在正确位置。
     auto grid = ma_map_->get_grid_map();
+    if (!grid) {
+        logger::error(logger::ros2, "Failed to load global map: grid_map snapshot is null");
+        return;
+    }
     const Eigen::Vector2i voxel_num = grid->getVoxelNum();
     const Eigen::Vector2d grid_origin = grid->getOrigin();
     const double grid_res = grid->getResolution();
@@ -786,17 +794,28 @@ void GlobalPlanner2d::load_global_map(const std::string& pgm_path) {
 }
 
 void GlobalPlanner2d::save_global_map(const std::string& map_dir) {
-    auto map_occ = ma_map_->get_occupancy_2d(); // 保存全球永久层
-    int h = map_occ.rows(), w = map_occ.cols();
-    double res = ma_map_->get_grid_map()->getResolution();
-    Eigen::Vector2d origin = ma_map_->get_grid_map()->getOrigin();
+    const auto snapshot = ma_map_->get_grid_map(); // 单一不可变快照，几何与占据严格一致
+    if (!snapshot) {
+        logger::error(logger::ros2, "Failed to save global map: snapshot is null");
+        return;
+    }
+    const Eigen::Vector2i voxel_num = snapshot->getVoxelNum();
+    const int h = voxel_num.x();
+    const int w = voxel_num.y();
+    const auto occ = snapshot->occData();
+    if (h <= 0 || w <= 0 || occ.size() != static_cast<size_t>(h) * static_cast<size_t>(w)) {
+        logger::error(logger::ros2, "Failed to save global map: invalid snapshot geometry {}x{}", h, w);
+        return;
+    }
+    const double res = snapshot->getResolution();
+    const Eigen::Vector2d origin = snapshot->getOrigin();
 
     std::ofstream f(map_dir + "/global_map.pgm", std::ios::binary);
     f << "P5\n" << w << " " << h << "\n255\n";
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x)
             // GridMap 行 0=底部=世界 y_min，PGM 行 0=顶部=世界 y_max，翻转 Y
-            f.put(map_occ(h - 1 - y, x) ? (char)0 : (char)255);
+            f.put(occ[static_cast<size_t>(h - 1 - y) * w + x] ? (char)0 : (char)255);
     f.close();
 
     std::ofstream y(map_dir + "/global_map.yaml");

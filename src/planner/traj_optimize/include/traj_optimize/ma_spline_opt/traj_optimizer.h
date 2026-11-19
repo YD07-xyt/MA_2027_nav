@@ -35,6 +35,8 @@ public:
     // 统一入口
     // ========================================================================
     auto optimize(const MaSplineInput& input) -> MAsplineOutput;
+    // 同步只读借用 esdf，返回或异常退出前自动清空内部指针，避免悬挂指向临时适配器。
+    auto optimize(const MaSplineInput& input, const ESDF& esdf) -> MAsplineOutput;
 
     auto check_trajectory_collision(const MAsplineOutput& out, const ESDF* esdf, double safe_distance)->bool;
 
@@ -164,6 +166,19 @@ auto MaSplineTrajectoryOptimizer<ESDF>::check_trajectory_collision(
 
     return true;
 }
+template<typename ESDF>
+auto MaSplineTrajectoryOptimizer<ESDF>::optimize(const MaSplineInput& input, const ESDF& esdf) -> MAsplineOutput {
+    struct ScopedEsdfReset {
+        const ESDF*& slot;
+        ~ScopedEsdfReset() {
+            slot = nullptr;
+        }
+    };
+    esdf_ = &esdf;
+    ScopedEsdfReset reset_guard {esdf_};
+    return optimize(input);
+}
+
 template <typename ESDF>
 auto MaSplineTrajectoryOptimizer<ESDF>::optimize(const MaSplineInput& input) -> MAsplineOutput {
     switch (input.model) {

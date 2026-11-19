@@ -3,18 +3,12 @@
 namespace path_planning {
 class PathPlanningImpl {
 public:
-    
-    auto set_map(const grid_map::GridMap& grid_map) -> void {
-        astar_.set_map(grid_map);
-        jps_.set_map(grid_map);
-        post_processing_.set_map(grid_map);
-    };
     auto set_param(const PathPostProcessing::PathPostProcessingParams& params) -> void {
         astar_.set_safe_threshold(params.safe_threshold);
         jps_.set_safe_threshold(params.safe_threshold);
         post_processing_.set_params(params);
     }
-    auto set_velocity(const Eigen::Vector3d& start_vel, const Eigen::Vector3d& end_vel)->void {
+    auto set_velocity(const Eigen::Vector3d& start_vel, const Eigen::Vector3d& end_vel) -> void {
         post_processing_.set_start_vel(start_vel.head<2>().norm());
         post_processing_.set_end_vel(end_vel.head<2>().norm());
 
@@ -27,6 +21,7 @@ public:
         use_jps_ = use_jps;
     }
     auto path_planning(
+        const grid_map::GridMap& grid_map,
         const Eigen::Vector2d& start,
         const Eigen::Vector2d& goal,
         double start_yaw,
@@ -38,20 +33,20 @@ public:
         PathPostProcessing::Trajectory traj;
 
         // 1. Grid search: JPS or original A*
-        traj.raw_path =
-            use_jps_ ? jps_.jps_search(start, goal, timeout_ms) : astar_.original_astar_search(start, goal, timeout_ms);
+        traj.raw_path = use_jps_ ? jps_.jps_search(grid_map, start, goal, timeout_ms)
+                                 : astar_.original_astar_search(grid_map, start, goal, timeout_ms);
 
         if (traj.raw_path.empty()) {
             return std::nullopt;
         }
         // 2. Path optimization (remove redundant waypoints)
-        traj.optimized_path = post_processing_.optimize_path(traj.raw_path);
+        traj.optimized_path = post_processing_.optimize_path(grid_map, traj.raw_path);
 
         // 3. State sampling (generate 5D states)
         traj.path_states = post_processing_.sample_path_states(traj.optimized_path);
 
         // 4. Time allocation (trapezoidal velocity profile)
-        post_processing_.assign_trajectory_timing(traj);
+        post_processing_.assign_trajectory_timing(grid_map, traj);
 
         // 5. Fill additional information
         post_processing_.fill_additional_trajectory_info(traj, start, goal, start_yaw, goal_yaw);
@@ -76,13 +71,10 @@ PathPlanning::~PathPlanning() = default;   // ← 在此处实例化 unique_ptr 
 PathPlanning::PathPlanning(PathPlanning&&) noexcept = default;
 PathPlanning& PathPlanning::operator=(PathPlanning&&) noexcept = default;
 
-auto PathPlanning::set_map(const grid_map::GridMap& grid_map) -> void {
-    impl_->set_map(grid_map);
-}
-auto PathPlanning::set_param(const PathPostProcessing::PathPostProcessingParams& params) -> void{
+auto PathPlanning::set_param(const PathPostProcessing::PathPostProcessingParams& params) -> void {
     impl_->set_param(params);
 };
-auto PathPlanning::set_velocity(const Eigen::Vector3d& start_vel, const Eigen::Vector3d& end_vel)->void {
+auto PathPlanning::set_velocity(const Eigen::Vector3d& start_vel, const Eigen::Vector3d& end_vel) -> void {
     impl_->set_velocity(start_vel, end_vel);
 };
 auto PathPlanning::set_use_jps(bool use_jps) -> void {
@@ -90,12 +82,13 @@ auto PathPlanning::set_use_jps(bool use_jps) -> void {
 };
 
 auto PathPlanning::path_planning(
+    const grid_map::GridMap& grid_map,
     const Eigen::Vector2d& start,
     const Eigen::Vector2d& goal,
     double start_yaw,
     double goal_yaw,
     int timeout_ms
 ) -> std::optional<PathPostProcessing::Trajectory> {
-    return impl_->path_planning(start,goal,start_yaw,goal_yaw,timeout_ms);
+    return impl_->path_planning(grid_map, start, goal, start_yaw, goal_yaw, timeout_ms);
 };
 };
