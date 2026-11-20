@@ -10,6 +10,7 @@
 
 #include <Eigen/Core>
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -25,6 +26,18 @@ struct LoadReport {
     int occupied_count = 0;
     int free_count = 0;
     int unknown_count = 0;
+    bool has_terrain_prior = false;
+    std::string terrain_prior_path;
+};
+
+// 导航模式感知所需的只读静态上下文快照：
+// - static_esdf      : 仅由 StaticMapLayer 计算的纯静态 ESDF（绝不被动态障碍污染），未加载静态图时为 nullptr。
+// - terrain_prior    : 可选 2.5D 静态地面/悬空先验（.terrain.bin），未加载或缺失时为 nullptr。
+// - current_snapshot : 当前已发布的 2D 地图快照（用于无锁查询 TUNNEL 等语义层）。
+struct StaticNavContext {
+    grid_map::GridMap::ConstPtr static_esdf;
+    std::shared_ptr<const StaticTerrainPrior> terrain_prior;
+    grid_map::GridMap::ConstPtr current_snapshot;
 };
 
 // Layer 3：分层 2D 全局地图协调器（与 3D 感知/PCL/ROS 完全解耦）。
@@ -79,6 +92,8 @@ public:
     setSemanticsPolygon(const std::vector<Eigen::Vector2d>& polygon, grid_map::GridMap::Semantics semantics) -> bool;
 
     auto getSnapshot() const -> grid_map::GridMap::ConstPtr;
+    auto getStaticNavContext() const -> StaticNavContext;
+    auto defaultSaveOptions() const -> SaveOptions;
     auto getOccupancyMatrix() const -> grid_map::RowMatrixXi;
     auto getStaticOccupancyMatrix() const -> grid_map::RowMatrixXi;
 
@@ -89,6 +104,7 @@ private:
     auto composeOccupancyLocked() -> void;
     auto publishComposedLocked(bool force_publish) -> void;
     auto publishSnapshot(grid_map::GridMap::ConstPtr next_front) -> void;
+    auto rebuildStaticEsdfLocked() const -> void;
 
     Config config_;
     MapMode mode_ = MapMode::MAPPING;
@@ -102,9 +118,12 @@ private:
     SemanticsLayer semantics_layer_;
 
     std::vector<uint8_t> composed_occ_;
-    grid_map::GridMap::EsdfWorkspace esdf_workspace_;
+    mutable grid_map::GridMap::EsdfWorkspace esdf_workspace_;
     std::shared_ptr<SnapshotPool> snapshot_pool_;
     grid_map::GridMap::ConstPtr front_snapshot_;
+    mutable grid_map::GridMap::ConstPtr front_static_esdf_;
+    mutable std::shared_ptr<const StaticTerrainPrior> front_terrain_prior_;
+    mutable std::atomic<bool> static_esdf_dirty_ {false};
 
     mutable std::mutex back_mtx_;
     mutable std::mutex front_mtx_;

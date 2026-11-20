@@ -1,5 +1,7 @@
 #include "map/core/map_io.hpp"
 
+#include "utils/logger.hpp"
+
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
@@ -280,6 +282,32 @@ auto MapIO::load(std::string_view map_path, const LoadOptions& options) -> tl::e
         }
     }
 
+    // 4. 自动查找并加载伴随 2.5D 静态地形先验（<stem>.terrain.bin）；缺失或失配时优雅降级，不阻塞加载。
+    std::string terrain_candidate = StaticTerrainPrior::companionPath(pgm_path.string());
+    std::error_code terrain_ec;
+    if (!fs::exists(terrain_candidate, terrain_ec) || terrain_ec) {
+        const std::string yaml_candidate = StaticTerrainPrior::companionPath(yaml_path.string());
+        terrain_ec.clear();
+        if (yaml_candidate != terrain_candidate && fs::exists(yaml_candidate, terrain_ec) && !terrain_ec) {
+            terrain_candidate = yaml_candidate;
+        } else {
+            terrain_candidate.clear();
+        }
+    }
+    if (!terrain_candidate.empty()) {
+        auto prior_res = StaticTerrainPrior::load(terrain_candidate, out.geometry);
+        if (prior_res) {
+            out.terrain_prior = std::move(*prior_res);
+            out.terrain_prior_path = terrain_candidate;
+        } else {
+            logger::MaMap->warn(
+                "Companion terrain prior ignored ({}): {}; falling back to 2D static map without 2.5D prior",
+                terrain_candidate,
+                prior_res.error()
+            );
+        }
+    }
+
     return out;
 }
 
@@ -287,7 +315,8 @@ auto MapIO::save(
     std::string_view output_path,
     const grid_map::GridGeometry& geometry,
     std::span<const CellState> cells,
-    const SaveOptions& options
+    const SaveOptions& options,
+    const StaticTerrainPrior* terrain_prior
 ) -> tl::expected<SaveReport, std::string> {
     if (output_path.empty()) {
         return tl::make_unexpected("Empty output path");
@@ -297,6 +326,10 @@ auto MapIO::save(
     }
     if (cells.size() != geometry.cellCount()) {
         return tl::make_unexpected("Cannot save map: cell buffer size does not match GridGeometry");
+    }
+    const bool write_prior = (terrain_prior != nullptr) && options.save_terrain_prior;
+    if (write_prior && (!terrain_prior->isValid() || terrain_prior->geometry != geometry)) {
+        return tl::make_unexpected("Cannot save map: StaticTerrainPrior geometry does not match GridGeometry");
     }
 
     fs::path pgm_path;
@@ -365,6 +398,11 @@ auto MapIO::save(
         const size_t src_off = static_cast<size_t>(x_min + ix) * static_cast<size_t>(ny) + static_cast<size_t>(y_min);
         const size_t dst_off = static_cast<size_t>(ix) * static_cast<size_t>(crop_ny);
         std::copy_n(cells.data() + src_off, static_cast<size_t>(crop_ny), cropped.data() + dst_off);
+    }
+
+    std::vector<CellState> pre_cleanup_cropped;
+    if (write_prior && options.cleanup_free_pinholes && options.max_pinhole_cells > 0) {
+        pre_cleanup_cropped = cropped;
     }
 
     int cleaned_pinholes = 0;
@@ -443,6 +481,27 @@ auto MapIO::save(
     report.free_count = free_cnt;
     report.unknown_count = unk_cnt;
     report.cleaned_pinholes = cleaned_pinholes;
+
+    if (write_prior) {
+        StaticTerrainPrior cropped_prior = terrain_prior->crop(x_min, x_max, y_min, y_max);
+        if (!pre_cleanup_cropped.empty() && cleaned_pinholes > 0) {
+            std::vector<uint8_t> filled_mask(cropped.size(), 0);
+            for (size_t i = 0; i < cropped.size(); ++i) {
+                if (pre_cleanup_cropped[i] == CellState::UNKNOWN && cropped[i] == CellState::FREE) {
+                    filled_mask[i] = 1;
+                }
+            }
+            cropped_prior.interpolateMissingGround(filled_mask, 2);
+        }
+        const std::string prior_path = StaticTerrainPrior::companionPath(pgm_path.string());
+        auto prior_res = StaticTerrainPrior::save(prior_path, cropped_prior);
+        if (!prior_res) {
+            return tl::make_unexpected(prior_res.error());
+        }
+        report.terrain_prior_path = prior_path;
+        report.saved_terrain_prior = true;
+    }
+
     return report;
 }
 

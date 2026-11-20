@@ -92,6 +92,7 @@ auto StaticMapLayer::resize(const grid_map::GridGeometry& new_geom, const Eigen:
         geom_ = grid_map::GridGeometry {};
         occ_.clear();
         cells_.clear();
+        terrain_prior_.reset();
         has_loaded_cells_ = false;
         from_binary_matrix_ = false;
         return;
@@ -116,10 +117,12 @@ auto StaticMapLayer::resize(const grid_map::GridGeometry& new_geom, const Eigen:
             shift,
             CellState::UNKNOWN
         );
+        terrain_prior_.reset();
         from_binary_matrix_ = false;
     } else {
         occ_.assign(new_geom.cellCount(), 0);
         cells_.assign(new_geom.cellCount(), CellState::UNKNOWN);
+        terrain_prior_.reset();
         has_loaded_cells_ = false;
         from_binary_matrix_ = false;
     }
@@ -129,6 +132,7 @@ auto StaticMapLayer::resize(const grid_map::GridGeometry& new_geom, const Eigen:
 auto StaticMapLayer::reset() -> void {
     std::fill(occ_.begin(), occ_.end(), 0);
     std::fill(cells_.begin(), cells_.end(), CellState::UNKNOWN);
+    terrain_prior_.reset();
     has_loaded_cells_ = false;
     from_binary_matrix_ = false;
 }
@@ -137,6 +141,13 @@ auto StaticMapLayer::load(const LoadedMap& loaded) -> void {
     geom_ = loaded.geometry;
     occ_ = loaded.occupancy;
     cells_ = loaded.cells;
+    if (loaded.terrain_prior.has_value() && loaded.terrain_prior->isValid()
+        && loaded.terrain_prior->geometry == loaded.geometry)
+    {
+        terrain_prior_ = std::make_shared<StaticTerrainPrior>(*loaded.terrain_prior);
+    } else {
+        terrain_prior_.reset();
+    }
     has_loaded_cells_ = geom_.isValid();
     from_binary_matrix_ = false;
 }
@@ -201,6 +212,7 @@ auto StaticMapLayer::setOccupancyMatrix(const grid_map::RowMatrixXi& mat, bool* 
         occ_[i] = v;
         cells_[i] = v != 0 ? CellState::OCCUPIED : CellState::FREE;
     }
+    terrain_prior_.reset();
     has_loaded_cells_ = true;
     from_binary_matrix_ = true;
     if (changed) {

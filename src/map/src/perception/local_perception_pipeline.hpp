@@ -2,32 +2,59 @@
 
 #include "map/3d_occ_map/config.hpp"
 #include "map/3d_occ_map/rog_map.h"
+#include "map/layered/layered_map.hpp"
+#include "map/layered/map_layers.hpp"
+#include "map/perception/dynamic_stvl_layer.hpp"
 #include "map/perception/ground_layer.hpp"
 #include "map/perception/local_terrain_frame.hpp"
+#include "map/perception/online_terrain_mapper.hpp"
+#include "map/perception/sensor_model.hpp"
 #include "map/perception/terrain_analysis.hpp"
 
+#include <atomic>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <vector>
 
 namespace ma_map {
 
-// Layer 2：局部 3D 感知管线（封装 ROGMap + GroundLayer + TerrainAnalyzer）。
+// Layer 2：局部 3D 感知管线，支持通过 YAML（rog_map/perception/backend）在双后端间切换：
+// - "stvl_prior"（默认）：6-DoF SensorModel + 零先验 OnlineTerrainMapper（建图）+ DynamicStvlLayer（导航）；
+// - "legacy_rog"（回退）：既有 ROGMap + GroundLayer + TerrainAnalyzer。
 // 仅在 3d_occ_map 内部编译，通过 LocalTerrainFrame 向 Layer 3（LayeredMap）单向输出。
 // 线程契约：
 // - updateOdom / updateCloud / processPendingFrame 通常由同一 map callback group 串行调用；
-//   cloud_/pc_pose_ 由 input_mtx_ 保护，scratch 缓冲为实例成员（替代旧实现中的线程不安全函数 static）。
+// - cloud_ / pc_pose_ 由 input_mtx_ 保护；
+// - buildGlobalStaticMap / hasOnlineMappingData 内部线程安全，支持保存服务跨线程调用。
 class LocalPerceptionPipeline {
 public:
     explicit LocalPerceptionPipeline(const rog_map::Config& cfg);
 
+    auto setMode(MapMode mode) -> void;
+    auto resetDynamic() -> void {
+        dynamic_stvl_.reset();
+    }
     auto setForgetThresholdForMode(bool mapping_mode) -> void;
     auto updateOdom(const rog_map::Pose& pose) -> void;
     auto updateCloud(const rog_map::PointCloud& cloud) -> void;
 
-    // 若存在待处理点云帧，则更新 3D ROGMap、持久地面层与局部地形分析，输出本帧 LocalTerrainFrame；
+    // 若存在待处理点云帧，则按当前后端与模式执行 3D 感知处理，输出本帧 LocalTerrainFrame；
     // 无新帧时返回 std::nullopt。
-    auto processPendingFrame() -> std::optional<LocalTerrainFrame>;
+    auto processPendingFrame(const StaticNavContext& static_ctx) -> std::optional<LocalTerrainFrame>;
+
+    auto usesStvlPrior() const -> bool {
+        return use_stvl_prior_;
+    }
+
+    auto hasOnlineMappingData() const -> bool {
+        return online_mapper_.hasData();
+    }
+
+    auto buildGlobalStaticMap() const -> std::optional<StaticTerrainBuilder::BuildResult> {
+        return online_mapper_.buildGlobalStaticMap();
+    }
 
     auto getLastTerrainMap() const -> utils::vec_E<utils::Vec3f>;
     auto getGroundLayer() const -> const Terrain::GroundLayer& {
@@ -42,9 +69,18 @@ public:
 
 private:
     rog_map::Config cfg_;
+    bool use_stvl_prior_ = true;
+    std::atomic<uint8_t> mode_ {static_cast<uint8_t>(MapMode::MAPPING)};
+
+    // 既有 ROGMap / GroundLayer / TerrainAnalyzer（legacy_rog 后端使用；stvl_prior 下仍安全构造以兼容旧查询接口）
     std::shared_ptr<rog_map::ROGMap> rog_map_ptr_;
     Terrain::TerrainAnalyzer terrain_analyzer_;
     Terrain::GroundLayer ground_layer_;
+
+    // 新 stvl_prior 感知后端组件
+    SensorModel sensor_model_;
+    OnlineTerrainMapper online_mapper_;
+    DynamicStvlLayer dynamic_stvl_;
 
     mutable std::mutex input_mtx_;
     rog_map::PointCloud cloud_;
@@ -56,6 +92,7 @@ private:
     rog_map::PointCloud scratch_pc_;
     rog_map::Pose scratch_pose_;
     utils::vec_E<utils::Vec3f> scratch_real_occ_;
+    std::vector<Eigen::Vector3d> scratch_pts_;
     double last_empty_warn_t_ = 0.0;
 
     mutable std::mutex terrain_mtx_;

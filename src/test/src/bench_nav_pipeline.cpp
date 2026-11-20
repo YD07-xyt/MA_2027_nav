@@ -21,8 +21,13 @@
 #include "cv2map.hpp"
 #include "map/core/grid_map.hpp"
 #include "map/core/map_io.hpp"
+#include "map/core/static_terrain_prior.hpp"
 #include "map/layered/layered_map.hpp"
 #include "map/ma_map.hpp"
+#include "map/perception/dynamic_stvl_layer.hpp"
+#include "map/perception/online_terrain_mapper.hpp"
+#include "map/perception/sensor_model.hpp"
+#include "map/perception/static_terrain_builder.hpp"
 #include "path_planning/path_planning.hpp"
 #include "path_planning/post_processing.h"
 #include "path_planning/search/astar.h"
@@ -1102,6 +1107,404 @@ auto run_sanity_checks(BenchEnv& env) -> bool {
         }
     }
 
+    // 8. 新感知架构自检：.terrain.bin 先验 / SensorModel / StaticTerrainBuilder / OnlineTerrainMapper / DynamicStvlLayer
+    {
+        const std::filesystem::path tmp_dir =
+            std::filesystem::temp_directory_path() / ("ma_nav_stvl_sanity_" + std::to_string(::getpid()));
+        struct TempDirGuard {
+            std::filesystem::path dir;
+            ~TempDirGuard() {
+                std::error_code ec;
+                std::filesystem::remove_all(dir, ec);
+            }
+        } tmp_guard {tmp_dir};
+
+        // 8a. StaticTerrainPrior & MapIO .terrain.bin 往返、裁剪针孔插值与缺失/失配降级
+        const auto p_geom =
+            grid_map::GridGeometry::fromOriginAndSize(Eigen::Vector2d(-1.0, -1.0), Eigen::Vector2i(20, 16), 0.1);
+        std::vector<ma_map::CellState> p_cells(p_geom.cellCount(), ma_map::CellState::UNKNOWN);
+        ma_map::StaticTerrainPrior prior = ma_map::StaticTerrainPrior::createEmpty(p_geom);
+        for (int ix = 4; ix <= 14; ++ix) {
+            for (int iy = 3; iy <= 12; ++iy) {
+                const size_t idx = static_cast<size_t>(p_geom.toAddress(ix, iy));
+                p_cells[idx] = ma_map::CellState::FREE;
+                prior.ground_z[idx] = 0.25f;
+            }
+        }
+        const size_t oh_idx = static_cast<size_t>(p_geom.toAddress(8, 6));
+        prior.overhang_min_z[oh_idx] = 0.55f;
+        // 内部被 FREE 包围的针孔：MapIO 清理针孔时同步邻域插值 ground_z
+        const size_t pin_idx = static_cast<size_t>(p_geom.toAddress(9, 7));
+        p_cells[pin_idx] = ma_map::CellState::UNKNOWN;
+        prior.ground_z[pin_idx] = std::numeric_limits<float>::quiet_NaN();
+
+        ma_map::SaveOptions psave_opts;
+        psave_opts.crop_to_explored = true;
+        psave_opts.margin_cells = 1;
+        psave_opts.cleanup_free_pinholes = true;
+        psave_opts.save_terrain_prior = true;
+        const auto psaved = ma_map::MapIO::save((tmp_dir / "prior_rt").string(), p_geom, p_cells, psave_opts, &prior);
+        ok &= check(psaved.has_value() && psaved->saved_terrain_prior, "MapIO saves companion .terrain.bin");
+        if (psaved) {
+            const auto ploaded = ma_map::MapIO::load(psaved->pgm_path);
+            ok &= check(
+                ploaded.has_value() && ploaded->terrain_prior.has_value() && ploaded->terrain_prior->isValid(),
+                "MapIO loads companion .terrain.bin automatically"
+            );
+            if (ploaded && ploaded->terrain_prior) {
+                const Eigen::Vector2d w_oh = p_geom.indexToPos(Eigen::Vector2i(8, 6));
+                const Eigen::Vector2d w_pin = p_geom.indexToPos(Eigen::Vector2i(9, 7));
+                const float gz_pin = ploaded->terrain_prior->sampleGroundZ(w_pin, 0);
+                const float oh_val = ploaded->terrain_prior->sampleOverhangMinZ(w_oh, 0);
+                ok &= check(
+                    std::isfinite(gz_pin) && std::abs(gz_pin - 0.25f) < 1e-4f,
+                    "MapIO .terrain.bin interpolates ground_z on cleaned pinhole"
+                );
+                ok &= check(
+                    std::isfinite(oh_val) && std::abs(oh_val - 0.55f) < 1e-4f,
+                    "MapIO .terrain.bin round-trips overhang_min_z exactly"
+                );
+            }
+            // 删除 .terrain.bin 后仍可无阻塞加载静态图
+            std::error_code ec;
+            std::filesystem::remove(psaved->terrain_prior_path, ec);
+            const auto no_prior = ma_map::MapIO::load(psaved->pgm_path);
+            ok &= check(
+                no_prior.has_value() && !no_prior->terrain_prior.has_value(),
+                "MapIO gracefully falls back when .terrain.bin is absent"
+            );
+            // 写入几何失配的 .terrain.bin 后仍可降级忽略而不失败
+            const auto bad_geom =
+                grid_map::GridGeometry::fromOriginAndSize(Eigen::Vector2d(0.0, 0.0), Eigen::Vector2i(5, 5), 0.2);
+            const auto bad_prior = ma_map::StaticTerrainPrior::createEmpty(bad_geom);
+            ok &= check(
+                ma_map::StaticTerrainPrior::save(psaved->terrain_prior_path, bad_prior).has_value(),
+                "StaticTerrainPrior save mismatch test"
+            );
+            const auto mis_prior = ma_map::MapIO::load(psaved->pgm_path);
+            ok &= check(
+                mis_prior.has_value() && !mis_prior->terrain_prior.has_value(),
+                "MapIO ignores geometry-mismatched .terrain.bin gracefully"
+            );
+        }
+
+        // 8b. SensorModel REP-103 6-DoF 外参、自遮挡盒、视场与倾角跳变
+        {
+            ma_map::SensorModel::Config scfg;
+            scfg.t_base_lidar = Eigen::Vector3d(0.0, 0.0, 0.194);
+            scfg.rpy_deg = Eigen::Vector3d(0.0, -20.0, 0.0); // REP-103: pitch=-20° => +X 上仰 20°
+            ma_map::SensorModel sm(scfg);
+            const ma_map::SensorPose sp = sm.computePose(Eigen::Vector3d(1.0, 2.0, 0.0), Eigen::Quaterniond::Identity());
+            const Eigen::Vector3d p_w = sp.p_lidar_w + sp.R_w_lidar * Eigen::Vector3d(1.0, 0.0, 0.0);
+            const double rad20 = 20.0 * 3.14159265358979323846 / 180.0;
+            ok &= check(
+                std::abs(p_w.x() - (1.0 + std::cos(rad20))) < 1e-6 && std::abs(p_w.y() - 2.0) < 1e-6
+                    && std::abs(p_w.z() - (0.194 + std::sin(rad20))) < 1e-6,
+                "SensorModel REP-103 pitch=-20deg pitches +X upward"
+            );
+            const Eigen::Vector3d rt = sp.worldToLidar(p_w);
+            ok &= check((rt - Eigen::Vector3d(1.0, 0.0, 0.0)).norm() < 1e-9, "SensorPose worldToLidar round-trip");
+            ok &= check(
+                sm.isSelfHit(Eigen::Vector3d(1.1, 2.0, 0.15), sp)
+                    && !sm.isSelfHit(Eigen::Vector3d(2.5, 2.0, 0.15), sp),
+                "SensorModel base-frame AABB self-filter"
+            );
+            ok &= check(
+                sm.inFov(Eigen::Vector3d(2.0, 0.0, 0.5), 10.0) && !sm.inFov(Eigen::Vector3d(2.0, 0.0, -1.5), 10.0),
+                "SensorModel Mid-360 vertical FOV check"
+            );
+            const Eigen::Quaterniond q_yaw(Eigen::AngleAxisd(1.2, Eigen::Vector3d::UnitZ()));
+            const Eigen::Quaterniond q_pitch(Eigen::AngleAxisd(10.0 * 3.14159265358979323846 / 180.0, Eigen::Vector3d::UnitY()));
+            ok &= check(
+                ma_map::SensorModel::tiltAngleDeg(Eigen::Quaterniond::Identity(), q_yaw) < 1e-6
+                    && std::abs(ma_map::SensorModel::tiltAngleDeg(Eigen::Quaterniond::Identity(), q_pitch) - 10.0) < 1e-3,
+                "SensorModel tiltAngleDeg ignores pure yaw and measures pitch accurately"
+            );
+        }
+
+        // 8c. StaticTerrainBuilder: 20° 缓坡 / 40° 陡坡 / 0.20m 高台边沿 / 0.25m 限高杆 / 0.16m 低杆 / 竖直墙
+        {
+            const auto t_geom =
+                grid_map::GridGeometry::fromOriginAndSize(Eigen::Vector2d(0.0, 0.0), Eigen::Vector2i(40, 20), 0.05);
+            ma_map::StaticTerrainBuilder builder;
+
+            // 20° 缓坡（应全 FREE）
+            auto ramp20 = ma_map::StaticTerrainBuilder::VoxelColumnGrid::create(t_geom, true, false);
+            const float tan20 = std::tan(20.0f * 3.14159265f / 180.0f);
+            for (int ix = 0; ix < 40; ++ix) {
+                const float z = static_cast<float>(ix) * 0.05f * tan20;
+                for (int iy = 0; iy < 20; ++iy) {
+                    ramp20.occ_spans[static_cast<size_t>(ix * 20 + iy)].push_back({z - 0.10f, z});
+                }
+            }
+            const auto r20 = builder.build(ramp20);
+            ok &= check(r20.occupied_count == 0 && r20.free_count == 800, "StaticTerrainBuilder 20deg ramp all FREE");
+
+            // 40° 陡坡（内部应判 OCCUPIED）
+            auto ramp40 = ma_map::StaticTerrainBuilder::VoxelColumnGrid::create(t_geom, true, false);
+            const float tan40 = std::tan(40.0f * 3.14159265f / 180.0f);
+            for (int ix = 0; ix < 40; ++ix) {
+                const float z = static_cast<float>(ix) * 0.05f * tan40;
+                for (int iy = 0; iy < 20; ++iy) {
+                    ramp40.occ_spans[static_cast<size_t>(ix * 20 + iy)].push_back({z - 0.10f, z});
+                }
+            }
+            const auto r40 = builder.build(ramp40);
+            ok &= check(
+                r40.cells[static_cast<size_t>(20 * 20 + 10)] == ma_map::CellState::OCCUPIED,
+                "StaticTerrainBuilder 40deg steep slope OCCUPIED"
+            );
+
+            // 0.20m 实心高台 + 0.25m 限高杆 + 0.16m 低杆
+            auto scene = ma_map::StaticTerrainBuilder::VoxelColumnGrid::create(t_geom, true, false);
+            for (int ix = 0; ix < 40; ++ix) {
+                for (int iy = 0; iy < 20; ++iy) {
+                    const size_t idx = static_cast<size_t>(ix * 20 + iy);
+                    if (ix >= 25 && ix <= 35 && iy >= 5 && iy <= 15) {
+                        // 0.20m 高台
+                        scene.occ_spans[idx].push_back({-0.05f, 0.20f});
+                    } else {
+                        scene.occ_spans[idx].push_back({-0.05f, 0.0f});
+                        if (ix >= 8 && ix <= 10 && iy >= 5 && iy <= 15) {
+                            // 0.25m 限高杆（净空 0.25 >= 0.225 -> 可通行 + 记录 overhang_min_z）
+                            scene.occ_spans[idx].push_back({0.25f, 0.35f});
+                        } else if (ix >= 16 && ix <= 18 && iy >= 5 && iy <= 15) {
+                            // 0.16m 低杆（净空 0.16 < 0.225 -> 判障碍）
+                            scene.occ_spans[idx].push_back({0.16f, 0.24f});
+                        }
+                    }
+                }
+            }
+            const auto rs = builder.build(scene);
+            const size_t plat_in = static_cast<size_t>(30 * 20 + 10);
+            const size_t plat_edge = static_cast<size_t>(25 * 20 + 10);
+            const size_t plat_inner2 = static_cast<size_t>(27 * 20 + 10);
+            const size_t bar_high = static_cast<size_t>(9 * 20 + 10);
+            const size_t bar_low = static_cast<size_t>(17 * 20 + 10);
+            ok &= check(
+                rs.cells[plat_in] == ma_map::CellState::FREE && rs.cells[plat_inner2] == ma_map::CellState::FREE
+                    && std::abs(rs.terrain_prior.ground_z[plat_in] - 0.20f) < 1e-4f
+                    && rs.cells[plat_edge] == ma_map::CellState::OCCUPIED,
+                "StaticTerrainBuilder 0.20m platform top FREE without edge bleed and curb OCCUPIED"
+            );
+            ok &= check(
+                rs.cells[bar_high] == ma_map::CellState::FREE
+                    && std::isfinite(rs.terrain_prior.overhang_min_z[bar_high])
+                    && std::abs(rs.terrain_prior.overhang_min_z[bar_high] - 0.25f) < 1e-4f,
+                "StaticTerrainBuilder 0.25m height-limit bar FREE with accurate overhang_min_z"
+            );
+            ok &= check(
+                rs.cells[bar_low] == ma_map::CellState::OCCUPIED,
+                "StaticTerrainBuilder 0.16m low bar OCCUPIED"
+            );
+        }
+
+        // 8d. OnlineTerrainMapper: 零先验建图 + 信任半径截断远距噪点 + 3D 射线清除动态过客 + 坐标严格对齐
+        {
+            ma_map::SensorModel::Config scfg;
+            scfg.t_base_lidar = Eigen::Vector3d(0.0, 0.0, 0.194);
+            scfg.rpy_deg = Eigen::Vector3d(0.0, -20.0, 0.0);
+            ma_map::SensorModel sm(scfg);
+
+            ma_map::OnlineTerrainMapper::Config mcfg;
+            mcfg.resolution = 0.05;
+            mcfg.trust_range = 4.0;
+            mcfg.clear_range = 8.0;
+            mcfg.static_min_hits = 2;
+            ma_map::OnlineTerrainMapper mapper(mcfg);
+
+            const Eigen::Vector3d p_base(0.0, 0.0, 0.0);
+            const Eigen::Quaterniond q_base = Eigen::Quaterniond::Identity();
+            const ma_map::SensorPose sp = sm.computePose(p_base, q_base);
+
+            auto makeFrame = [](bool with_dynamic) {
+                std::vector<Eigen::Vector3d> pts;
+                // 地面 [0.5, 3.2] x [-1.2, 1.2], z = 0
+                for (double x = 0.525; x <= 3.175; x += 0.05) {
+                    for (double y = -1.175; y <= 1.175; y += 0.05) {
+                        pts.emplace_back(x, y, 0.0);
+                    }
+                }
+                // 静态墙体 x = 3.025, y in [-1.0, 1.0], z in [0.02, 0.72]
+                for (double y = -0.975; y <= 0.975; y += 0.05) {
+                    for (double z = 0.025; z <= 0.725; z += 0.05) {
+                        pts.emplace_back(3.025, y, z);
+                    }
+                }
+                // 动态过客在 (1.525, 0.025, 0.25..0.55)
+                if (with_dynamic) {
+                    for (double z = 0.225; z <= 0.525; z += 0.05) {
+                        pts.emplace_back(1.525, 0.025, z);
+                    }
+                }
+                // 远距噪点在 (6.525, 0.025, 0.30)（超过 trust_range=4.0m，必须被拒收）
+                for (int k = 0; k < 5; ++k) {
+                    pts.emplace_back(6.525, 0.025, 0.25 + 0.05 * k);
+                }
+                return pts;
+            };
+
+            const auto pts_dyn = makeFrame(true);
+            const auto pts_clean = makeFrame(false);
+            for (int f = 0; f < 2; ++f) {
+                (void)mapper.integrateFrame(pts_dyn, sp, q_base, sm, false);
+            }
+            for (int f = 0; f < 6; ++f) {
+                (void)mapper.integrateFrame(pts_clean, sp, q_base, sm, false);
+            }
+
+            const auto built = mapper.buildGlobalStaticMap();
+            ok &= check(built.has_value() && built->geometry.isValid(), "OnlineTerrainMapper builds global static map");
+            if (built) {
+                const auto wall_idx = built->geometry.posToIndex(Eigen::Vector2d(3.025, 0.025));
+                const auto dyn_idx = built->geometry.posToIndex(Eigen::Vector2d(1.525, 0.025));
+                const auto flr_idx = built->geometry.posToIndex(Eigen::Vector2d(1.025, 0.525));
+                ok &= check(
+                    built->geometry.isInside(wall_idx)
+                        && built->cells[static_cast<size_t>(built->geometry.toAddress(wall_idx))]
+                            == ma_map::CellState::OCCUPIED,
+                    "OnlineTerrainMapper preserves static wall at exact world coordinate"
+                );
+                ok &= check(
+                    built->geometry.isInside(dyn_idx)
+                        && built->cells[static_cast<size_t>(built->geometry.toAddress(dyn_idx))]
+                            == ma_map::CellState::FREE,
+                    "OnlineTerrainMapper clears transient dynamic obstacle via 3D ray clearing"
+                );
+                ok &= check(
+                    !built->geometry.isInside(Eigen::Vector2d(6.525, 0.025)),
+                    "OnlineTerrainMapper rejects distant noise beyond trust_range"
+                );
+                ok &= check(
+                    built->geometry.isInside(flr_idx)
+                        && built->cells[static_cast<size_t>(built->geometry.toAddress(flr_idx))]
+                            == ma_map::CellState::FREE
+                        && std::abs(
+                               built->terrain_prior.ground_z[static_cast<size_t>(built->geometry.toAddress(flr_idx))]
+                           )
+                            < 0.03f,
+                    "OnlineTerrainMapper recovers accurate ground_z"
+                );
+            }
+        }
+
+        // 8e. DynamicStvlLayer: 静态 ESDF 墙边抑制 + 2.5D 先验 Z 漂移跟踪/悬空剥离 + 移动障碍即时检测与射线清零
+        {
+            const auto n_geom =
+                grid_map::GridGeometry::fromOriginAndSize(Eigen::Vector2d(-1.0, -2.5), Eigen::Vector2i(100, 100), 0.05);
+            std::vector<ma_map::CellState> n_cells(n_geom.cellCount(), ma_map::CellState::FREE);
+            ma_map::StaticTerrainPrior n_prior = ma_map::StaticTerrainPrior::createEmpty(n_geom);
+            std::fill(n_prior.ground_z.begin(), n_prior.ground_z.end(), 0.0f);
+            // 静态墙体 x = 3.0m（ix = 80）
+            for (int iy = 0; iy < 100; ++iy) {
+                n_cells[static_cast<size_t>(n_geom.toAddress(80, iy))] = ma_map::CellState::OCCUPIED;
+            }
+            // 已知静态悬空限高杆区域 x in [1.0, 1.5], y in [-1.5, -0.5], overhang_min_z = 0.25m
+            for (int ix = 40; ix <= 50; ++ix) {
+                for (int iy = 20; iy <= 40; ++iy) {
+                    n_prior.overhang_min_z[static_cast<size_t>(n_geom.toAddress(ix, iy))] = 0.25f;
+                }
+            }
+
+            ma_map::SaveOptions ns_opts;
+            ns_opts.crop_to_explored = false;
+            ns_opts.save_terrain_prior = true;
+            const auto n_saved = ma_map::MapIO::save((tmp_dir / "stvl_static").string(), n_geom, n_cells, ns_opts, &n_prior);
+            ok &= check(n_saved.has_value() && n_saved->saved_terrain_prior, "DynamicStvlLayer test static map saved");
+
+            ma_map::LayeredMap::Config lm_cfg;
+            lm_cfg.x_left = 1.0;
+            lm_cfg.x_right = 4.0;
+            lm_cfg.y_left = 2.5;
+            lm_cfg.y_right = 2.5;
+            lm_cfg.resolution = 0.05;
+            ma_map::LayeredMap nav_lm(lm_cfg);
+            nav_lm.setMode(ma_map::MapMode::NAVIGATION);
+            const auto n_loaded = nav_lm.loadStaticMap(n_saved->pgm_path);
+            ok &= check(n_loaded.has_value() && n_loaded->has_terrain_prior, "LayeredMap loads static map + terrain prior");
+            const ma_map::StaticNavContext sctx = nav_lm.getStaticNavContext();
+            ok &= check(
+                sctx.static_esdf != nullptr && sctx.terrain_prior != nullptr,
+                "StaticNavContext exposes static_esdf and terrain_prior"
+            );
+
+            ma_map::SensorModel::Config scfg;
+            scfg.t_base_lidar = Eigen::Vector3d(0.0, 0.0, 0.194);
+            scfg.rpy_deg = Eigen::Vector3d(0.0, -20.0, 0.0);
+            ma_map::SensorModel sm(scfg);
+            ma_map::DynamicStvlLayer stvl;
+
+            const Eigen::Vector3d p_base(0.0, 0.0, 0.0);
+            const Eigen::Quaterniond q_base = Eigen::Quaterniond::Identity();
+            const ma_map::SensorPose sp = sm.computePose(p_base, q_base);
+            constexpr double kDriftZ = 0.10;
+
+            auto makeNavCloud = [&](bool with_dyn) {
+                std::vector<Eigen::Vector3d> pts;
+                // 含 +0.10m Z 漂移的地面点
+                for (double x = 0.6; x <= 2.7; x += 0.10) {
+                    for (double y = -1.5; y <= 1.5; y += 0.10) {
+                        pts.emplace_back(x, y, kDriftZ);
+                    }
+                }
+                // 墙边 0.05m 抖动点（距静态墙 x=3.025 <= wall_suppress_dist=0.08m，应被纯静态 ESDF 抑制）
+                for (double y = -1.2; y <= 1.2; y += 0.08) {
+                    for (double z = 0.25; z <= 0.65; z += 0.08) {
+                        pts.emplace_back(2.97, y, z + kDriftZ);
+                    }
+                }
+                // 静态墙体背景点（作为射线清除背景）
+                for (double y = -1.2; y <= 1.2; y += 0.05) {
+                    for (double z = 0.15; z <= 0.85; z += 0.05) {
+                        pts.emplace_back(3.025, y, z + kDriftZ);
+                    }
+                }
+                // 已知限高杆点（z_corr = 0.26 >= 0.25 - 0.06，应被 terrain_prior 剥离）
+                for (double x = 1.05; x <= 1.45; x += 0.05) {
+                    for (double y = -1.45; y <= -0.55; y += 0.05) {
+                        pts.emplace_back(x, y, 0.26 + kDriftZ);
+                    }
+                }
+                // 动态障碍物簇（位于 (1.8, 0.0)，高度 0.25..0.55）
+                if (with_dyn) {
+                    for (double x = 1.72; x <= 1.88; x += 0.05) {
+                        for (double y = -0.10; y <= 0.10; y += 0.05) {
+                            for (double z = 0.25; z <= 0.55; z += 0.05) {
+                                pts.emplace_back(x, y, z + kDriftZ);
+                            }
+                        }
+                    }
+                }
+                return pts;
+            };
+
+            const auto nav_static_only = makeNavCloud(false);
+            const auto nav_with_dyn = makeNavCloud(true);
+
+            // Frame 1: 纯静态场景 + +0.10m Z 漂移 -> 零误检 + 精确跟踪 Z 漂移
+            const auto f1 = stvl.update(nav_static_only, sp, q_base, sm, sctx, 0.0);
+            ok &= check(
+                f1.obstacle_cells.empty() && std::abs(stvl.estimatedDriftZ() - static_cast<float>(kDriftZ)) < 0.03f,
+                "DynamicStvlLayer tracks Z-drift and emits 0 false obstacles on floor/wall-halo/overhang"
+            );
+
+            // Frame 2: 动态障碍物出现 -> 单帧 3D 成簇即刻检测
+            const auto f2 = stvl.update(nav_with_dyn, sp, q_base, sm, sctx, 0.1);
+            ok &= check(
+                !f2.obstacle_cells.empty(),
+                "DynamicStvlLayer detects moving obstacle immediately via 3D cluster confirm"
+            );
+
+            // Frame 3 & 4: 动态障碍物移开 -> 极坐标深度图射线穿透在 2 帧内清零（零拖影）
+            (void)stvl.update(nav_static_only, sp, q_base, sm, sctx, 0.2);
+            const auto f4 = stvl.update(nav_static_only, sp, q_base, sm, sctx, 0.3);
+            ok &= check(
+                f4.obstacle_cells.empty() && stvl.activeVoxelCount() == 0,
+                "DynamicStvlLayer ray-clears vanished dynamic obstacle within 2 frames (zero ghosting)"
+            );
+        }
+    }
+
     return ok;
 }
 
@@ -1361,6 +1764,75 @@ auto register_benchmarks(BenchEnv* env) -> void {
         }
         st.SetItemsProcessed(st.iterations());
     })->Unit(benchmark::kMicrosecond);
+
+    // ---- Perception (新感知后端 15k 点实测单帧延迟) ----
+    benchmark::RegisterBenchmark("Perception/DynamicStvl_Update_15kPts", [env](benchmark::State& st) {
+        ma_map::SensorModel::Config scfg;
+        scfg.t_base_lidar = Eigen::Vector3d(0.0, 0.0, 0.194);
+        scfg.rpy_deg = Eigen::Vector3d(0.0, -20.0, 0.0);
+        ma_map::SensorModel sm(scfg);
+        ma_map::DynamicStvlLayer stvl;
+
+        const auto snap = env->gm_a;
+        const auto geom = snap->geometry();
+        auto prior = std::make_shared<ma_map::StaticTerrainPrior>(ma_map::StaticTerrainPrior::createEmpty(geom));
+        std::fill(prior->ground_z.begin(), prior->ground_z.end(), 0.0f);
+        ma_map::StaticNavContext sctx;
+        sctx.static_esdf = snap;
+        sctx.terrain_prior = prior;
+        sctx.current_snapshot = snap;
+
+        const Eigen::Vector3d p_base(6.0, 4.0, 0.0);
+        const Eigen::Quaterniond q_base = Eigen::Quaterniond::Identity();
+        const ma_map::SensorPose sp = sm.computePose(p_base, q_base);
+
+        // 构造 15,000 点真实密度 Mid-360 帧（地面 + 周边结构 + 移动动态障碍物）
+        std::vector<Eigen::Vector3d> pts;
+        pts.reserve(15000);
+        for (int i = 0; i < 15000; ++i) {
+            const double az = (static_cast<double>(i % 360) * 3.14159265358979323846) / 180.0;
+            const double r = 0.6 + 0.18 * static_cast<double>((i / 360) % 40);
+            const double z = (i % 15 == 0) ? 0.35 : 0.01 * std::sin(static_cast<double>(i));
+            pts.emplace_back(p_base.x() + r * std::cos(az), p_base.y() + r * std::sin(az), z);
+        }
+
+        double t_sim = 0.0;
+        for (auto _: st) {
+            t_sim += 0.1;
+            const auto fr = stvl.update(pts, sp, q_base, sm, sctx, t_sim);
+            benchmark::DoNotOptimize(fr.obstacle_cells.size());
+        }
+        st.SetItemsProcessed(st.iterations());
+    })->Unit(benchmark::kMillisecond);
+
+    benchmark::RegisterBenchmark("Perception/OnlineMapper_Integrate_15kPts", [](benchmark::State& st) {
+        ma_map::SensorModel::Config scfg;
+        scfg.t_base_lidar = Eigen::Vector3d(0.0, 0.0, 0.194);
+        scfg.rpy_deg = Eigen::Vector3d(0.0, -20.0, 0.0);
+        ma_map::SensorModel sm(scfg);
+        ma_map::OnlineTerrainMapper mapper;
+
+        const Eigen::Vector3d p_base(0.0, 0.0, 0.0);
+        const Eigen::Quaterniond q_base = Eigen::Quaterniond::Identity();
+        const ma_map::SensorPose sp = sm.computePose(p_base, q_base);
+
+        std::vector<Eigen::Vector3d> pts;
+        pts.reserve(15000);
+        for (int i = 0; i < 15000; ++i) {
+            const double az = (static_cast<double>(i % 360) * 3.14159265358979323846) / 180.0;
+            const double r = 0.6 + 0.18 * static_cast<double>((i / 360) % 40);
+            const double z = (r > 3.5) ? (0.1 + 0.02 * static_cast<double>(i % 30)) : 0.0;
+            pts.emplace_back(r * std::cos(az), r * std::sin(az), z);
+        }
+
+        // 预热分配一次稀疏块，测稳态单帧集成 + 3D DDA 扫空 + 局部预览耗时
+        (void)mapper.integrateFrame(pts, sp, q_base, sm, true);
+        for (auto _: st) {
+            const auto fr = mapper.integrateFrame(pts, sp, q_base, sm, true);
+            benchmark::DoNotOptimize(fr);
+        }
+        st.SetItemsProcessed(st.iterations());
+    })->Unit(benchmark::kMillisecond);
 }
 
 } // namespace

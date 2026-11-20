@@ -36,7 +36,7 @@ MaMap::MaMap(MaMap&&) noexcept = default;
 MaMap& MaMap::operator=(MaMap&&) noexcept = default;
 
 auto MaMap::set_mode(MapMode mode) -> void {
-    impl_->perception.setForgetThresholdForMode(mode == MapMode::MAPPING);
+    impl_->perception.setMode(mode);
     impl_->layered_map.setMode(mode);
 }
 
@@ -57,7 +57,11 @@ auto MaMap::update_cloud(const rog_map::PointCloud& cloud) -> void {
 }
 
 auto MaMap::update_map() -> void {
-    auto frame = impl_->perception.processPendingFrame();
+    const StaticNavContext static_ctx =
+        (impl_->layered_map.mode() == MapMode::NAVIGATION && impl_->perception.usesStvlPrior())
+        ? impl_->layered_map.getStaticNavContext()
+        : StaticNavContext {};
+    auto frame = impl_->perception.processPendingFrame(static_ctx);
     if (!frame.has_value()) {
         return;
     }
@@ -69,11 +73,24 @@ auto MaMap::ensure_covers(const Eigen::Vector2d& world_pt) -> bool {
 }
 
 auto MaMap::load_static_map(std::string_view map_path) -> tl::expected<LoadReport, std::string> {
-    return impl_->layered_map.loadStaticMap(map_path);
+    auto res = impl_->layered_map.loadStaticMap(map_path);
+    if (res.has_value()) {
+        impl_->perception.resetDynamic();
+    }
+    return res;
 }
 
 auto MaMap::save_explored_map(std::string_view output_path, const std::optional<SaveOptions>& options) const
     -> tl::expected<SaveReport, std::string> {
+    if (impl_->layered_map.mode() == MapMode::MAPPING && impl_->perception.usesStvlPrior()
+        && impl_->perception.hasOnlineMappingData())
+    {
+        auto built = impl_->perception.buildGlobalStaticMap();
+        if (built.has_value() && built->geometry.isValid()) {
+            const SaveOptions effective_opts = options.value_or(impl_->layered_map.defaultSaveOptions());
+            return MapIO::save(output_path, built->geometry, built->cells, effective_opts, &built->terrain_prior);
+        }
+    }
     return impl_->layered_map.saveExploredMap(output_path, options);
 }
 

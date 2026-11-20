@@ -179,6 +179,8 @@ auto LayeredMap::loadStaticMap(std::string_view map_path) -> tl::expected<LoadRe
     report.occupied_count = loaded->occupied_count;
     report.free_count = loaded->free_count;
     report.unknown_count = loaded->unknown_count;
+    report.has_terrain_prior = loaded->terrain_prior.has_value();
+    report.terrain_prior_path = loaded->terrain_prior_path;
 
     {
         std::lock_guard<std::mutex> lock(back_mtx_);
@@ -193,6 +195,7 @@ auto LayeredMap::loadStaticMap(std::string_view map_path) -> tl::expected<LoadRe
         snapshot_pool_ = std::make_shared<SnapshotPool>(geometry_, oob_policy_);
         composeOccupancyLocked();
         publishComposedLocked(/*force_publish=*/true);
+        rebuildStaticEsdfLocked();
     }
 
     return report;
@@ -202,6 +205,7 @@ auto LayeredMap::saveExploredMap(std::string_view output_path, const std::option
     -> tl::expected<SaveReport, std::string> {
     grid_map::GridGeometry save_geom;
     std::vector<CellState> save_cells;
+    std::shared_ptr<const StaticTerrainPrior> save_prior;
     SaveOptions effective_opts;
 
     {
@@ -237,6 +241,10 @@ auto LayeredMap::saveExploredMap(std::string_view output_path, const std::option
                         save_cells[i] = CellState::OCCUPIED;
                     }
                 }
+                auto st_prior = static_layer_.terrainPrior();
+                if (st_prior && st_prior->isValid() && st_prior->geometry == save_geom) {
+                    save_prior = std::move(st_prior);
+                }
             } else {
                 for (size_t i = 0; i < n; ++i) {
                     save_cells[i] = composed_occ_[i] != 0 ? CellState::OCCUPIED : CellState::FREE;
@@ -247,14 +255,11 @@ auto LayeredMap::saveExploredMap(std::string_view output_path, const std::option
         if (options.has_value()) {
             effective_opts = *options;
         } else {
-            effective_opts.crop_to_explored = true;
-            effective_opts.margin_cells = config_.save_margin_cells;
-            effective_opts.cleanup_free_pinholes = true;
-            effective_opts.max_pinhole_cells = 4;
+            effective_opts = defaultSaveOptions();
         }
     }
 
-    return MapIO::save(output_path, save_geom, save_cells, effective_opts);
+    return MapIO::save(output_path, save_geom, save_cells, effective_opts, save_prior.get());
 }
 
 auto LayeredMap::setGlobalOccupancy(const grid_map::RowMatrixXi& global_occ) -> bool {
@@ -266,6 +271,7 @@ auto LayeredMap::setGlobalOccupancy(const grid_map::RowMatrixXi& global_occ) -> 
     if (!changed) {
         return true;
     }
+    static_esdf_dirty_.store(true, std::memory_order_release);
     composeOccupancyLocked();
     publishComposedLocked(/*force_publish=*/false);
     return true;
@@ -300,6 +306,31 @@ auto LayeredMap::setSemanticsPolygon(
 auto LayeredMap::getSnapshot() const -> grid_map::GridMap::ConstPtr {
     std::lock_guard<std::mutex> lock(front_mtx_);
     return front_snapshot_;
+}
+
+auto LayeredMap::getStaticNavContext() const -> StaticNavContext {
+    if (static_esdf_dirty_.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> back_lock(back_mtx_);
+        if (static_esdf_dirty_.load(std::memory_order_relaxed)) {
+            rebuildStaticEsdfLocked();
+        }
+    }
+    std::lock_guard<std::mutex> lock(front_mtx_);
+    StaticNavContext ctx;
+    ctx.static_esdf = front_static_esdf_;
+    ctx.terrain_prior = front_terrain_prior_;
+    ctx.current_snapshot = front_snapshot_;
+    return ctx;
+}
+
+auto LayeredMap::defaultSaveOptions() const -> SaveOptions {
+    SaveOptions opts;
+    opts.crop_to_explored = true;
+    opts.margin_cells = config_.save_margin_cells;
+    opts.cleanup_free_pinholes = true;
+    opts.max_pinhole_cells = 4;
+    opts.save_terrain_prior = true;
+    return opts;
 }
 
 auto LayeredMap::getOccupancyMatrix() const -> grid_map::RowMatrixXi {
@@ -465,6 +496,9 @@ auto LayeredMap::expandByCellsLocked(int dx_neg, int dx_pos, int dy_neg, int dy_
     geometry_ = new_geom;
     composed_occ_.assign(geometry_.cellCount(), 0);
     snapshot_pool_ = std::make_shared<SnapshotPool>(geometry_, oob_policy_);
+    if (static_layer_.hasLoadedCells()) {
+        static_esdf_dirty_.store(true, std::memory_order_release);
+    }
 
     logger::MaMap->info(
         "Expanded 2D map: {}x{} -> {}x{} (origin ({:.2f},{:.2f}) -> ({:.2f},{:.2f}), size {:.1f}x{:.1f}m)",
@@ -529,6 +563,29 @@ auto LayeredMap::publishSnapshot(grid_map::GridMap::ConstPtr next_front) -> void
         old_front = std::move(front_snapshot_);
         front_snapshot_ = std::move(next_front);
     }
+}
+
+auto LayeredMap::rebuildStaticEsdfLocked() const -> void {
+    grid_map::GridMap::ConstPtr next_static;
+    std::shared_ptr<const StaticTerrainPrior> next_prior;
+    if (static_layer_.hasLoadedCells() && geometry_.isValid()) {
+        auto gm = std::make_shared<grid_map::GridMap>();
+        gm->init(geometry_, grid_map::OutOfBoundsPolicy::OCCUPIED);
+        gm->overwriteOccAndUpdateEsdf(static_layer_.occupancy(), &esdf_workspace_);
+        next_static = std::move(gm);
+        next_prior = static_layer_.terrainPrior();
+    }
+
+    grid_map::GridMap::ConstPtr old_static;
+    std::shared_ptr<const StaticTerrainPrior> old_prior;
+    {
+        std::lock_guard<std::mutex> lock(front_mtx_);
+        old_static = std::move(front_static_esdf_);
+        old_prior = std::move(front_terrain_prior_);
+        front_static_esdf_ = std::move(next_static);
+        front_terrain_prior_ = std::move(next_prior);
+    }
+    static_esdf_dirty_.store(false, std::memory_order_release);
 }
 
 } // namespace ma_map

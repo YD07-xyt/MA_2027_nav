@@ -108,3 +108,16 @@ target_link_libraries(bench_nav_pipeline
     ${OpenCV_LIBS}
     benchmark::benchmark
 )
+
+# 离线静态地图与 2.5D 地形先验构建工具（无 ROS 依赖；支持 STL / PCD / frames.bin -> .pgm + .yaml + .terrain.bin）
+add_executable(static_map_builder src/static_map_builder.cpp)
+target_include_directories(static_map_builder PUBLIC include ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(static_map_builder PUBLIC
+    spdlog::spdlog
+    utils
+    Eigen3::Eigen
+    3d_occ_map
+    yaml-cpp
+    ${PCL_LIBRARIES}
+)
+target_link_libraries(static_map_builder PRIVATE ${OpenCV_LIBS})

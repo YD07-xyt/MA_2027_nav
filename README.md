@@ -12,7 +12,18 @@ bash scripts/format.sh src/明确文件.cpp  # 显式格式修复，使用现有
 
 # 核心代码改前/改后离线基准对比（流程见 docs/WORKFLOW.md 与 docs/TOOLCHAIN.md）
 cmake --build build/ma_nav --target bench_nav_pipeline -j
+./build/ma_nav/src/tes```bash
+./scripts/verify.sh                 # 默认增量静态门禁，无构建
+./scripts/verify.sh --full-scan     # 全量现状扫描，存量问题也返回失败
+./scripts/verify.sh --static-only --report .cache/verify/latest.json
+bash scripts/format.sh src/明确文件.cpp  # 显式格式修复，使用现有风格
+
+# 核心代码改前/改后离线基准对比（流程见 docs/WORKFLOW.md 与 docs/TOOLCHAIN.md）
+cmake --build build/ma_nav --target bench_nav_pipeline -j
 ./build/ma_nav/src/test/bench_nav_pipeline --benchmark_repetitions=5 \
+  --benchmark_out=.cache/bench/before.json --benchmark_out_format=json
+python3 scripts/compare_bench.py .cache/bench/before.json .cache/bench/after.json
+```t/bench_nav_pipeline --benchmark_repetitions=5 \
   --benchmark_out=.cache/bench/before.json --benchmark_out_format=json
 python3 scripts/compare_bench.py .cache/bench/before.json .cache/bench/after.json
 ```

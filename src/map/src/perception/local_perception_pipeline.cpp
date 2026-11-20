@@ -3,15 +3,20 @@
 #include "utils/logger.hpp"
 
 #include <chrono>
+#include <cmath>
 #include <utility>
 
 namespace ma_map {
 
-LocalPerceptionPipeline::LocalPerceptionPipeline(const rog_map::Config& cfg): cfg_(cfg) {
+LocalPerceptionPipeline::LocalPerceptionPipeline(const rog_map::Config& cfg):
+    cfg_(cfg),
+    use_stvl_prior_(cfg.perception_backend == "stvl_prior") {
+    // 始终初始化 rog_map_ptr_，保障既有 visualizer::map_viz_callback 与 odom 状态查询安全无空指针。
     rog_map_ptr_ = std::make_shared<rog_map::ROGMap>();
     rog_map_ptr_->setConfig(cfg_);
     rog_map_ptr_->init();
 
+    // 初始化 legacy_rog 地形与持久地面层组件（回退后端与 get_ground_layer() 兼容）
     Terrain::TerrainAnalyzer::Config terrain_cfg;
     terrain_cfg.kernel_size = cfg_.terrain_kernel_size;
     terrain_cfg.max_step_height = cfg_.terrain_max_step_height;
@@ -55,8 +60,90 @@ LocalPerceptionPipeline::LocalPerceptionPipeline(const rog_map::Config& cfg): cf
         terrain_analyzer_.setGroundLayer(&ground_layer_);
     }
 
+    // 初始化 stvl_prior 感知后端组件
+    SensorModel::Config scfg;
+    scfg.t_base_lidar = cfg_.perception_t_base_lidar;
+    scfg.rpy_deg = cfg_.perception_rpy_deg;
+    scfg.fov_min_elev_deg = cfg_.perception_fov_min_elev_deg;
+    scfg.fov_max_elev_deg = cfg_.perception_fov_max_elev_deg;
+    scfg.fov_margin_deg = cfg_.perception_fov_margin_deg;
+    scfg.min_range = cfg_.perception_sensor_min_range;
+    scfg.max_range = cfg_.perception_sensor_max_range;
+    scfg.self_filter_min = cfg_.perception_self_filter_min;
+    scfg.self_filter_max = cfg_.perception_self_filter_max;
+    sensor_model_.setConfig(scfg);
+
+    OnlineTerrainMapper::Config mcfg;
+    mcfg.resolution = cfg_.grid_map_resolution;
+    mcfg.trust_range = cfg_.perception_map_trust_range;
+    mcfg.clear_range = cfg_.perception_map_clear_range;
+    mcfg.clear_stop_margin = cfg_.perception_map_clear_stop_margin;
+    mcfg.min_z = cfg_.perception_map_min_z;
+    mcfg.max_z = cfg_.perception_map_max_z;
+    mcfg.static_min_hits = cfg_.perception_map_static_min_hits;
+    mcfg.static_clear_ratio = cfg_.perception_map_static_clear_ratio;
+    mcfg.preview_radius = cfg_.perception_map_preview_radius;
+    mcfg.footprint_radius = cfg_.ground_layer_en ? static_cast<double>(cfg_.ground_layer_footprint_radius) : 0.20;
+    mcfg.footprint_ground_offset =
+        cfg_.ground_layer_en ? static_cast<double>(cfg_.ground_layer_footprint_offset) : 0.0;
+    mcfg.tilt_jump_deg = cfg_.perception_map_tilt_jump_deg;
+    mcfg.tilt_hold_frames = cfg_.perception_map_tilt_hold_frames;
+    mcfg.terrain.robot_height = cfg_.terrain_robot_height;
+    mcfg.terrain.min_overhang_clearance = cfg_.terrain_min_overhang_clearance;
+    mcfg.terrain.max_slope_deg = cfg_.perception_map_max_slope_deg;
+    mcfg.terrain.step_tol = cfg_.perception_map_step_tol;
+    mcfg.terrain.plane_rms_max = cfg_.perception_map_plane_rms_max;
+    mcfg.terrain.max_surface_thickness = cfg_.perception_map_max_surface_thickness;
+    mcfg.terrain.overhang_ground_radius = cfg_.terrain_overhang_ground_radius;
+    online_mapper_.setConfig(mcfg);
+
+    DynamicStvlLayer::Config dcfg;
+    dcfg.voxel_size = cfg_.grid_map_resolution;
+    dcfg.nav_max_range = cfg_.perception_nav_max_range;
+    dcfg.wall_suppress_dist = cfg_.perception_nav_wall_suppress_dist;
+    dcfg.ground_margin_base = cfg_.perception_nav_ground_margin_base;
+    dcfg.ground_margin_per_m = cfg_.perception_nav_ground_margin_per_m;
+    dcfg.dynamic_max_height = cfg_.perception_nav_dynamic_max_height;
+    dcfg.overhang_margin = cfg_.perception_nav_overhang_margin;
+    dcfg.tunnel_clearance_z = cfg_.perception_nav_tunnel_clearance_z;
+    dcfg.fallback_ground_offset =
+        cfg_.ground_layer_en ? static_cast<double>(cfg_.ground_layer_footprint_offset) : 0.0;
+    dcfg.ray_clear_margin = cfg_.perception_nav_ray_clear_margin;
+    dcfg.miss_clear_frames = cfg_.perception_nav_miss_clear_frames;
+    dcfg.decay_in_fov_sec = cfg_.perception_nav_decay_in_fov_sec;
+    dcfg.decay_blind_sec = cfg_.perception_nav_decay_blind_sec;
+    dcfg.confirm_min_frames = cfg_.perception_nav_confirm_min_frames;
+    dcfg.fast_confirm_with_neighbor = cfg_.perception_nav_fast_confirm_with_neighbor;
+    dcfg.tilt_jump_deg = cfg_.perception_nav_tilt_jump_deg;
+    dcfg.tilt_hold_frames = cfg_.perception_nav_tilt_hold_frames;
+    dcfg.drift_max_abs = cfg_.perception_nav_drift_max_abs;
+    dcfg.drift_min_samples = cfg_.perception_nav_drift_min_samples;
+    dynamic_stvl_.setConfig(dcfg);
+
+    scratch_pts_.reserve(20000);
+
+    logger::MaMap->info(
+        "[LocalPerceptionPipeline] backend='{}', sensor t_bl=[{:.3f},{:.3f},{:.3f}] rpy_deg=[{:.1f},{:.1f},{:.1f}]",
+        cfg_.perception_backend,
+        scfg.t_base_lidar.x(),
+        scfg.t_base_lidar.y(),
+        scfg.t_base_lidar.z(),
+        scfg.rpy_deg.x(),
+        scfg.rpy_deg.y(),
+        scfg.rpy_deg.z()
+    );
+
     last_empty_warn_t_ =
         std::chrono::duration<double>(std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+}
+
+auto LocalPerceptionPipeline::setMode(MapMode mode) -> void {
+    const uint8_t next = static_cast<uint8_t>(mode);
+    const uint8_t prev = mode_.exchange(next, std::memory_order_acq_rel);
+    setForgetThresholdForMode(mode == MapMode::MAPPING);
+    if (prev != next) {
+        dynamic_stvl_.reset();
+    }
 }
 
 auto LocalPerceptionPipeline::setForgetThresholdForMode(bool mapping_mode) -> void {
@@ -88,7 +175,8 @@ auto LocalPerceptionPipeline::updateCloud(const rog_map::PointCloud& cloud) -> v
     map_empty_ = false;
 }
 
-auto LocalPerceptionPipeline::processPendingFrame() -> std::optional<LocalTerrainFrame> {
+auto LocalPerceptionPipeline::processPendingFrame(const StaticNavContext& static_ctx)
+    -> std::optional<LocalTerrainFrame> {
     int pending = 0;
     bool empty = true;
     {
@@ -120,6 +208,54 @@ auto LocalPerceptionPipeline::processPendingFrame() -> std::optional<LocalTerrai
         logger::MaMap->warn("Unfinished frame cnt > 1, the map may not work in real-time");
     }
 
+    if (use_stvl_prior_) {
+        scratch_pts_.clear();
+        if (scratch_pts_.capacity() < scratch_pc_.size()) {
+            scratch_pts_.reserve(scratch_pc_.size());
+        }
+        const int stride = std::max(1, cfg_.point_filt_num);
+        const bool filter_intensity = (cfg_.intensity_thresh > 0);
+        for (size_t i = 0; i < scratch_pc_.size(); i += static_cast<size_t>(stride)) {
+            const auto& pt = scratch_pc_.points[i];
+            if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) {
+                continue;
+            }
+            if (filter_intensity && pt.intensity < static_cast<float>(cfg_.intensity_thresh)) {
+                continue;
+            }
+            scratch_pts_.emplace_back(static_cast<double>(pt.x), static_cast<double>(pt.y), static_cast<double>(pt.z));
+        }
+
+        const SensorPose sp = sensor_model_.computePose(scratch_pose_.first, scratch_pose_.second);
+        const MapMode cur_mode = static_cast<MapMode>(mode_.load(std::memory_order_acquire));
+
+        std::optional<LocalTerrainFrame> frame;
+        if (cur_mode == MapMode::MAPPING) {
+            frame = online_mapper_.integrateFrame(
+                scratch_pts_,
+                sp,
+                scratch_pose_.second,
+                sensor_model_,
+                /*build_local_preview=*/true
+            );
+        } else {
+            frame = dynamic_stvl_.update(
+                scratch_pts_,
+                sp,
+                scratch_pose_.second,
+                sensor_model_,
+                static_ctx
+            );
+        }
+
+        if (frame.has_value()) {
+            std::lock_guard<std::mutex> lock(terrain_mtx_);
+            last_terrain_map_ = frame->obstacle_cells;
+        }
+        return frame;
+    }
+
+    // ---------- 回退后端：legacy_rog ----------
     rog_map_ptr_->updateProbMap(scratch_pc_, scratch_pose_);
     const auto voxel_query = [this](const utils::Vec3f& pos) { return rog_map_ptr_->getGridType(pos); };
     if (cfg_.ground_layer_en) {

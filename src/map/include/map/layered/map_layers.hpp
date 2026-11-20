@@ -3,11 +3,13 @@
 #include "map/core/grid_geometry.hpp"
 #include "map/core/grid_map.hpp"
 #include "map/core/map_io.hpp"
+#include "map/core/static_terrain_prior.hpp"
 #include "map/perception/local_terrain_frame.hpp"
 
 #include <Eigen/Core>
 
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -68,12 +70,17 @@ public:
         return has_loaded_cells_;
     }
 
+    auto terrainPrior() const -> std::shared_ptr<const StaticTerrainPrior> {
+        return terrain_prior_;
+    }
+
     auto toOccupancyMatrix() const -> grid_map::RowMatrixXi;
 
 private:
     grid_map::GridGeometry geom_;
     std::vector<uint8_t> occ_;
     std::vector<CellState> cells_;
+    std::shared_ptr<const StaticTerrainPrior> terrain_prior_;
     bool has_loaded_cells_ = false;
     bool from_binary_matrix_ = false;
 };

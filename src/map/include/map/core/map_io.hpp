@@ -1,9 +1,11 @@
 #pragma once
 
 #include "map/core/grid_geometry.hpp"
+#include "map/core/static_terrain_prior.hpp"
 #include "utils/expected.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -28,6 +30,8 @@ struct LoadedMap {
     int occupied_count = 0;
     int free_count = 0;
     int unknown_count = 0;
+    std::optional<StaticTerrainPrior> terrain_prior; // 可选伴随 2.5D 静态地形先验（<stem>.terrain.bin）
+    std::string terrain_prior_path;
 };
 
 struct LoadOptions {
@@ -39,11 +43,14 @@ struct SaveOptions {
     int margin_cells = 2; // 已探索包围盒外扩的 UNKNOWN 边距格数（夹紧到原图内）
     bool cleanup_free_pinholes = true; // 填补完全被 FREE 包围的内部孤立小 UNKNOWN 洞
     int max_pinhole_cells = 4; // 孤立 UNKNOWN 洞最大清理面积（4 连通格数）
+    bool save_terrain_prior = true; // 若提供 StaticTerrainPrior，同步原子写出伴随 <stem>.terrain.bin
 };
 
 struct SaveReport {
     std::string pgm_path;
     std::string yaml_path;
+    std::string terrain_prior_path;
+    bool saved_terrain_prior = false;
     grid_map::GridGeometry saved_geometry;
     int occupied_count = 0;
     int free_count = 0;
@@ -51,24 +58,27 @@ struct SaveReport {
     int cleaned_pinholes = 0;
 };
 
-// 纯 C++ 静态地图持久化（P5 PGM + ROS map_server YAML）。
+// 纯 C++ 静态地图持久化（P5 PGM + ROS map_server YAML + 可选伴随 .terrain.bin）。
 // 轴约定与既有 global_map 兼容：
 //   pgm_cols = voxel_num.y()（世界 Y 递增），pgm_rows = voxel_num.x()（顶行对应世界 X 最大，即 pgm_row = nx - 1 - ix）。
 class MapIO {
 public:
     // 从 .pgm 或 .yaml 文件加载地图，严格继承文件内的 resolution、origin 与尺寸。
+    // 若同目录存在同名 .terrain.bin 且几何校验一致则自动加载；缺失或失配时降级忽略，不阻塞静态图加载。
     // 失败返回错误描述字符串，无副作用。
     static auto
     load(std::string_view map_path, const LoadOptions& options = {}) -> tl::expected<LoadedMap, std::string>;
 
     // 保存三态栅格为 P5 PGM（0=OCCUPIED, 254=FREE, 205=UNKNOWN）与同名 YAML。
+    // 若 terrain_prior 非空且 options.save_terrain_prior 为真，按相同裁剪窗口原子写出同名 .terrain.bin。
     // output_path 可为目录（写入 global_map.pgm / global_map.yaml）或 .pgm / .yaml 文件路径。
     // 若 crop_to_explored 为真且没有任何已探索格，返回错误并拒绝覆盖目标文件。
     static auto save(
         std::string_view output_path,
         const grid_map::GridGeometry& geometry,
         std::span<const CellState> cells,
-        const SaveOptions& options = {}
+        const SaveOptions& options = {},
+        const StaticTerrainPrior* terrain_prior = nullptr
     ) -> tl::expected<SaveReport, std::string>;
 };
 
