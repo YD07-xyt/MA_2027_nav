@@ -246,6 +246,28 @@ public:
         loader.LoadParam(name_space + "/grid_map/y_left", grid_map_y_left, 8.0);
         loader.LoadParam(name_space + "/grid_map/y_right", grid_map_y_right, 8.0);
         loader.LoadParam(name_space + "/grid_map/resolution", grid_map_resolution, 0.05);
+        loader.LoadParam(name_space + "/grid_map/expand_chunk_m", grid_map_expand_chunk_m, 4.0);
+        if (!std::isfinite(grid_map_expand_chunk_m) || grid_map_expand_chunk_m <= 0.0) {
+            logger::Parameter->warn("[map] invalid grid_map/expand_chunk_m, fallback to 4.0");
+            grid_map_expand_chunk_m = 4.0;
+        }
+        std::vector<double> max_map_size_v;
+        loader.LoadParam(name_space + "/grid_map/max_map_size", max_map_size_v, std::vector<double> {80.0, 80.0});
+        if (max_map_size_v.size() == 2 && std::isfinite(max_map_size_v[0]) && std::isfinite(max_map_size_v[1])
+            && max_map_size_v[0] > 0.0 && max_map_size_v[1] > 0.0)
+        {
+            grid_map_max_size_x = max_map_size_v[0];
+            grid_map_max_size_y = max_map_size_v[1];
+        } else {
+            logger::Parameter->warn("[map] invalid grid_map/max_map_size, fallback to [80.0, 80.0]");
+            grid_map_max_size_x = 80.0;
+            grid_map_max_size_y = 80.0;
+        }
+        loader.LoadParam(name_space + "/grid_map/save_margin_cells", grid_map_save_margin_cells, 2);
+        if (grid_map_save_margin_cells < 0) {
+            grid_map_save_margin_cells = 0;
+        }
+        loader.LoadParam(name_space + "/grid_map/unknown_as_occupied", grid_map_unknown_as_occupied, true);
 
         resetMapSize();
 
@@ -418,6 +440,11 @@ public:
     double grid_map_y_left{8.0};
     double grid_map_y_right{8.0};
     double grid_map_resolution{0.05};
+    double grid_map_expand_chunk_m {4.0};
+    double grid_map_max_size_x {80.0};
+    double grid_map_max_size_y {80.0};
+    int grid_map_save_margin_cells {2};
+    bool grid_map_unknown_as_occupied {true};
 
     void resetMapSize() {
         int inflation_ratio = ceil(inflation_resolution / resolution);

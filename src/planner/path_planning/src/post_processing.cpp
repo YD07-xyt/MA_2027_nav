@@ -47,11 +47,7 @@ auto PathPostProcessing::optimize_path(const grid_map::GridMap& map, const std::
     return optimized_path;
 }
 auto PathPostProcessing::check_collision(const grid_map::GridMap& map, const Eigen::Vector2d& pos) const -> bool {
-    // Points outside map are considered collision-free
-    if (!map.isInsideMap(pos)) return false;
-
-    // Points inside map use safety distance check
-    return map.getDistance(pos) < params_.safe_threshold;
+    return map.isCollision(pos, params_.safe_threshold);
 }
 
 /*  Bresenham 直线算法 枚举线段经过的所有栅格索引，

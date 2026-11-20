@@ -5,7 +5,7 @@
 
 #pragma once
 
-#include "map/grid_map.hpp"
+#include "map/core/grid_map.hpp"
 #include "traj_optimize/esdf_Interface.hpp"
 #include <memory>
 #include <utility>
@@ -39,8 +39,20 @@ public:
         return grad;
     }
 
-    auto isInside(double x, double y) const ->bool {
+    auto getDistanceAndGradient(double x, double y, double& distance, Eigen::Vector2d& gradient) const -> bool {
+        return map_->getDistanceAndGradient(Eigen::Vector2d(x, y), distance, gradient);
+    }
+
+    auto isInside(double x, double y) const -> bool {
         return map_->isInsideMap(Eigen::Vector2d(x, y));
+    }
+
+    auto isCollision(double x, double y, double safe_distance) const -> bool {
+        return map_->isCollision(Eigen::Vector2d(x, y), safe_distance);
+    }
+
+    auto outOfBoundsOccupied() const -> bool {
+        return map_->outOfBoundsPolicy() == grid_map::OutOfBoundsPolicy::OCCUPIED;
     }
 
     auto resolution() const -> double {

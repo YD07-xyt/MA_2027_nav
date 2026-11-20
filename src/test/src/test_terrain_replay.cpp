@@ -60,9 +60,9 @@ int main(int argc, char** argv) {
 
     const auto gm0 = map.get_grid_map();
     const double res = gm0->getResolution();
-    const Eigen::Vector2i nvox = gm0->getVoxelNum();
-    // 车走过的格（足迹半径 0.15 m）：最终不应是障碍
-    std::vector<char> traversed(nvox.x() * nvox.y(), 0);
+    // 记录每帧机器人世界坐标；建图模式允许动态扩图，结束时再映射到最终网格尺寸，避免索引越界。
+    std::vector<Eigen::Vector2d> robot_positions;
+    robot_positions.reserve(frames.size());
     const double foot_r = 0.15;
     const int foot_c = static_cast<int>(std::ceil(foot_r / res));
 
@@ -92,9 +92,11 @@ int main(int argc, char** argv) {
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
         ms_all.push_back(ms);
 
+        const auto gm = map.get_grid_map();
         const auto occ = map.get_occupancy_2d();
         Eigen::Vector2i rid;
-        gm0->posToIndex(Eigen::Vector2d(fr.p[0], fr.p[1]), rid);
+        gm->posToIndex(Eigen::Vector2d(fr.p[0], fr.p[1]), rid);
+        robot_positions.emplace_back(fr.p[0], fr.p[1]);
         int obs = 0, near = 0, foot = 0;
         const int near_c = static_cast<int>(3.0 / res);
         for (int x = 0; x < occ.rows(); ++x) {
@@ -106,23 +108,30 @@ int main(int argc, char** argv) {
                 if (dx * dx + dy * dy <= foot_c * foot_c) ++foot;
             }
         }
+        csv << fr.t - t0 << ',' << fr.p[0] << ',' << fr.p[1] << ',' << fr.p[2] << ',' << obs << ',' << near << ','
+            << foot << ',' << ms << '\n';
+    }
+
+    const auto gm_final = map.get_grid_map();
+    const Eigen::Vector2i nvox = gm_final->getVoxelNum();
+    const auto occ = map.get_occupancy_2d();
+    std::vector<char> traversed(static_cast<size_t>(nvox.x()) * static_cast<size_t>(nvox.y()), 0);
+    for (const auto& rp: robot_positions) {
+        Eigen::Vector2i rid;
+        gm_final->posToIndex(rp, rid);
         for (int dx = -foot_c; dx <= foot_c; ++dx)
             for (int dy = -foot_c; dy <= foot_c; ++dy) {
                 const int x = rid.x() + dx, y = rid.y() + dy;
                 if (dx * dx + dy * dy > foot_c * foot_c) continue;
                 if (x < 0 || y < 0 || x >= nvox.x() || y >= nvox.y()) continue;
-                traversed[x * nvox.y() + y] = 1;
+                traversed[static_cast<size_t>(x) * static_cast<size_t>(nvox.y()) + static_cast<size_t>(y)] = 1;
             }
-        csv << fr.t - t0 << ',' << fr.p[0] << ',' << fr.p[1] << ',' << fr.p[2] << ',' << obs << ',' << near << ','
-            << foot << ',' << ms << '\n';
     }
-
-    const auto occ = map.get_occupancy_2d();
     int trav = 0, trav_obs = 0, obs_total = 0;
     for (int x = 0; x < occ.rows(); ++x)
         for (int y = 0; y < occ.cols(); ++y) {
             obs_total += occ(x, y) == 1;
-            if (!traversed[x * nvox.y() + y]) continue;
+            if (!traversed[static_cast<size_t>(x) * static_cast<size_t>(nvox.y()) + static_cast<size_t>(y)]) continue;
             ++trav;
             trav_obs += occ(x, y) == 1;
         }
@@ -131,7 +140,10 @@ int main(int argc, char** argv) {
     pgm << "P5\n" << occ.rows() << ' ' << occ.cols() << "\n255\n";
     for (int y = occ.cols() - 1; y >= 0; --y)
         for (int x = 0; x < occ.rows(); ++x) {
-            const unsigned char v = occ(x, y) == 1 ? 0 : (traversed[x * nvox.y() + y] ? 160 : 255);
+            const unsigned char v = occ(x, y) == 1
+                ? 0
+                : (traversed[static_cast<size_t>(x) * static_cast<size_t>(nvox.y()) + static_cast<size_t>(y)] ? 160
+                                                                                                              : 255);
             pgm.put(static_cast<char>(v));
         }
     // 持久地面层：每个 2D 格一行 x, y, h, flags（只写有地面的格）
@@ -143,7 +155,7 @@ int main(int argc, char** argv) {
         for (int x = 0; x < nvox.x(); ++x)
             for (int y = 0; y < nvox.y(); ++y) {
                 Eigen::Vector2d p;
-                gm0->indexToPos(Eigen::Vector2i(x, y), p);
+                gm_final->indexToPos(Eigen::Vector2i(x, y), p);
                 const auto* c = gl.cell(static_cast<int>(std::floor(p.x() / gres)), static_cast<int>(std::floor(p.y() / gres)));
                 if (c == nullptr || c->flags == 0) continue;
                 g << p.x() << ',' << p.y() << ',' << c->h << ',' << int(c->flags) << ',' << c->ub << '\n';

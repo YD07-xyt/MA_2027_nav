@@ -23,47 +23,47 @@ class GroundLayer {
 public:
     struct Config {
         float resolution = 0.05f;
-        float size = 20.0f;              // 环形缓冲边长 (m)
-        float min_range = 0.5f;          // 距雷达水平距离小于此值的点丢弃（车体自身点），同 ray_range[0]
-        float max_range = 7.5f;          // 只用距雷达水平距离以内的点 (m)
-        float meas_sigma = 0.01f;        // 量测噪声 σ = meas_sigma + meas_sigma_per_m * 距离
+        float size = 20.0f; // 环形缓冲边长 (m)
+        float min_range = 0.5f; // 距雷达水平距离小于此值的点丢弃（车体自身点），同 ray_range[0]
+        float max_range = 7.5f; // 只用距雷达水平距离以内的点 (m)
+        float meas_sigma = 0.01f; // 量测噪声 σ = meas_sigma + meas_sigma_per_m * 距离
         float meas_sigma_per_m = 0.003f;
-        float gate_min = 0.03f;          // 融合门限下限 (m)
-        int   drop_votes = 2;            // 下降需连续几帧一致
-        int   rise_votes = 3;            // 上升需连续几帧一致
-        float rise_max = 0.24f;          // 高于当前地面超过此值的量测当悬空物，不参与上升
-        float footprint_radius = 0.20f;  // 足迹半径 (m)
-        float footprint_ground_offset = 0.0f;  // 足迹种子高度 = base 平面 + 此偏移
-        float seed_radius = 1.5f;        // 首帧盲区种子半径 (m)
-        float seed_sigma = 0.05f;        // 种子 σ（低置信，任何真实量测直接覆盖）
-        int   float_free_voxels = 3;     // 最低点正下方连续多少个已知空闲体素即判悬空
-        float ub_end_margin = 0.3f;      // 射线末端多少米内不算上界（掠射噪声）
-        float ub_margin = 0.05f;         // ub 低于地面多少才算矛盾
-        int   ub_stale_frames = 5;       // 地面最近这么多帧内被命中过则不因 ub 撤销
+        float gate_min = 0.03f; // 融合门限下限 (m)
+        int drop_votes = 2; // 下降需连续几帧一致
+        int rise_votes = 3; // 上升需连续几帧一致
+        float rise_max = 0.24f; // 高于当前地面超过此值的量测当悬空物，不参与上升
+        float footprint_radius = 0.20f; // 足迹半径 (m)
+        float footprint_ground_offset = 0.0f; // 足迹种子高度 = base 平面 + 此偏移
+        float seed_radius = 1.5f; // 首帧盲区种子半径 (m)
+        float seed_sigma = 0.05f; // 种子 σ（低置信，任何真实量测直接覆盖）
+        int float_free_voxels = 3; // 最低点正下方连续多少个已知空闲体素即判悬空
+        float ub_end_margin = 0.3f; // 射线末端多少米内不算上界（掠射噪声）
+        float ub_margin = 0.05f; // ub 低于地面多少才算矛盾
+        int ub_stale_frames = 5; // 地面最近这么多帧内被命中过则不因 ub 撤销
         // 姿态跳变门控：机体 z 轴相邻帧夹角超过此值（度）时，本帧及其后 tilt_hold_frames 帧
         // 点云配准不可信，不做量测融合与射线上界（只更新足迹）。0 关闭
         float tilt_jump_deg = 2.0f;
-        int   tilt_hold_frames = 2;
+        int tilt_hold_frames = 2;
         // 下降空间一致性：投票达标的下降，需要至少这么多个 8 邻格支持（邻格地面或其待降高度
         // 与新高度相差不超过 2*gate_min），否则暂不下降（孤立坑多为噪声/错配）。0 关闭
-        int   drop_min_support = 2;
+        int drop_min_support = 2;
     };
 
     enum Flag : uint8_t {
-        OBS = 1,   // 有真实量测的地面
-        SEED = 2,  // 种子地面（足迹/盲区），无真实量测
-        TRAV = 4,  // 车走过
+        OBS = 1, // 有真实量测的地面
+        SEED = 2, // 种子地面（足迹/盲区），无真实量测
+        TRAV = 4, // 车走过
     };
 
     struct Cell {
-        int kx = INT_MIN, ky = INT_MIN;  // 全局格坐标
-        float h = 0.0f;                  // 地面高度
-        float var = 0.0f;                // 方差
-        float ub = std::numeric_limits<float>::infinity();  // 射线上界
-        float vote_h = 0.0f;             // 待确认的升/降高度
+        int kx = INT_MIN, ky = INT_MIN; // 全局格坐标
+        float h = 0.0f; // 地面高度
+        float var = 0.0f; // 方差
+        float ub = std::numeric_limits<float>::infinity(); // 射线上界
+        float vote_h = 0.0f; // 待确认的升/降高度
         uint8_t flags = 0;
-        int8_t down = 0, up = 0;         // 升/降投票数
-        int last_hit = -1000;            // 最近一次量测的帧号
+        int8_t down = 0, up = 0; // 升/降投票数
+        int last_hit = -1000; // 最近一次量测的帧号
     };
 
     using VoxelQuery = std::function<utils::GridType(const utils::Vec3f&)>;
@@ -88,19 +88,19 @@ public:
 
 private:
     auto ringIndex(int kx, int ky) const -> int;
-    auto slot(int kx, int ky) -> Cell&;  // 坐标不符时重置为空格
+    auto slot(int kx, int ky) -> Cell&; // 坐标不符时重置为空格
     void seedDisk(const utils::Pose& base_pose, float radius, bool traversed);
 
     struct Scratch {
         int stamp = -1;
         int kx = 0, ky = 0;
-        float m1 = 0.0f, m2 = 0.0f;  // 本帧最低、次低点
+        float m1 = 0.0f, m2 = 0.0f; // 本帧最低、次低点
         int cnt = 0;
         float range = 0.0f;
     };
 
     Config cfg_;
-    int n_ = 0;  // 环形缓冲每边格数
+    int n_ = 0; // 环形缓冲每边格数
     int frame_ = 0;
     bool seeded_ = false;
     std::vector<Cell> cells_;
@@ -110,7 +110,7 @@ private:
         int kx, ky;
         float var;
     };
-    std::vector<DropCand> drop_cand_;  // 本帧投票达标、待邻域确认的下降格
+    std::vector<DropCand> drop_cand_; // 本帧投票达标、待邻域确认的下降格
     std::vector<char> drop_ok_;
     utils::Vec3f last_up_ {0, 0, 0};
     bool has_last_up_ = false;
@@ -126,4 +126,4 @@ private:
     bool last_gated_ = false;
 };
 
-}  // namespace Terrain
+} // namespace Terrain

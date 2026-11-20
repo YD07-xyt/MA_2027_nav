@@ -19,7 +19,9 @@
 #include "controller/mpc.h"
 #include "controller/traj_interface.hpp"
 #include "cv2map.hpp"
-#include "map/grid_map.hpp"
+#include "map/core/grid_map.hpp"
+#include "map/core/map_io.hpp"
+#include "map/layered/layered_map.hpp"
 #include "map/ma_map.hpp"
 #include "path_planning/path_planning.hpp"
 #include "path_planning/post_processing.h"
@@ -45,6 +47,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -251,6 +254,7 @@ auto load_planner_config(const YAML::Node& root) -> replan::FsmReplan::PlannerCo
         }
         if (rp["brake_acc"]) r.brake_acc = rp["brake_acc"].as<double>();
         if (rp["brake_acc_max"]) r.brake_acc_max = rp["brake_acc_max"].as<double>();
+        if (rp["start_oob_recover_dist"]) r.start_oob_recover_dist = rp["start_oob_recover_dist"].as<double>();
     }
     return cfg;
 }
@@ -705,6 +709,396 @@ auto run_sanity_checks(BenchEnv& env) -> bool {
                 && u_cmd(1) >= env.mpc_param.u_min(1) - 1e-3 && u_cmd(1) <= env.mpc_param.u_max(1) + 1e-3;
             ok &= check(solved && finite && bounded, "MPC solve valid and within bounds");
             if (!ok) break;
+        }
+    }
+
+    // 7. 双模式地图架构自检：GridGeometry / Option A 虚拟墙 / MapIO / LayeredMap 动态扩图 / 导航越界闭环
+    {
+        // 7a. GridGeometry 半开区间与 GridMap Option A 四边界虚拟墙
+        const auto geom =
+            grid_map::GridGeometry::fromOriginAndSize(Eigen::Vector2d(-2.0, -2.0), Eigen::Vector2i(40, 40), 0.1);
+        ok &= check(geom.isValid(), "GridGeometry valid");
+        ok &= check(geom.isInside(Eigen::Vector2d(-2.0, -2.0)), "GridGeometry min_boundary inside");
+        ok &= check(!geom.isInside(Eigen::Vector2d(2.0, 0.0)), "GridGeometry max_boundary X outside");
+        ok &= check(!geom.isInside(Eigen::Vector2d(0.0, 2.0)), "GridGeometry max_boundary Y outside");
+        ok &= check(
+            !geom.isInside(Eigen::Vector2d(std::numeric_limits<double>::quiet_NaN(), 0.0)),
+            "GridGeometry NaN outside"
+        );
+        ok &= check(
+            geom.posToIndex(Eigen::Vector2d(-2.05, -2.05)) == Eigen::Vector2i(-1, -1),
+            "GridGeometry floor negative"
+        );
+
+        grid_map::GridMap vwall;
+        vwall.init(geom, grid_map::OutOfBoundsPolicy::FREE);
+        const grid_map::RowMatrixXi all_free = grid_map::RowMatrixXi::Zero(40, 40);
+        ok &= check(vwall.overwriteMapAndUpdateEsdf(all_free), "GridMap all-free ESDF");
+        ok &= check(
+            std::isfinite(vwall.getDistance(Eigen::Vector2d(0.0, 0.0)))
+                && vwall.getDistance(Eigen::Vector2d(0.0, 0.0)) > 4.0,
+            "GridMap all-free short-circuit finite positive"
+        );
+        ok &= check(!vwall.isCollision(Eigen::Vector2d(3.0, 0.0), 0.3), "GridMap FREE policy OOB non-collision");
+
+        const uint64_t rev_free = vwall.esdf_revision();
+        vwall.setOutOfBoundsPolicy(grid_map::OutOfBoundsPolicy::OCCUPIED);
+        ok &= check(vwall.esdf_revision() != rev_free, "GridMap setOutOfBoundsPolicy bumps esdf_revision");
+
+        // 图内四边界虚拟墙距离与向内单位法向
+        double d_edge = 0.0;
+        Eigen::Vector2d g_edge = Eigen::Vector2d::Zero();
+        ok &= check(
+            vwall.getDistanceAndGradient(Eigen::Vector2d(-1.85, 0.0), d_edge, g_edge) && std::abs(d_edge - 0.15) < 1e-6
+                && (g_edge - Eigen::Vector2d(1.0, 0.0)).norm() < 1e-6,
+            "GridMap OCCUPIED left virtual wall distance & normal"
+        );
+        ok &= check(
+            vwall.getDistanceAndGradient(Eigen::Vector2d(1.85, 0.0), d_edge, g_edge) && std::abs(d_edge - 0.15) < 1e-6
+                && (g_edge - Eigen::Vector2d(-1.0, 0.0)).norm() < 1e-6,
+            "GridMap OCCUPIED right virtual wall distance & normal"
+        );
+        ok &= check(
+            vwall.getDistanceAndGradient(Eigen::Vector2d(0.0, -1.85), d_edge, g_edge) && std::abs(d_edge - 0.15) < 1e-6
+                && (g_edge - Eigen::Vector2d(0.0, 1.0)).norm() < 1e-6,
+            "GridMap OCCUPIED bottom virtual wall distance & normal"
+        );
+        ok &= check(
+            vwall.getDistanceAndGradient(Eigen::Vector2d(0.0, 1.85), d_edge, g_edge) && std::abs(d_edge - 0.15) < 1e-6
+                && (g_edge - Eigen::Vector2d(0.0, -1.0)).norm() < 1e-6,
+            "GridMap OCCUPIED top virtual wall distance & normal"
+        );
+
+        // 图外（边外、角外、精确上边界）负距离与向内单位法向
+        ok &= check(vwall.isCollision(Eigen::Vector2d(2.3, 0.0), 0.3), "GridMap OCCUPIED OOB collision");
+        ok &= check(
+            vwall.getDistanceAndGradient(Eigen::Vector2d(2.3, 0.0), d_edge, g_edge) && std::abs(d_edge - (-0.3)) < 1e-6
+                && (g_edge - Eigen::Vector2d(-1.0, 0.0)).norm() < 1e-6,
+            "GridMap OCCUPIED edge OOB negative distance & inward normal"
+        );
+        ok &= check(
+            vwall.getDistanceAndGradient(Eigen::Vector2d(2.3, 2.4), d_edge, g_edge) && std::abs(d_edge - (-0.5)) < 1e-6
+                && (g_edge - Eigen::Vector2d(-0.6, -0.8)).norm() < 1e-6,
+            "GridMap OCCUPIED corner OOB negative distance & inward normal"
+        );
+        ok &= check(
+            vwall.getDistanceAndGradient(Eigen::Vector2d(2.0, 0.0), d_edge, g_edge) && std::abs(d_edge) < 1e-6
+                && (g_edge - Eigen::Vector2d(-1.0, 0.0)).norm() < 1e-6,
+            "GridMap OCCUPIED exact max_boundary distance=0 & inward normal"
+        );
+
+        const grid_map::RowMatrixXi all_occ = grid_map::RowMatrixXi::Ones(40, 40);
+        ok &= check(vwall.overwriteMapAndUpdateEsdf(all_occ), "GridMap all-occupied ESDF");
+        ok &= check(
+            std::isfinite(vwall.getDistance(Eigen::Vector2d(0.0, 0.0)))
+                && vwall.getDistance(Eigen::Vector2d(0.0, 0.0)) < -4.0,
+            "GridMap all-occupied short-circuit finite negative"
+        );
+
+        // 7b. MapIO: 既有 global_map.pgm 兼容加载 + 三态裁剪/针孔清理/往返精度（仅写系统临时目录并自动清理）
+        const std::string legacy_map_path = kRootDir + "map/global_map.pgm";
+        if (std::filesystem::exists(legacy_map_path)) {
+            const auto legacy = ma_map::MapIO::load(legacy_map_path);
+            ok &= check(
+                legacy.has_value() && legacy->geometry.voxel_num == Eigen::Vector2i(560, 320)
+                    && std::abs(legacy->geometry.resolution - 0.05) < 1e-9
+                    && (legacy->geometry.origin - Eigen::Vector2d(-6.0, -8.0)).norm() < 1e-9
+                    && legacy->occupied_count > 0 && legacy->free_count > 0,
+                "MapIO loads legacy map/global_map.pgm with exact geometry"
+            );
+        }
+
+        const std::filesystem::path tmp_dir =
+            std::filesystem::temp_directory_path() / ("ma_nav_sanity_" + std::to_string(::getpid()));
+        struct TempDirGuard {
+            std::filesystem::path dir;
+            ~TempDirGuard() {
+                std::error_code ec;
+                std::filesystem::remove_all(dir, ec);
+            }
+        } tmp_guard {tmp_dir};
+
+        const auto io_geom =
+            grid_map::GridGeometry::fromOriginAndSize(Eigen::Vector2d(-2.0, -1.5), Eigen::Vector2i(20, 16), 0.1);
+        std::vector<ma_map::CellState> io_cells(io_geom.cellCount(), ma_map::CellState::UNKNOWN);
+        // 拒绝保存全 UNKNOWN 图
+        const auto empty_save = ma_map::MapIO::save((tmp_dir / "empty").string(), io_geom, io_cells);
+        ok &= check(!empty_save.has_value(), "MapIO rejects saving completely unexplored map");
+
+        // 构造局部已探索块 x in [5..12], y in [4..10]
+        for (int x = 5; x <= 12; ++x) {
+            for (int y = 4; y <= 10; ++y) {
+                io_cells[static_cast<size_t>(io_geom.toAddress(x, y))] = ma_map::CellState::FREE;
+            }
+        }
+        // 一个障碍格 + 紧邻障碍的 UNKNOWN（不可被清理）
+        io_cells[static_cast<size_t>(io_geom.toAddress(6, 5))] = ma_map::CellState::OCCUPIED;
+        io_cells[static_cast<size_t>(io_geom.toAddress(6, 6))] = ma_map::CellState::UNKNOWN;
+        // 两个完全被 FREE 包围的内部小 UNKNOWN 针孔（应当被清理）
+        io_cells[static_cast<size_t>(io_geom.toAddress(9, 7))] = ma_map::CellState::UNKNOWN;
+        io_cells[static_cast<size_t>(io_geom.toAddress(9, 8))] = ma_map::CellState::UNKNOWN;
+
+        ma_map::SaveOptions save_opts;
+        save_opts.crop_to_explored = true;
+        save_opts.margin_cells = 1;
+        save_opts.cleanup_free_pinholes = true;
+        save_opts.max_pinhole_cells = 4;
+        const auto saved = ma_map::MapIO::save((tmp_dir / "crop_test").string(), io_geom, io_cells, save_opts);
+        ok &= check(saved.has_value(), "MapIO cropped trinary save succeeds");
+        if (saved) {
+            ok &= check(
+                saved->saved_geometry.voxel_num == Eigen::Vector2i(10, 9),
+                "MapIO cropped dimensions match explored bbox + margin"
+            );
+            ok &= check(saved->cleaned_pinholes == 2, "MapIO cleaned only FREE-surrounded pinholes");
+
+            const auto reload_occ = ma_map::MapIO::load(saved->pgm_path, ma_map::LoadOptions {true});
+            const auto reload_free = ma_map::MapIO::load(saved->pgm_path, ma_map::LoadOptions {false});
+            ok &= check(reload_occ.has_value() && reload_free.has_value(), "MapIO reload succeeds");
+            if (reload_occ && reload_free) {
+                ok &= check(
+                    reload_occ->geometry.voxel_num == saved->saved_geometry.voxel_num
+                        && (reload_occ->geometry.origin - saved->saved_geometry.origin).norm() < 1e-9,
+                    "MapIO round-trip preserves exact geometry and origin"
+                );
+                const Eigen::Vector2d obs_world = io_geom.indexToPos(Eigen::Vector2i(6, 5));
+                const Eigen::Vector2d adj_unk_world = io_geom.indexToPos(Eigen::Vector2i(6, 6));
+                const Eigen::Vector2d pinhole_world = io_geom.indexToPos(Eigen::Vector2i(9, 7));
+                const auto obs_id = reload_occ->geometry.posToIndex(obs_world);
+                const auto unk_id = reload_occ->geometry.posToIndex(adj_unk_world);
+                const auto pin_id = reload_occ->geometry.posToIndex(pinhole_world);
+                ok &= check(
+                    reload_occ->cells[static_cast<size_t>(reload_occ->geometry.toAddress(obs_id))]
+                        == ma_map::CellState::OCCUPIED,
+                    "MapIO round-trip preserves OCCUPIED world cell"
+                );
+                ok &= check(
+                    reload_occ->cells[static_cast<size_t>(reload_occ->geometry.toAddress(unk_id))]
+                            == ma_map::CellState::UNKNOWN
+                        && reload_occ->occupancy[static_cast<size_t>(reload_occ->geometry.toAddress(unk_id))] == 1
+                        && reload_free->occupancy[static_cast<size_t>(reload_free->geometry.toAddress(unk_id))] == 0,
+                    "MapIO unknown_as_occupied controls UNKNOWN occupancy"
+                );
+                ok &= check(
+                    reload_occ->cells[static_cast<size_t>(reload_occ->geometry.toAddress(pin_id))]
+                        == ma_map::CellState::FREE,
+                    "MapIO pinhole cell restored as FREE"
+                );
+            }
+        }
+
+        // 7c. LayeredMap: 双模式、动态扩图（细胞中心保持 + 语义重光栅化 + 上限拦截）、持久化往返与导航固定边界
+        ma_map::LayeredMap::Config lm_cfg;
+        lm_cfg.x_left = 1.0;
+        lm_cfg.x_right = 1.0;
+        lm_cfg.y_left = 1.0;
+        lm_cfg.y_right = 1.0;
+        lm_cfg.resolution = 0.1;
+        lm_cfg.expand_chunk_m = 1.0;
+        lm_cfg.max_map_size_x = 5.0;
+        lm_cfg.max_map_size_y = 5.0;
+        lm_cfg.save_margin_cells = 1;
+        lm_cfg.unknown_as_occupied = true;
+
+        ma_map::LayeredMap lm(lm_cfg);
+        ok &= check(lm.mode() == ma_map::MapMode::MAPPING, "LayeredMap starts in MAPPING mode");
+        const auto s0 = lm.getSnapshot();
+        ok &= check(
+            s0 && s0->outOfBoundsPolicy() == grid_map::OutOfBoundsPolicy::FREE
+                && s0->getVoxelNum() == Eigen::Vector2i(20, 20),
+            "LayeredMap initial snapshot FREE policy and 20x20"
+        );
+
+        const std::vector<Eigen::Vector2d> tunnel_poly = {
+            Eigen::Vector2d(0.1, 0.1),
+            Eigen::Vector2d(0.6, 0.1),
+            Eigen::Vector2d(0.6, 0.6),
+            Eigen::Vector2d(0.1, 0.6),
+        };
+        ok &= check(
+            lm.setSemanticsPolygon(tunnel_poly, grid_map::GridMap::Semantics::TUNNEL),
+            "LayeredMap setSemanticsPolygon succeeds"
+        );
+
+        // 同帧 obstacle + free 重叠时障碍优先；连续 2 帧 free 才清除旧障碍
+        ma_map::LocalTerrainFrame fr1;
+        fr1.terrain_resolution = 0.1;
+        fr1.has_robot_pos = true;
+        fr1.robot_pos = Eigen::Vector2d(0.0, 0.0);
+        fr1.robot_footprint_radius = 0.2;
+        fr1.obstacle_cells.emplace_back(0.45, 0.45, 0.0);
+        fr1.obstacle_cells.emplace_back(-0.45, -0.45, 0.0);
+        fr1.free_cells.emplace_back(0.45, 0.45, 0.0);
+        fr1.free_cells.emplace_back(0.25, 0.25, 0.0);
+        lm.updateFromPerception(fr1);
+        auto s1 = lm.getSnapshot();
+        Eigen::Vector2i id_obs1;
+        s1->posToIndex(Eigen::Vector2d(0.45, 0.45), id_obs1);
+        ok &= check(s1->isOccupied(id_obs1), "LayeredMap obstacle prioritized over same-frame free");
+
+        ma_map::LocalTerrainFrame fr2;
+        fr2.terrain_resolution = 0.1;
+        fr2.free_cells.emplace_back(0.45, 0.45, 0.0);
+        lm.updateFromPerception(fr2);
+        s1 = lm.getSnapshot();
+        s1->posToIndex(Eigen::Vector2d(0.45, 0.45), id_obs1);
+        ok &= check(s1->isOccupied(id_obs1), "LayeredMap 1 free frame keeps persistent obstacle");
+
+        lm.updateFromPerception(fr2);
+        s1 = lm.getSnapshot();
+        s1->posToIndex(Eigen::Vector2d(0.45, 0.45), id_obs1);
+        ok &= check(!s1->isOccupied(id_obs1), "LayeredMap 2 consecutive free frames clear persistent obstacle");
+
+        // 感知触发动态扩图（超出 [-1, 1] -> 按 1.0m 块扩展），保留旧障碍与语义多边形
+        ma_map::LocalTerrainFrame fr_exp;
+        fr_exp.terrain_resolution = 0.1;
+        fr_exp.obstacle_cells.emplace_back(1.45, 0.25, 0.0);
+        fr_exp.free_cells.emplace_back(1.25, 0.25, 0.0);
+        lm.updateFromPerception(fr_exp);
+        const auto s_exp = lm.getSnapshot();
+        ok &= check(
+            s_exp->getVoxelNum().x() >= 30 && s_exp->isInsideMap(Eigen::Vector2d(1.45, 0.25)),
+            "LayeredMap perception dynamically expands map"
+        );
+        Eigen::Vector2i id_old, id_new;
+        s_exp->posToIndex(Eigen::Vector2d(-0.45, -0.45), id_old);
+        s_exp->posToIndex(Eigen::Vector2d(1.45, 0.25), id_new);
+        ok &= check(
+            s_exp->isOccupied(id_old) && s_exp->isOccupied(id_new),
+            "LayeredMap expansion preserves old & new cells"
+        );
+        ok &= check(
+            s_exp->is_tunnel(Eigen::Vector2d(0.35, 0.35)),
+            "LayeredMap expansion re-rasterizes semantics polygon"
+        );
+
+        // ensureCovers：上限内扩图成功，超 max_map_size 或 NaN 拒收且不改图几何
+        ok &=
+            check(lm.ensureCovers(Eigen::Vector2d(-1.5, -1.5)), "LayeredMap ensureCovers expands within max_map_size");
+        const auto geom_before_reject = lm.getSnapshot()->geometry();
+        ok &=
+            check(!lm.ensureCovers(Eigen::Vector2d(100.0, 0.0)), "LayeredMap ensureCovers rejects beyond max_map_size");
+        ok &= check(
+            !lm.ensureCovers(Eigen::Vector2d(std::numeric_limits<double>::infinity(), 0.0)),
+            "LayeredMap ensureCovers rejects non-finite point"
+        );
+        ok &= check(
+            lm.getSnapshot()->geometry() == geom_before_reject,
+            "LayeredMap rejected ensureCovers leaves geometry unchanged"
+        );
+
+        // 导出已探索地图并切换导航模式加载：严格固定边界 + OCCUPIED 策略 + 动态层逐帧刷新
+        const auto lm_saved = lm.saveExploredMap((tmp_dir / "layered_saved").string());
+        ok &= check(lm_saved.has_value(), "LayeredMap saveExploredMap succeeds");
+        if (lm_saved) {
+            lm.setMode(ma_map::MapMode::NAVIGATION);
+            const auto lm_loaded = lm.loadStaticMap(lm_saved->pgm_path);
+            ok &= check(lm_loaded.has_value(), "LayeredMap loadStaticMap succeeds");
+            const auto s_nav = lm.getSnapshot();
+            ok &= check(
+                s_nav && s_nav->outOfBoundsPolicy() == grid_map::OutOfBoundsPolicy::OCCUPIED
+                    && s_nav->geometry().voxel_num == lm_saved->saved_geometry.voxel_num
+                    && std::abs(s_nav->geometry().resolution - lm_saved->saved_geometry.resolution) < 1e-9
+                    && (s_nav->geometry().origin - lm_saved->saved_geometry.origin).norm() < 1e-9,
+                "LayeredMap nav mode inherits exact loaded geometry with OCCUPIED policy"
+            );
+            ok &= check(
+                !lm.ensureCovers(Eigen::Vector2d(50.0, 50.0)) && lm.getSnapshot()->geometry() == s_nav->geometry(),
+                "LayeredMap nav mode never expands"
+            );
+            ma_map::LocalTerrainFrame dyn1;
+            dyn1.terrain_resolution = 0.1;
+            dyn1.obstacle_cells.emplace_back(0.25, 0.25, 0.0);
+            lm.updateFromPerception(dyn1);
+            const auto s_dyn1 = lm.getSnapshot();
+            Eigen::Vector2i dyn_id;
+            s_dyn1->posToIndex(Eigen::Vector2d(0.25, 0.25), dyn_id);
+            ok &= check(s_dyn1->isOccupied(dyn_id), "LayeredMap nav mode overlays dynamic obstacle");
+
+            ma_map::LocalTerrainFrame dyn2;
+            dyn2.terrain_resolution = 0.1;
+            lm.updateFromPerception(dyn2);
+            const auto s_dyn2 = lm.getSnapshot();
+            s_dyn2->posToIndex(Eigen::Vector2d(0.25, 0.25), dyn_id);
+            ok &=
+                check(!s_dyn2->isOccupied(dyn_id), "LayeredMap nav mode clears vanished dynamic obstacle immediately");
+        }
+
+        // 7d. 导航模式越界闭环：A*/JPS/PostProc/GridMapESDF/FsmReplan（OOB 目标拒收保旧轨 + 起点轻微越界向内恢复）
+        auto nav_gm = std::make_shared<grid_map::GridMap>();
+        nav_gm->init(3.0, 3.0, 3.0, 3.0, 0.05, grid_map::OutOfBoundsPolicy::OCCUPIED);
+        grid_map::RowMatrixXi nav_occ = grid_map::RowMatrixXi::Zero(120, 120);
+        // 在中心放一块障碍，四周保留开阔走廊
+        for (int x = 55; x <= 64; ++x) {
+            for (int y = 55; y <= 64; ++y) {
+                nav_occ(x, y) = 1;
+            }
+        }
+        ok &= check(nav_gm->overwriteMapAndUpdateEsdf(nav_occ), "Nav test GridMap ESDF init");
+
+        path_planning::JPS nav_jps;
+        nav_jps.set_safe_threshold(0.35);
+        ok &= check(
+            nav_jps.jps_search(*nav_gm, Eigen::Vector2d(-1.5, -1.5), Eigen::Vector2d(4.0, 0.0), kTimeoutMs).empty(),
+            "JPS rejects OOB goal in OCCUPIED nav map"
+        );
+        ok &= check(
+            !nav_jps.jps_search(*nav_gm, Eigen::Vector2d(-1.5, -1.5), Eigen::Vector2d(1.5, 1.5), kTimeoutMs).empty(),
+            "JPS finds interior path in OCCUPIED nav map"
+        );
+
+        minco_opt::GridMapESDF nav_esdf(nav_gm);
+        ok &= check(nav_esdf.outOfBoundsOccupied(), "GridMapESDF reports outOfBoundsOccupied=true");
+        ok &= check(nav_esdf.isCollision(3.5, 0.0, 0.3), "GridMapESDF isCollision true on OOB");
+
+        replan::FsmReplan nav_fsm(env.planner_cfg);
+        const utils::RobotState nav_start = make_robot_state(Eigen::Vector2d(-1.8, -1.8));
+        const utils::RobotState nav_goal_in = make_robot_state(Eigen::Vector2d(1.8, 1.8));
+        const utils::RobotState nav_goal_oob = make_robot_state(Eigen::Vector2d(4.0, 0.0));
+        const utils::RobotState nav_start_far_oob = make_robot_state(Eigen::Vector2d(-3.8, 0.0));
+        const utils::RobotState nav_start_near_oob = make_robot_state(Eigen::Vector2d(-3.12, -1.5));
+
+        const auto nav_init = nav_fsm.plan(nav_goal_in, nav_start, nav_gm);
+        ok &= check(
+            nav_init.has_value() && nav_init->is_new_trajectory && nav_init->ma_spline_traj.success,
+            "FsmReplan nav mode initial interior plan succeeds"
+        );
+
+        const auto nav_rej_goal = nav_fsm.plan(nav_goal_oob, nav_start, nav_gm);
+        ok &= check(
+            !nav_rej_goal.has_value() && nav_rej_goal.error() == replan::FsmReplan::PathError::PLANNING_FAILED,
+            "FsmReplan nav mode rejects OOB goal"
+        );
+        const auto nav_keep_mon = nav_fsm.plan(nav_goal_in, nav_start, nav_gm);
+        ok &= check(
+            nav_keep_mon.has_value() && !nav_keep_mon->is_new_trajectory,
+            "FsmReplan nav mode preserves committed trajectory after OOB goal rejection"
+        );
+
+        const auto nav_rej_start = nav_fsm.plan(nav_goal_in, nav_start_far_oob, nav_gm);
+        ok &= check(
+            !nav_rej_start.has_value() && nav_rej_start.error() == replan::FsmReplan::PathError::PLANNING_FAILED,
+            "FsmReplan nav mode rejects start beyond start_oob_recover_dist"
+        );
+
+        replan::FsmReplan recover_fsm(env.planner_cfg);
+        const auto nav_rec = recover_fsm.plan(nav_goal_in, nav_start_near_oob, nav_gm);
+        ok &= check(
+            nav_rec.has_value() && nav_rec->is_new_trajectory && nav_rec->ma_spline_traj.success,
+            "FsmReplan nav mode recovers slightly OOB start within start_oob_recover_dist"
+        );
+        if (nav_rec.has_value() && nav_rec->ma_spline_traj.trajectory.isInitialized()) {
+            const auto& tr = nav_rec->ma_spline_traj.trajectory.getTrajectory();
+            bool all_inside = true;
+            for (double t = tr.getStartTime(); t <= tr.getEndTime(); t += 0.05) {
+                const Eigen::Vector2d pt = tr.evaluate(t, 0).head<2>();
+                if (!nav_gm->isInsideMap(pt)) {
+                    all_inside = false;
+                    break;
+                }
+            }
+            all_inside &= nav_gm->isInsideMap(tr.evaluate(tr.getEndTime(), 0).head<2>());
+            ok &= check(all_inside, "FsmReplan nav recovered trajectory stays strictly inside map");
         }
     }
 

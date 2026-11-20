@@ -43,6 +43,7 @@
 #include <std_msgs/msg/int16.hpp>
 #include "ros2/misc/visualizer.hpp"
 //std
+#include <atomic>
 #include <optional>
 #include <cstddef>
 #include <chrono>
@@ -96,7 +97,7 @@ private:
     std::optional<utils::RobotState> current_pose = std::nullopt;
     std::optional<utils::RobotState> goal_pose = std::nullopt;
     std::optional<Eigen::Vector3d> current_XYTheta = std::nullopt;
-    bool mapInitialized;
+    std::atomic<bool> mapInitialized;
     Visualizer visualizer;
 
 private:

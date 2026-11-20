@@ -13,7 +13,7 @@
 //   2) 无地面 -> 障碍；
 //   3) 与 8 邻格地面高差 > max_step_height -> 障碍（台阶、墙脚两侧都标）。
 #include "map/3d_occ_map/rog_map.h"
-#include "map/grid_map.hpp"
+#include "map/core/grid_map.hpp"
 #include "stl_loader.hpp"
 #include "utils/yaml_loader.hpp"
 

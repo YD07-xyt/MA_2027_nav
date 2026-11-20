@@ -28,6 +28,9 @@ auto JPS::sync_map_cache(const grid_map::GridMap& map) -> bool {
     }
 
     const size_t n = static_cast<size_t>(nx_) * static_cast<size_t>(ny_);
+    if (map.esdfData().size() != n) {
+        return false;
+    }
     if (open_gen_.size() != n) {
         open_gen_.assign(n, 0);
         closed_gen_.assign(n, 0);
@@ -60,10 +63,14 @@ auto JPS::blocked(const grid_map::GridMap& map, int x, int y) const -> bool {
     const int8_t c = blocked_cache_[a];
     if (c != 0) return c < 0;
 
-    // 与 AStar::check_collision 相同的碰撞语义,在栅格中心求值
-    // (对栅格中心而言,该值就等于 ESDF 栅格的原始值)。
-    const Eigen::Vector2d center((x + 0.5) * resolution_ + origin_.x(), (y + 0.5) * resolution_ + origin_.y());
-    blocked_cache_[a] = (map.getDistance(center) < safe_threshold_) ? -1 : 1;
+    // 栅格中心求值与 esdfData()[a] 等价；越界策略为 OCCUPIED 时取 min(esdf, d_bound)
+    double dist = map.esdfData()[static_cast<size_t>(a)];
+    if (map.outOfBoundsPolicy() == grid_map::OutOfBoundsPolicy::OCCUPIED) {
+        const int edge_cells = std::min({x, nx_ - 1 - x, y, ny_ - 1 - y});
+        const double d_bound = (static_cast<double>(edge_cells) + 0.5) * resolution_;
+        dist = std::min(dist, d_bound);
+    }
+    blocked_cache_[a] = (dist < safe_threshold_) ? -1 : 1;
     return blocked_cache_[a] < 0;
 }
 
@@ -177,9 +184,7 @@ auto JPS::neighbor_directions(const grid_map::GridMap& map, int x, int y, int in
 }
 
 auto JPS::check_collision(const grid_map::GridMap& map, const Eigen::Vector2d& pos) const -> bool {
-    // 地图外的点视为无碰撞(AStar 的约定)。
-    if (!map.isInsideMap(pos)) return false;
-    return map.getDistance(pos) < safe_threshold_;
+    return map.isCollision(pos, safe_threshold_);
 }
 
 auto JPS::reconstruct_path(int goal_lin) const -> std::vector<Eigen::Vector2d> {

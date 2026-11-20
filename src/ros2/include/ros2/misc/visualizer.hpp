@@ -1,5 +1,5 @@
 #pragma once
-#include "map/grid_map.hpp"
+#include "map/core/grid_map.hpp"
 #include "map/ma_map.hpp"
 // #include "opt/traj_optimizer.hpp"
 #include "traj_optimize/ma_spline_opt/SplineTrajectory/SplineTrajectory.hpp"

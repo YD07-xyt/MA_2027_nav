@@ -1,6 +1,6 @@
 #pragma once
 
-#include "map/grid_map.hpp"
+#include "map/core/grid_map.hpp"
 #include <Eigen/Dense>
 #include <algorithm>
 #include <cstdint>

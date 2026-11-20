@@ -1,7 +1,7 @@
 #pragma once
 
 #include "utils/scope_timer.hpp"
-#include "map/grid_map.hpp"
+#include "map/core/grid_map.hpp"
 #include <Eigen/Dense>
 #include <algorithm>
 #include <chrono>

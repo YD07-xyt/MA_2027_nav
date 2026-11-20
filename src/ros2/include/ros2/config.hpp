@@ -217,6 +217,10 @@ inline void load_replan_param(const YAML::Node& node, replan::FsmReplan::ReplanP
         param.projection_search_resolution = node["projection_search_resolution"].as<double>();
     if (node["brake_acc"]) param.brake_acc = node["brake_acc"].as<double>();
     if (node["brake_acc_max"]) param.brake_acc_max = node["brake_acc_max"].as<double>();
+    if (node["start_oob_recover_dist"]) {
+        const double v = node["start_oob_recover_dist"].as<double>();
+        param.start_oob_recover_dist = (std::isfinite(v) && v >= 0.0) ? v : 0.3;
+    }
 }
 
 // ============================================================

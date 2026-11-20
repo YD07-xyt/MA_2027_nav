@@ -6,7 +6,7 @@
 - 头文件：`src/planner/path_planning/include/path_planning/target_tracking/`
 - 源文件：`src/planner/path_planning/src/target_tracking/`（本目录）
 - 编进 `path_planning` 库（`CMakeLists.txt` 递归 GLOB `src/*.cpp`，新增文件无需改 CMake）
-- 依赖：`map/grid_map.hpp`（`grid_map::GridMap`）、Eigen。**不依赖 ROS**，不持有地图、不开线程。
+- 依赖：`map/core/grid_map.hpp`（`grid_map::GridMap`）、Eigen。**不依赖 ROS**，不持有地图、不开线程。
 - 设计参考：`3rd/Elastic-Tracker`（原版）、`3rd/SentryNav2026_XDU/.../elastic_tracker_nav2`（移植版）
 
 ## 1. 背景与约束

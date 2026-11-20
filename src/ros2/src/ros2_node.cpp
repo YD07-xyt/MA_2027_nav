@@ -1,6 +1,6 @@
 #include "ros2/ros2_node.h"
 #include <fstream>
-#include "map/grid_map.hpp"
+#include "map/core/grid_map.hpp"
 #include "controller/mpc.h"
 #include "replan/fsm_replanner.h"
 #include "utils/logger.hpp"
@@ -105,10 +105,28 @@ GlobalPlanner2d::GlobalPlanner2d(rclcpp::Node::SharedPtr nh_, std::string params
     save_map_srv_ = nh->create_service<std_srvs::srv::Trigger>(
         config.save_map_srv_topic,
         [this](const std_srvs::srv::Trigger::Request::SharedPtr, std_srvs::srv::Trigger::Response::SharedPtr res) {
-            save_global_map(config.save_global_map_path);
-            std::string msg = "Global map saved to " + config.save_global_map_path;
-            res->success = true;
-            res->message = msg;
+            auto saved = ma_map_->save_explored_map(config.save_global_map_path);
+            if (saved) {
+                logger::info(
+                    logger::ros2,
+                    "Saved global map {}x{} (res={:.3f}, origin=({:.2f},{:.2f}), occ={}, free={}, unk={}) -> {}",
+                    saved->saved_geometry.voxel_num.y(),
+                    saved->saved_geometry.voxel_num.x(),
+                    saved->saved_geometry.resolution,
+                    saved->saved_geometry.origin.x(),
+                    saved->saved_geometry.origin.y(),
+                    saved->occupied_count,
+                    saved->free_count,
+                    saved->unknown_count,
+                    saved->pgm_path
+                );
+                res->success = true;
+                res->message = "Global map saved to " + saved->pgm_path;
+            } else {
+                logger::error(logger::ros2, "Failed to save global map: {}", saved.error());
+                res->success = false;
+                res->message = saved.error();
+            }
         }
     );
     save_tunnel_regions_srv_ = nh->create_service<std_srvs::srv::Trigger>(
@@ -120,9 +138,6 @@ GlobalPlanner2d::GlobalPlanner2d(rclcpp::Node::SharedPtr nh_, std::string params
         }
     );
     ma_map_->set_mapping_model(config.mapping_model);
-    if (!config.mapping_model) {
-        load_global_map(config.global_map_path);
-    }
     if (!config.mapping_model) {
         load_global_map(config.global_map_path);
         load_clicked_regions(config.tunnel_regions_path);
@@ -541,25 +556,52 @@ void GlobalPlanner2d::target_callback(const geometry_msgs::msg::PoseStamped::Sha
     //     msg->pose.position.z
     // );
     warn_frame_mismatch_once(target_frame_warned_, config.target_topic_name, msg->header.frame_id, frame_id);
-    if (mapInitialized) {
-        const Eigen::Vector3d goal(msg->pose.position.x, msg->pose.position.y, 1.0);
-        if (old_goal_pose_ == goal) {
-            //logger::warn(logger::ros2,"old_goal_pose_==goal");
+    if (!mapInitialized) {
+        logger::warn(logger::ros2, "map no init");
+        return;
+    }
+    const Eigen::Vector2d goal_xy(msg->pose.position.x, msg->pose.position.y);
+    if (!goal_xy.allFinite()) {
+        logger::warn(logger::ros2, "Reject non-finite goal pose");
+        return;
+    }
+    const Eigen::Vector3d goal(goal_xy.x(), goal_xy.y(), 1.0);
+    if (old_goal_pose_ == goal) {
+        //logger::warn(logger::ros2,"old_goal_pose_==goal");
+        return;
+    }
+    if (config.mapping_model) {
+        // 建图模式：允许对图外目标按块扩图（受 max_map_size 约束）；超出上限则拒收。
+        if (!ma_map_->ensure_covers(goal_xy)) {
+            logger::warn(
+                logger::ros2,
+                "Reject goal ({:.2f}, {:.2f}): outside mapping max_map_size",
+                goal_xy.x(),
+                goal_xy.y()
+            );
             return;
         }
-        utils::RobotState temp_goal_pose;
-
-        temp_goal_pose.p = goal;
-        temp_goal_pose.yaw = atan2(msg->pose.orientation.z, msg->pose.orientation.w) * 2.0;
-        goal_pose = temp_goal_pose;
-        old_goal_pose_ = goal;
-        nav_state = replan::FsmReplan::PathState::RUNNING;
-        //logger::info(logger::ros2, "set goal success");
-        plan_start_time_ = std::chrono::steady_clock::now();
     } else {
-        logger::warn(logger::ros2, "map no init");
+        // 导航模式：严格在已加载静态图内，图外目标直接拒收且保留当前在途任务。
+        const auto snap = ma_map_->get_grid_map();
+        if (!snap || !snap->isInsideMap(goal_xy)) {
+            logger::warn(
+                logger::ros2,
+                "Reject goal ({:.2f}, {:.2f}): outside loaded navigation map bounds",
+                goal_xy.x(),
+                goal_xy.y()
+            );
+            return;
+        }
     }
-    return;
+    utils::RobotState temp_goal_pose;
+    temp_goal_pose.p = goal;
+    temp_goal_pose.yaw = atan2(msg->pose.orientation.z, msg->pose.orientation.w) * 2.0;
+    goal_pose = temp_goal_pose;
+    old_goal_pose_ = goal;
+    nav_state = replan::FsmReplan::PathState::RUNNING;
+    //logger::info(logger::ros2, "set goal success");
+    plan_start_time_ = std::chrono::steady_clock::now();
 }
 
 void GlobalPlanner2d::publish_clicked_regions() {
@@ -632,203 +674,47 @@ void GlobalPlanner2d::clicked_point_callback(const geometry_msgs::msg::PointStam
     logger::info(logger::ros2, "Published clicked region #{} name={}", region.id, region_name);
 }
 
-void GlobalPlanner2d::load_global_map(const std::string& pgm_path) {
-    std::ifstream f(pgm_path, std::ios::binary);
-    if (!f.is_open()) {
-        logger::error(logger::ros2, "Failed to open global map: {}", pgm_path);
+void GlobalPlanner2d::load_global_map(const std::string& map_path) {
+    auto loaded = ma_map_->load_static_map(map_path);
+    if (!loaded) {
+        logger::error(logger::ros2, "Failed to load global map {}: {}", map_path, loaded.error());
         return;
     }
-    std::string magic;
-    if (!(f >> magic) || magic != "P5") {
-        logger::error(logger::ros2, "Only P5 binary PGM supported: {}", pgm_path);
-        return;
-    }
-
-    // PGM 头里允许出现 '#' 注释和任意空白，逐个跳过
-    auto skip_pgm_header_space = [&f]() {
-        while (true) {
-            int c = f.peek();
-            if (c == '#') {
-                f.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-            } else if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
-                f.get();
-            } else {
-                break;
-            }
-        }
-    };
-
-    int w = 0, h = 0, maxval = 0;
-    skip_pgm_header_space();
-    if (!(f >> w)) {
-        logger::error(logger::ros2, "Invalid PGM width: {}", pgm_path);
-        return;
-    }
-
-    skip_pgm_header_space();
-    if (!(f >> h)) {
-        logger::error(logger::ros2, "Invalid PGM height: {}", pgm_path);
-        return;
-    }
-
-    skip_pgm_header_space();
-    if (!(f >> maxval)) {
-        logger::error(logger::ros2, "Invalid PGM maxval: {}", pgm_path);
-        return;
-    }
-
-    if (maxval != 255 || w <= 0 || h <= 0) {
-        logger::error(
-            logger::ros2,
-            "Only P5 binary PGM (maxval=255) supported: {} ({}x{}, maxval={})",
-            pgm_path,
-            w,
-            h,
-            maxval
-        );
-        return;
-    }
-
-    // 关键：PGM 规范里 maxval 后面只消耗一个空白字符。
-    // 不能跳过所有空白，因为二进制像素数据本身可能以空格/换行等字节开头。
-    int sep = f.get();
-    if (sep == '\r' && f.peek() == '\n') {
-        f.get(); // 兼容 CRLF
-    }
-
-    // 读入全部像素，之后按世界坐标做任意像素查询
-    std::vector<unsigned char> pixels(static_cast<size_t>(w) * h);
-    f.read(reinterpret_cast<char*>(pixels.data()), static_cast<std::streamsize>(pixels.size()));
-    if (f.gcount() != static_cast<std::streamsize>(pixels.size())) {
-        logger::error(logger::ros2, "PGM pixel data truncated: {}", pgm_path);
-        return;
-    }
-    f.close();
-
-    // 读取同目录 global_map.yaml 中的 resolution/origin（save_global_map 生成的）。
-    // 缺少该信息无法把 PGM 像素映射回世界坐标，直接拒绝加载，避免错位/越界。
-    std::string yaml_path = pgm_path;
-    if (yaml_path.size() > 4 && yaml_path.substr(yaml_path.size() - 4) == ".pgm") {
-        yaml_path = yaml_path.substr(0, yaml_path.size() - 4) + ".yaml";
-    }
-    double pgm_res = 0.0;
-    Eigen::Vector2d pgm_origin = Eigen::Vector2d::Zero();
-    try {
-        YAML::Node root = YAML::LoadFile(yaml_path);
-        if (!root["resolution"] || !root["origin"]) {
-            logger::error(
-                logger::ros2,
-                "Global map yaml {} missing resolution/origin, load aborted (size mismatch would misalign map)",
-                yaml_path
-            );
-            return;
-        }
-        pgm_res = root["resolution"].as<double>();
-        auto origin = root["origin"].as<std::vector<double>>();
-        if (origin.size() < 2 || pgm_res <= 0.0) {
-            logger::error(logger::ros2, "Global map yaml {} has invalid resolution/origin, load aborted", yaml_path);
-            return;
-        }
-        pgm_origin << origin[0], origin[1];
-    } catch (const std::exception& e) {
-        logger::error(
-            logger::ros2,
-            "Failed to parse global map yaml {} ({}), load aborted (size mismatch would misalign map)",
-            yaml_path,
-            e.what()
-        );
-
-        return;
-    }
-
-    // 按世界坐标重投影到当前栅格图：遍历当前每个 cell，把其中心的世界坐标
-    // 换算成 PGM 像素坐标，仅当像素落在 PGM 范围内时取值（否则保持 0/自由）。
-    // 这样无论当前地图尺寸/分辨率与保存时是否一致，障碍物都落在正确位置。
-    auto grid = ma_map_->get_grid_map();
-    if (!grid) {
-        logger::error(logger::ros2, "Failed to load global map: grid_map snapshot is null");
-        return;
-    }
-    const Eigen::Vector2i voxel_num = grid->getVoxelNum();
-    const Eigen::Vector2d grid_origin = grid->getOrigin();
-    const double grid_res = grid->getResolution();
-    const int pgm_rows = h, pgm_cols = w;
-
-    grid_map::RowMatrixXi global = grid_map::RowMatrixXi::Zero(voxel_num.x(), voxel_num.y());
-    int loaded = 0;
-    for (int i = 0; i < voxel_num.x(); ++i) {
-        for (int j = 0; j < voxel_num.y(); ++j) {
-            // 当前 cell 中心的世界坐标（与 GridMap::indexToPos 一致）
-            const double wx = (i + 0.5) * grid_res + grid_origin.x();
-            const double wy = (j + 0.5) * grid_res + grid_origin.y();
-            // PGM 像素坐标约定（与 save_global_map 一致）：
-            //   占用矩阵 map_occ(row, col) 的 row=世界 x、col=世界 y；
-            //   PGM 列方向 = 世界 Y（左→右 y 增大），PGM 行方向 = 世界 X（顶→底 x 减小）
-            const int px = static_cast<int>(std::floor((wy - pgm_origin.y()) / pgm_res)); // PGM 列 = 世界 y
-            const int py_grid =
-                static_cast<int>(std::floor((wx - pgm_origin.x()) / pgm_res)); // 世界 x 格号（0 = x 最小）
-            const int pgm_row = pgm_rows - 1 - py_grid; // 顶行 = x 最大
-            if (px < 0 || px >= pgm_cols || pgm_row < 0 || pgm_row >= pgm_rows) {
-                continue; // 当前 cell 在老地图范围之外，保持自由
-            }
-            if (pixels[static_cast<size_t>(pgm_row) * pgm_cols + px] < 128) {
-                global(i, j) = 1;
-                ++loaded;
-            }
-        }
-    }
-    ma_map_->set_global_map(global);
+    mapInitialized = true;
     logger::info(
         logger::ros2,
-        "Loaded global map {}x{} (res={:.3f}, origin=({:.2f},{:.2f})) -> current grid {}x{} (res={:.3f}), {} occupied cells projected",
-        pgm_cols,
-        pgm_rows,
-        pgm_res,
-        pgm_origin.x(),
-        pgm_origin.y(),
-        voxel_num.x(),
-        voxel_num.y(),
-        grid_res,
-        loaded
+        "Loaded static global map {} ({}x{}, res={:.3f}, origin=({:.2f},{:.2f}), occ={}, free={}, unk={})",
+        map_path,
+        loaded->geometry.voxel_num.y(),
+        loaded->geometry.voxel_num.x(),
+        loaded->geometry.resolution,
+        loaded->geometry.origin.x(),
+        loaded->geometry.origin.y(),
+        loaded->occupied_count,
+        loaded->free_count,
+        loaded->unknown_count
     );
 }
 
 void GlobalPlanner2d::save_global_map(const std::string& map_dir) {
-    const auto snapshot = ma_map_->get_grid_map(); // 单一不可变快照，几何与占据严格一致
-    if (!snapshot) {
-        logger::error(logger::ros2, "Failed to save global map: snapshot is null");
+    auto saved = ma_map_->save_explored_map(map_dir);
+    if (!saved) {
+        logger::error(logger::ros2, "Failed to save global map {}: {}", map_dir, saved.error());
         return;
     }
-    const Eigen::Vector2i voxel_num = snapshot->getVoxelNum();
-    const int h = voxel_num.x();
-    const int w = voxel_num.y();
-    const auto occ = snapshot->occData();
-    if (h <= 0 || w <= 0 || occ.size() != static_cast<size_t>(h) * static_cast<size_t>(w)) {
-        logger::error(logger::ros2, "Failed to save global map: invalid snapshot geometry {}x{}", h, w);
-        return;
-    }
-    const double res = snapshot->getResolution();
-    const Eigen::Vector2d origin = snapshot->getOrigin();
-
-    std::ofstream f(map_dir + "/global_map.pgm", std::ios::binary);
-    f << "P5\n" << w << " " << h << "\n255\n";
-    for (int y = 0; y < h; ++y)
-        for (int x = 0; x < w; ++x)
-            // GridMap 行 0=底部=世界 y_min，PGM 行 0=顶部=世界 y_max，翻转 Y
-            f.put(occ[static_cast<size_t>(h - 1 - y) * w + x] ? (char)0 : (char)255);
-    f.close();
-
-    std::ofstream y(map_dir + "/global_map.yaml");
-    y << "image: global_map.pgm\n";
-    y << "resolution: " << res << "\n";
-    y << "origin: [" << origin.x() << ", " << origin.y() << ", 0.0]\n";
-    y << "negate: 0\n";
-    y << "occupied_thresh: 0.65\n";
-    y << "free_thresh: 0.196\n";
-    y << "mode: trinary\n";
-    y.close();
-
-    logger::info(logger::ros2, "Saved global map {}x{} -> {}", w, h, map_dir);
+    logger::info(
+        logger::ros2,
+        "Saved global map {}x{} (res={:.3f}, origin=({:.2f},{:.2f}), occ={}, free={}, unk={}) -> {}",
+        saved->saved_geometry.voxel_num.y(),
+        saved->saved_geometry.voxel_num.x(),
+        saved->saved_geometry.resolution,
+        saved->saved_geometry.origin.x(),
+        saved->saved_geometry.origin.y(),
+        saved->occupied_count,
+        saved->free_count,
+        saved->unknown_count,
+        saved->pgm_path
+    );
 }
 
 void GlobalPlanner2d::save_clicked_regions(const std::string& yaml_path) {

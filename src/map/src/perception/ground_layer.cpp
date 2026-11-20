@@ -1,4 +1,4 @@
-#include "map/ground_layer.hpp"
+#include "map/perception/ground_layer.hpp"
 #include <algorithm>
 #include <cmath>
 
@@ -139,7 +139,7 @@ void GroundLayer::update(
         Scratch& s = scratch_[idx];
         if (s.stamp != frame_ || s.kx != kx || s.ky != ky) {
             if (s.stamp == frame_) {
-                continue;  // 环形冲突（距离超过 size 的点），丢弃
+                continue; // 环形冲突（距离超过 size 的点），丢弃
             }
             s.stamp = frame_;
             s.kx = kx;
@@ -182,7 +182,7 @@ void GroundLayer::update(
         Cell& c = slot(s.kx, s.ky);
         if (!(c.flags & OBS)) {
             if ((c.flags & SEED) && z - c.h > cfg_.rise_max) {
-                continue;  // 种子格上方的悬空物
+                continue; // 种子格上方的悬空物
             }
             c.h = z;
             c.var = var_m;
@@ -207,9 +207,9 @@ void GroundLayer::update(
                 }
                 c.up = 0;
                 if (c.down >= cfg_.drop_votes) {
-                    c.down = static_cast<int8_t>(cfg_.drop_votes);  // 封顶，待邻域确认期间不溢出
+                    c.down = static_cast<int8_t>(cfg_.drop_votes); // 封顶，待邻域确认期间不溢出
                     if (cfg_.drop_min_support > 0) {
-                        drop_cand_.push_back({s.kx, s.ky, var_m});  // 本帧结束后做邻域一致性确认
+                        drop_cand_.push_back({s.kx, s.ky, var_m}); // 本帧结束后做邻域一致性确认
                     } else {
                         c.h = c.vote_h;
                         c.var = var_m;
@@ -218,7 +218,7 @@ void GroundLayer::update(
                 }
             } else {
                 if (d > cfg_.rise_max) {
-                    continue;  // 远高于地面：悬空物/车体，不计命中
+                    continue; // 远高于地面：悬空物/车体，不计命中
                 }
                 if (c.up > 0 && std::fabs(z - c.vote_h) <= 2 * cfg_.gate_min) {
                     ++c.up;
@@ -236,7 +236,7 @@ void GroundLayer::update(
             }
         }
         c.last_hit = frame_;
-        c.ub = kInf;  // 有量测的格以量测为准，上界只对未观测格有意义
+        c.ub = kInf; // 有量测的格以量测为准，上界只对未观测格有意义
     }
 
     // 2b) 下降的空间一致性：真实的下降（下坡、台阶下沿、移走的物体）总是成片出现，
@@ -258,7 +258,8 @@ void GroundLayer::update(
                     if (n == nullptr || !(n->flags & (OBS | SEED))) {
                         continue;
                     }
-                    if (std::fabs(n->h - c->vote_h) <= tol || (n->down > 0 && std::fabs(n->vote_h - c->vote_h) <= tol)) {
+                    if (std::fabs(n->h - c->vote_h) <= tol || (n->down > 0 && std::fabs(n->vote_h - c->vote_h) <= tol))
+                    {
                         ++support;
                     }
                 }
@@ -318,4 +319,4 @@ void GroundLayer::update(
     seedDisk(base_pose, cfg_.footprint_radius, true);
 }
 
-}  // namespace Terrain
+} // namespace Terrain

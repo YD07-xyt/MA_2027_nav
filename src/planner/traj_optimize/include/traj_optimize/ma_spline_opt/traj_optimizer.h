@@ -159,8 +159,8 @@ auto MaSplineTrajectoryOptimizer<ESDF>::check_trajectory_collision(
     for (double t = traj.getStartTime(); t <= traj.getEndTime() + 1e-6; t += 0.05) {
         Eigen::Vector2d p = traj.evaluate(t, 0).head<2>();
 
-        if (esdf && esdf->isInside(p.x(), p.y())) {
-            if (esdf->getDistance(p.x(), p.y()) < safe_distance) return false;
+        if (esdf && esdf->isCollision(p.x(), p.y(), safe_distance)) {
+            return false;
         }
     }
 

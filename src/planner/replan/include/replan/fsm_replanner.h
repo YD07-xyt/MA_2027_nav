@@ -1,5 +1,5 @@
 #pragma once
-#include "map/grid_map.hpp"
+#include "map/core/grid_map.hpp"
 #include "traj_optimize/ma_spline_opt/optimizer_config.h"
 
 #include "path_planning/post_processing.h"
@@ -23,6 +23,7 @@ public:
         // 反向重规划刹车段：常规减速度；空间不够时最多提到 brake_acc_max，仍不够则急停（发零速）
         double brake_acc = 6.0; ///< 常规刹车减速度 (m/s²)
         double brake_acc_max = 10.0; ///< 刹车减速度上限 (m/s²)，应 ≤ 底盘真实能力且 ≤ MPC u_max
+        double start_oob_recover_dist = 0.3; ///< 导航模式下允许轻微越界起点沿虚拟墙向内恢复的最大距离 (m)
     };
     struct PlannerConfig {
         ReplanParam replan_params;
@@ -43,12 +44,14 @@ public:
     explicit FsmReplan(const PlannerConfig& planner_config);
 
 public:
+    // 对外导航/规划结果状态（供 ROS2 编排层判断交接与发布 nav_feedback）
     enum PathState {
-        SUCCESSED,
-        FAILED,
-        RUNNING,
-        IDLE,
-    } ;
+        SUCCESSED, // 规划优化成功并产出可用轨迹，或机器人已进入 goal_reached_radius 到达目标
+        FAILED, // 导航任务失败（当前主要由 ROS2 外层 20s 任务超时置位）
+        RUNNING, // 导航执行/重试中（收到目标后或单次规划失败等待下一帧重试时由 ROS2 层置位）
+        IDLE, // 初始空闲态，尚未收到目标或尚未生成有效轨迹
+    };
+
 private:
     struct ResultPath {
         path_planning::PathPostProcessing::Trajectory planning_traj;
@@ -59,9 +62,10 @@ private:
     };
 
 public:
+    // 单次 plan() 失败的错误原因（失败不覆盖已提交轨迹，内部转入 RETRY_PENDING）
     enum PathError {
-        PLANNING_FAILED,
-        MINCO_OPT_FIALED,
+        PLANNING_FAILED, // 地图快照为空，或前端路径搜索失败（含反向刹车后从刹停点二次搜索失败）
+        MINCO_OPT_FIALED, // 后端样条轨迹优化失败（保留历史枚举拼写）
     };
     using path = tl::expected<ResultPath, PathError>;
     // 接收不可变地图快照；grid_map 为空时返回 PLANNING_FAILED，不改变内部状态与已提交轨迹。

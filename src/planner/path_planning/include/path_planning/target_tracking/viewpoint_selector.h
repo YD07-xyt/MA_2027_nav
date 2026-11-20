@@ -11,7 +11,7 @@
  * 暂时处理：遮挡按“2D 栅格地图中所有占据格都挡视线”计算，台阶、矮墙等低矮障碍也会被当成遮挡（偏保守）。
  *          若传入的是膨胀后的规划地图，遮挡会进一步偏保守。
  */
-#include "map/grid_map.hpp"
+#include "map/core/grid_map.hpp"
 #include "path_planning/target_tracking/tracking_types.h"
 #include <Eigen/Core>
 #include <cmath>

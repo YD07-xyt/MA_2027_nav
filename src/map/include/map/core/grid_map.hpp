@@ -24,15 +24,18 @@
 
 #pragma once
 
+#include "map/core/grid_geometry.hpp"
 #include "utils/logger.hpp"
-#include <algorithm>
-#include <cstdint>
-#include <vector>
+
 #include <Eigen/Eigen>
-#include <memory>
-#include <limits>
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <iostream>
+#include <limits>
+#include <memory>
 #include <span>
+#include <vector>
 
 namespace grid_map {
 
@@ -53,27 +56,71 @@ public:
         std::vector<double> z;
     };
 
+    auto geometry() const -> const GridGeometry& {
+        return geometry_;
+    }
     double getResolution() const {
-        return resolution_;
+        return geometry_.resolution;
     }
     Eigen::Vector2d getMapSize() const {
-        return map_size_;
+        return geometry_.map_size;
     }
     Eigen::Vector2d getOrigin() const {
-        return map_origin_;
+        return geometry_.origin;
+    }
+
+    auto setOutOfBoundsPolicy(OutOfBoundsPolicy policy) -> void {
+        if (oob_policy_ != policy) {
+            oob_policy_ = policy;
+            esdf_revision_ = nextEsdfRevision();
+            revision_ = nextRevision();
+        }
+    }
+
+    auto outOfBoundsPolicy() const -> OutOfBoundsPolicy {
+        return oob_policy_;
     }
 
     bool isInsideMap(const Eigen::Vector2d& pos) const {
-        return (pos.array() >= min_boundary_.array()).all() && (pos.array() <= max_boundary_.array()).all();
+        return geometry_.isInside(pos);
+    }
+
+    // 使用精确几何与越界策略初始化地图；所有缓冲清零并递增 revision / esdf_revision。
+    auto init(const GridGeometry& geom, OutOfBoundsPolicy oob_policy = OutOfBoundsPolicy::FREE) -> void;
+
+    // 按世界原点与精确体素数初始化地图（用于静态图精确加载及动态扩图）。
+    auto initByOriginAndSize(
+        const Eigen::Vector2d& origin,
+        const Eigen::Vector2i& voxel_num,
+        double resolution,
+        OutOfBoundsPolicy oob_policy = OutOfBoundsPolicy::FREE
+    ) -> void {
+        init(GridGeometry::fromOriginAndSize(origin, voxel_num, resolution), oob_policy);
     }
 
     // 按原点向四个方向的延伸量初始化地图边界：
     //   x ∈ [-x_left, +x_right]，y ∈ [-y_left, +y_right]
-    auto init(double x_left, double x_right, double y_left, double y_right, double resolution) -> void;
-    //给定总尺寸，地图以原点为中心（等价于左=右=size/2）
-    void init(double map_size_x, double map_size_y, double resolution) {
-        init(map_size_x / 2.0, map_size_x / 2.0, map_size_y / 2.0, map_size_y / 2.0, resolution);
+    auto init(
+        double x_left,
+        double x_right,
+        double y_left,
+        double y_right,
+        double resolution,
+        OutOfBoundsPolicy oob_policy = OutOfBoundsPolicy::FREE
+    ) -> void {
+        init(GridGeometry::fromBounds(x_left, x_right, y_left, y_right, resolution), oob_policy);
     }
+
+    // 给定总尺寸，地图以原点为中心（等价于左=右=size/2）
+    void init(
+        double map_size_x,
+        double map_size_y,
+        double resolution,
+        OutOfBoundsPolicy oob_policy = OutOfBoundsPolicy::FREE
+    ) {
+        init(map_size_x / 2.0, map_size_x / 2.0, map_size_y / 2.0, map_size_y / 2.0, resolution, oob_policy);
+    }
+
     auto direct_set_map(const RowMatrixXi& map) -> void;
     void set_semantics();
     auto inflate(double radius) -> void;
@@ -83,15 +130,18 @@ public:
     // 无条件覆写占据并重算 ESDF（供对象池复用槽位使用，槽位可能持有更早代际的数据）。
     // workspace 为可选的单写者复用缓存，为空时退回局部临时分配。
     auto overwriteMapAndUpdateEsdf(const RowMatrixXi& map, EsdfWorkspace* workspace = nullptr) -> bool;
-    // 从几何一致的快照复用占据与 ESDF（保留源 esdf_revision_，不触发 ESDF 重算，仅递增 revision_）。
+    // 无条件覆写 uint8 占据缓冲（0=自由，非 0 归一化为 1）并重算 ESDF。
+    auto overwriteOccAndUpdateEsdf(std::span<const uint8_t> occ, EsdfWorkspace* workspace = nullptr) -> bool;
+    // 从几何一致的快照复用占据、ESDF 与越界策略（保留源 esdf_revision_，不触发 ESDF 重算，仅递增 revision_）。
     auto copyOccAndEsdfFrom(const GridMap& src) -> bool;
     // 覆写语义层（不修改占据与 ESDF，不改变 esdf_revision_，仅递增 revision_）。
     auto copySemanticsFrom(std::span<const uint8_t> semantics) -> bool;
-    // 快速比较外部占据矩阵是否与当前快照逐格一致（首个差异即提前退出）。
+    // 快速比较外部占据矩阵/缓冲是否与当前快照逐格一致（首个差异即提前退出）。
     auto equalsOccupancy(const RowMatrixXi& map) const -> bool;
+    auto equalsOccupancy(std::span<const uint8_t> occ) const -> bool;
 
-    // 单调递增版本号：revision() 覆盖占据/ESDF/语义任意变化；
-    // esdf_revision() 仅在 ESDF（或 init）变化时递增，供规划器占用缓存失效判定使用。
+    // 单调递增版本号：revision() 覆盖占据/ESDF/语义/越界策略任意变化；
+    // esdf_revision() 在 ESDF、init 或越界策略变化时递增，供规划器占用缓存失效判定使用。
     auto revision() const -> uint64_t {
         return revision_;
     }
@@ -100,7 +150,7 @@ public:
         return esdf_revision_;
     }
 
-    // 只读连续数据视图：布局为 (x, y) 行主序，索引 = x * voxel_num_.y() + y。
+    // 只读连续数据视图：布局为 (x, y) 行主序，索引 = x * voxel_num.y() + y。
     // 借用生命周期不得超过当前 GridMap 快照（或下一次 init() 重新分配）。
     auto occData() const -> std::span<const char> {
         return occ_buffer_;
@@ -117,16 +167,13 @@ public:
     auto getDistance(const Eigen::Vector2d& pos) const -> double;
     auto getDistanceAndGradient(const Eigen::Vector2d& pos, double& distance, Eigen::Vector2d& gradient) const -> bool;
     auto isCollision(const Eigen::Vector2d& pos, double safe_threshold = 0.0) const -> bool;
-    // bool isCollision(const Eigen::Vector2d& pos, double safe_threshold = 0.0) const {
-    //     return !isInMap(pos) || getDistance(pos) < safe_threshold;
-    // }
 
     auto isLineOccupancy(const Eigen::Vector2d& p1, const Eigen::Vector2d& p2) const -> bool;
 
     auto getMap() const -> RowMatrixXd;
 
     Eigen::Vector2i getVoxelNum() const {
-        return voxel_num_;
+        return geometry_.voxel_num;
     }
 
     bool isOccupied(const Eigen::Vector2i& id) const {
@@ -134,12 +181,11 @@ public:
     }
 
     void posToIndex(const Eigen::Vector2d& pos, Eigen::Vector2i& id) const {
-        id << static_cast<int>((pos.x() - map_origin_.x()) * resolution_inv_),
-            static_cast<int>((pos.y() - map_origin_.y()) * resolution_inv_);
+        id = geometry_.posToIndex(pos);
     }
 
     void indexToPos(const Eigen::Vector2i& id, Eigen::Vector2d& pos) const {
-        pos << (id.x() + 0.5) * resolution_ + map_origin_.x(), (id.y() + 0.5) * resolution_ + map_origin_.y();
+        pos = geometry_.indexToPos(id);
     }
 
 public:
@@ -147,6 +193,7 @@ public:
         NONE = 0,
         TUNNEL = 1,
     };
+
     // 设置某个栅格的标记
     auto set_semantics(const Eigen::Vector2i& idx, Semantics semantics) -> void {
         if (!isInMap(idx)) return;
@@ -164,22 +211,43 @@ public:
         return static_cast<Semantics>(semantics_buffer_[toAddress(idx)]);
     }
 
-    //获取标记矩阵（用于可视化）
+    // 获取标记矩阵（用于可视化）
     auto get_semantics_map() const -> RowMatrixXi {
-        RowMatrixXi semantics_map(voxel_num_.x(), voxel_num_.y());
-        for (int x = 0; x < voxel_num_.x(); ++x)
-            for (int y = 0; y < voxel_num_.y(); ++y)
+        RowMatrixXi semantics_map(geometry_.voxel_num.x(), geometry_.voxel_num.y());
+        for (int x = 0; x < geometry_.voxel_num.x(); ++x) {
+            for (int y = 0; y < geometry_.voxel_num.y(); ++y) {
                 semantics_map(x, y) = semantics_buffer_[toAddress(x, y)];
+            }
+        }
         return semantics_map;
     }
+
     auto semantics_polygon_region(const std::vector<Eigen::Vector2d>& polygon, Semantics semantics) -> bool {
-        // 遍历所有栅格，将多边形内的栅格标记设为 semantics；仅在至少一格变化时递增 revision_
+        if (polygon.size() < 3 || !geometry_.isValid()) {
+            return false;
+        }
+        Eigen::Vector2d min_p = polygon.front();
+        Eigen::Vector2d max_p = polygon.front();
+        for (const auto& pt: polygon) {
+            min_p.x() = std::min(min_p.x(), pt.x());
+            min_p.y() = std::min(min_p.y(), pt.y());
+            max_p.x() = std::max(max_p.x(), pt.x());
+            max_p.y() = std::max(max_p.y(), pt.y());
+        }
+        const Eigen::Vector2i lo =
+            (geometry_.posToIndex(min_p) - Eigen::Vector2i(1, 1)).cwiseMax(Eigen::Vector2i::Zero());
+        const Eigen::Vector2i hi =
+            (geometry_.posToIndex(max_p) + Eigen::Vector2i(1, 1))
+                .cwiseMin(Eigen::Vector2i(geometry_.voxel_num.x() - 1, geometry_.voxel_num.y() - 1));
+        if (lo.x() > hi.x() || lo.y() > hi.y()) {
+            return false;
+        }
+
         const auto target = static_cast<uint8_t>(semantics);
         bool changed = false;
-        for (int x = 0; x < voxel_num_.x(); ++x) {
-            for (int y = 0; y < voxel_num_.y(); ++y) {
-                Eigen::Vector2d pos;
-                indexToPos(Eigen::Vector2i(x, y), pos);
+        for (int x = lo.x(); x <= hi.x(); ++x) {
+            for (int y = lo.y(); y <= hi.y(); ++y) {
+                const Eigen::Vector2d pos = geometry_.indexToPos(Eigen::Vector2i(x, y));
                 if (point_in_polygon(pos, polygon)) {
                     const int addr = toAddress(x, y);
                     if (semantics_buffer_[addr] != target) {
@@ -195,7 +263,7 @@ public:
         return changed;
     }
 
-    // 可选：清除所有标记
+    // 清除所有语义标记
     auto clear_all_markers() -> void {
         const auto none = static_cast<uint8_t>(Semantics::NONE);
         bool changed = false;
@@ -219,20 +287,20 @@ public:
 
 protected:
     inline int toAddress(int x, int y) const {
-        return x * voxel_num_.y() + y;
+        return geometry_.toAddress(x, y);
     }
 
     // 保护 setMap/direct_set_map 不越界：输入矩阵行列必须与当前栅格一致，
     // 否则直接拒绝（尺寸不一致时按像素索引拷贝会导致错位或读越界内存）
     auto checkMapSize(const RowMatrixXi& map) const -> bool {
-        if (map.rows() != voxel_num_.x() || map.cols() != voxel_num_.y()) {
+        if (map.rows() != geometry_.voxel_num.x() || map.cols() != geometry_.voxel_num.y()) {
             logger::error(
                 logger::GirdMap2D,
                 "size mismatch: got {}x{}, expected {}x{}, map update rejected",
                 map.rows(),
                 map.cols(),
-                voxel_num_.x(),
-                voxel_num_.y()
+                geometry_.voxel_num.x(),
+                geometry_.voxel_num.y()
             );
             return false;
         }
@@ -240,11 +308,15 @@ protected:
     }
     auto inflateOccupancy(const RowMatrixXi& occ, double inflate_radius, double resolution) -> RowMatrixXi;
     auto updateESDF(EsdfWorkspace* workspace = nullptr) -> void;
+    template<bool ComputeGradient>
     auto sampleEsdf(const Eigen::Vector2d& pos, double& distance, Eigen::Vector2d* gradient) const -> bool;
 
 private:
     static auto nextRevision() -> uint64_t;
     static auto nextEsdfRevision() -> uint64_t;
+
+    auto computeBoundaryDistanceAndNormal(const Eigen::Vector2d& pos, double& dist, Eigen::Vector2d* inward_normal)
+        const -> void;
 
     template<typename F_get_val, typename F_set_val>
     static void fillESDF(
@@ -285,31 +357,31 @@ private:
     }
 
     inline int toAddress(const Eigen::Vector2i& id) const {
-        return id.x() * voxel_num_.y() + id.y();
+        return geometry_.toAddress(id);
     }
 
     inline void boundIndex(Eigen::Vector2i& id) const {
-        id(0) = std::max(std::min(id(0), voxel_num_.x() - 1), 0);
-        id(1) = std::max(std::min(id(1), voxel_num_.y() - 1), 0);
+        id(0) = std::max(std::min(id(0), geometry_.voxel_num.x() - 1), 0);
+        id(1) = std::max(std::min(id(1), geometry_.voxel_num.y() - 1), 0);
     }
 
     inline bool isInMap(const Eigen::Vector2d& pos) const {
-        return (pos.array() >= min_boundary_.array()).all() && (pos.array() <= max_boundary_.array()).all();
+        return geometry_.isInside(pos);
     }
 
     inline bool isInMap(const Eigen::Vector2i& idx) const {
-        return idx.x() >= 0 && idx.y() >= 0 && idx.x() < voxel_num_.x() && idx.y() < voxel_num_.y();
+        return geometry_.isInside(idx);
     }
 
 private:
     // 判断点是否在多边形内
     auto point_in_polygon(const Eigen::Vector2d& p, const std::vector<Eigen::Vector2d>& polygon) const -> bool {
         bool inside = false;
-        int n = polygon.size();
+        const int n = static_cast<int>(polygon.size());
         for (int i = 0, j = n - 1; i < n; j = i++) {
             const Eigen::Vector2d& pi = polygon[i];
             const Eigen::Vector2d& pj = polygon[j];
-            bool intersect = ((pi.y() > p.y()) != (pj.y() > p.y()))
+            const bool intersect = ((pi.y() > p.y()) != (pj.y() > p.y()))
                 && (p.x() < (pj.x() - pi.x()) * (p.y() - pi.y()) / (pj.y() - pi.y()) + pi.x());
             if (intersect) inside = !inside;
         }
@@ -317,13 +389,8 @@ private:
     }
 
 private:
-    double resolution_ = 0.0;
-    double resolution_inv_ = 0.0;
-    Eigen::Vector2d map_size_ = Eigen::Vector2d::Zero();
-    Eigen::Vector2d map_origin_ = Eigen::Vector2d::Zero();
-    Eigen::Vector2d min_boundary_ = Eigen::Vector2d::Zero();
-    Eigen::Vector2d max_boundary_ = Eigen::Vector2d::Zero();
-    Eigen::Vector2i voxel_num_ = Eigen::Vector2i::Zero();
+    GridGeometry geometry_;
+    OutOfBoundsPolicy oob_policy_ = OutOfBoundsPolicy::FREE;
     int buffer_size_ = 0;
     uint64_t revision_ = 0;
     uint64_t esdf_revision_ = 0;

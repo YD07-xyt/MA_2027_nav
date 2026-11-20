@@ -77,15 +77,17 @@ struct RobotIntegralCost
         {
             // ========== ESDF 避障 ==========
             Eigen::Vector2d pos = p.template head<2>();
+            double d = 0.0;
+            Eigen::Vector2d grad_dist = Eigen::Vector2d::Zero();
 
-            if (esdf && esdf->isInside(pos.x(), pos.y()))
-            {
-                double d = esdf->getDistance(pos.x(), pos.y());
-                double violation = safe_distance - d;
-                Eigen::Vector2d grad_dist = esdf->getGradient(pos.x(), pos.y());
+            // 单次查询同时取距离与梯度：
+            // - FREE 越界策略：图外返回 false，不做避障惩罚；
+            // - OCCUPIED 越界策略：图内含四边界虚拟墙距离，图外返回负距离与向内单位法向。
+            if (esdf && esdf->getDistanceAndGradient(pos.x(), pos.y(), d, grad_dist)) {
+                const double violation = safe_distance - d;
+                const bool inside = esdf->isInside(pos.x(), pos.y());
 
-                if (!split_esdf)
-                {
+                if (!split_esdf || !inside) {
                     double f, df;
                     smoothedL1(violation, f, df);
                     cost += w_obs * f;
@@ -114,8 +116,7 @@ struct RobotIntegralCost
                         // 一步不超过一个栅格，差分才接近真实斜率。
                         const double step = std::max(esdf->resolution(), 1e-3);
                         const Eigen::Vector2d ahead = pos + direction * step;
-                        if (esdf->isInside(ahead.x(), ahead.y()))
-                        {
+                        if (esdf->isInside(ahead.x(), ahead.y()) || esdf->outOfBoundsOccupied()) {
                             const double d_ahead = esdf->getDistance(ahead.x(), ahead.y());
                             const double step_grad = (d_ahead - d) / step;
                             if (step_grad < kThreshold)

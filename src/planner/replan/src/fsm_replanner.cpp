@@ -28,9 +28,21 @@ public:
     ma_spline_opt::MaSplineTrajectoryOptimizer<minco_opt::GridMapESDF> ma_opt_;
 
 private:
-    // 失败进入 RETRY_PENDING，下一次调用继续尝试。
-    enum class State { IDLE, PLANNING, MONITORING, RETRY_PENDING };
-    enum class Event { START, PLAN_SUCCEEDED, PLAN_FAILED, GOAL_REACHED, KEEP_MONITORING };
+    // 内部重规划状态机状态（失败进入 RETRY_PENDING，下一次调用继续尝试）
+    enum class State {
+        IDLE, // 初始态，尚未生成有效轨迹，收到请求必触发首次规划
+        PLANNING, // 规划执行中（单次 plan() 同步执行前端搜索与后端优化时的瞬态）
+        MONITORING, // 监控态，持有已提交轨迹，仅检测目标变化/碰撞/横向偏离，无异常则复用旧轨迹
+        RETRY_PENDING, // 待重试态，上次规划或优化失败（保留旧轨迹），下一次 plan() 强制重新尝试
+    };
+    // 驱动内部状态机迁移的事件
+    enum class Event {
+        START, // 满足重规划条件，开始一次完整规划（IDLE/MONITORING/RETRY_PENDING -> PLANNING）
+        PLAN_SUCCEEDED, // 前端搜索与样条优化均成功并提交新轨迹（PLANNING -> MONITORING）
+        PLAN_FAILED, // 前端搜索或样条优化失败，保留旧轨迹（PLANNING -> RETRY_PENDING）
+        GOAL_REACHED, // 当前位姿已进入 goal_reached_radius，直接结束本次规划（-> MONITORING）
+        KEEP_MONITORING, // 未触发任何重规划条件，继续沿用当前已提交轨迹（-> MONITORING）
+    };
 
     State state_ = State::IDLE;
     PlannerConfig planner_config_;
@@ -136,8 +148,44 @@ auto FsmReplan::Impl::plan(
 
     result_.is_new_trajectory = false;
 
+    const Eigen::Vector2d current_xy(current_pose.p.x(), current_pose.p.y());
+    const Eigen::Vector2d goal_xy(goal_pose.p.x(), goal_pose.p.y());
+    if (!current_xy.allFinite() || !goal_xy.allFinite()) {
+        logger::warn(logger::fsm_replan, "Reject non-finite start or goal pose");
+        return tl::make_unexpected(PathError::PLANNING_FAILED);
+    }
+
+    const bool oob_occupied = (grid_map->outOfBoundsPolicy() == grid_map::OutOfBoundsPolicy::OCCUPIED);
+    if (oob_occupied && !grid_map->isInsideMap(goal_xy)) {
+        logger::warn(
+            logger::fsm_replan,
+            "Reject out-of-bounds goal ({:.2f}, {:.2f}) in navigation mode",
+            goal_xy.x(),
+            goal_xy.y()
+        );
+        return tl::make_unexpected(PathError::PLANNING_FAILED);
+    }
+
+    // 导航模式允许轻微越界的起点沿虚拟墙向内恢复（<= start_oob_recover_dist），
+    // 越界过深时直接拒收，避免在定位异常期间覆盖状态与在途轨迹。
+    if (oob_occupied && !grid_map->isInsideMap(current_xy)) {
+        const double oob_dist = -std::min(0.0, grid_map->getDistance(current_xy));
+        const double max_recover = std::max(0.0, planner_config_.replan_params.start_oob_recover_dist);
+        if (oob_dist > max_recover + 1e-9) {
+            logger::warn(
+                logger::fsm_replan,
+                "Reject start ({:.2f}, {:.2f}): out of navigation map by {:.3f}m > start_oob_recover_dist ({:.3f}m)",
+                current_xy.x(),
+                current_xy.y(),
+                oob_dist,
+                max_recover
+            );
+            return tl::make_unexpected(PathError::PLANNING_FAILED);
+        }
+    }
+
     // 起点≈终点（机器人已到达目标附近）：直接退出，不规划。
-    if ((current_pose.p.head<2>() - goal_pose.p.head<2>()).norm() < planner_config_.replan_params.goal_reached_radius) {
+    if ((current_xy - goal_xy).norm() < planner_config_.replan_params.goal_reached_radius) {
         result_.path_state = PathState::SUCCESSED;
         transition(Event::GOAL_REACHED);
         return result_;
@@ -184,10 +232,32 @@ auto FsmReplan::Impl::plan(
         Eigen::Vector2d start(current_pose.p.x(), current_pose.p.y());
         Eigen::Vector2d goal(goal_pose.p.x(), goal_pose.p.y());
 
-        // 若起点/终点过于靠近障碍物，沿 ESDF 梯度外推到安全点，保证可规划
+        // 若起点/终点过于靠近障碍物或导航模式轻微越界，沿 ESDF/虚拟墙梯度外推到安全点
         const Eigen::Vector2d robot_pos = start;
         start = get_safe_pos(start, *grid_map, safe_threshold);
         goal = get_safe_pos(goal, *grid_map, safe_threshold);
+        if (oob_occupied && !grid_map->isInsideMap(robot_pos)
+            && (!grid_map->isInsideMap(start) || grid_map->isCollision(start, safe_threshold)))
+        {
+            logger::warn(
+                logger::fsm_replan,
+                "Failed to recover out-of-bounds start ({:.2f}, {:.2f}) into safe navigation map interior",
+                robot_pos.x(),
+                robot_pos.y()
+            );
+            transition(Event::PLAN_FAILED);
+            return tl::make_unexpected(PathError::PLANNING_FAILED);
+        }
+        if (oob_occupied && !grid_map->isInsideMap(goal)) {
+            logger::warn(
+                logger::fsm_replan,
+                "Adjusted goal ({:.2f}, {:.2f}) landed outside navigation map bounds",
+                goal.x(),
+                goal.y()
+            );
+            transition(Event::PLAN_FAILED);
+            return tl::make_unexpected(PathError::PLANNING_FAILED);
+        }
         const bool start_moved = (start - robot_pos).norm() > 1e-6;
 
         // 起点速度/加速度：取机器人在上一条参考（刹车段 + 样条）上最近投影时刻的计划 v(t)、a(t)
@@ -326,6 +396,30 @@ auto FsmReplan::Impl::plan(
             transition(Event::PLAN_FAILED);
             return tl::make_unexpected(PathError::MINCO_OPT_FIALED);
         }
+        if (oob_occupied && ma_output.trajectory.isInitialized()) {
+            const auto& traj = ma_output.trajectory.getTrajectory();
+            const double t_start = traj.getStartTime();
+            const double t_end = traj.getEndTime();
+            bool traj_oob = false;
+            for (double t = t_start; t <= t_end; t += 0.05) {
+                const Eigen::Vector2d pt = traj.evaluate(t, 0).head<2>();
+                if (!grid_map->isInsideMap(pt)) {
+                    traj_oob = true;
+                    break;
+                }
+            }
+            if (!traj_oob) {
+                const Eigen::Vector2d end_pt = traj.evaluate(t_end, 0).head<2>();
+                if (!grid_map->isInsideMap(end_pt)) {
+                    traj_oob = true;
+                }
+            }
+            if (traj_oob) {
+                logger::warn(logger::fsm_replan, "ma opt trajectory exited navigation map bounds, rejecting");
+                transition(Event::PLAN_FAILED);
+                return tl::make_unexpected(PathError::MINCO_OPT_FIALED);
+            }
+        }
         ma_output.brake = brake; // 刹车段拼在样条前面（无刹车时 duration=0）
         // 优化成功后再组装并整体提交，失败时保持旧轨迹不变。
         ResultPath candidate;
@@ -363,14 +457,7 @@ static bool check_path_collision(
     if (path.empty()) {
         return false;
     }
-    auto is_unsafe = [&](const Eigen::Vector2d& pos) -> bool {
-        // Points outside map are considered collision-free
-        if (!grid_map.isInsideMap(pos)) {
-            return false;
-        }
-        // Points inside map use safety distance check
-        return grid_map.getDistance(pos) < safe_threshold;
-    };
+    auto is_unsafe = [&](const Eigen::Vector2d& pos) -> bool { return grid_map.isCollision(pos, safe_threshold); };
 
     for (size_t i = 0; i < path.size(); ++i) {
         if (is_unsafe(path[i])) {
@@ -415,10 +502,7 @@ auto FsmReplan::Impl::get_safe_pos(
     const grid_map::GridMap& grid_map,
     const double& safe_threshold
 ) -> Eigen::Vector2d {
-    if (!grid_map.isInsideMap(pos)) {
-        return pos;
-    }
-    if (grid_map.getDistance(pos) >= safe_threshold) {
+    if (!grid_map.isCollision(pos, safe_threshold)) {
         return pos;
     }
     Eigen::Vector2d safe = pos;
@@ -427,20 +511,22 @@ auto FsmReplan::Impl::get_safe_pos(
     for (int i = 0; i < 200; ++i) {
         double d = 0.0;
         Eigen::Vector2d g;
-        grid_map.getDistanceAndGradient(safe, d, g);
+        if (!grid_map.getDistanceAndGradient(safe, d, g)) {
+            break;
+        }
         double gn = g.norm();
         if (gn < 1e-6) {
             break; // 梯度退化，无法继续外推
         }
-        Eigen::Vector2d dir = g / gn; // 梯度指向远离障碍方向
+        Eigen::Vector2d dir = g / gn; // 梯度指向远离障碍或指向地图内部方向
         double need = (safe_threshold - d) + 0.05;
         double step = std::min(need, max_push - pushed);
-        if (step <= 0) {
+        if (step <= 0.0) {
             break;
         }
         safe += dir * step;
         pushed += step;
-        if (grid_map.getDistance(safe) >= safe_threshold || pushed >= max_push) {
+        if (!grid_map.isCollision(safe, safe_threshold) || pushed >= max_push) {
             return safe;
         }
     }
@@ -469,15 +555,15 @@ auto FsmReplan::Impl::plan_brake_segment(
     // 射线最远只需检查以最小减速度刹停的距离
     const double max_check = speed * speed / (2.0 * a_nom);
     const double step = std::max(grid_map.getResolution() * 0.5, 0.02);
-    // 起点本身已贴近障碍时（同 DDR-opt）把阈值放到起点净空的 0.85 倍，避免一出发就判为撞墙
+    // 起点本身已贴近障碍时（同 DDR-opt）把阈值放到起点净空的 0.85 倍（夹紧非负），避免一出发就判为撞墙
     double thr = safe_threshold;
     if (grid_map.isInsideMap(p0)) {
-        thr = std::min(thr, 0.85 * grid_map.getDistance(p0));
+        thr = std::min(thr, std::max(0.0, 0.85 * grid_map.getDistance(p0)));
     }
     double l_geo = max_check;
     for (double s = step; s <= max_check + 1e-9; s += step) {
         const Eigen::Vector2d q = p0 + dir * s;
-        if (grid_map.isInsideMap(q) && grid_map.getDistance(q) < thr) {
+        if (grid_map.isCollision(q, thr)) {
             l_geo = std::max(0.0, s - step);
             break;
         }

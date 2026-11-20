@@ -17,7 +17,7 @@
  * 文档：src/planner/path_planning/src/target_tracking/README.md（流程、接入、调参、已知问题）
  * 参数说明与调参：tracking_types.h 中 TargetTrackingParams 的注释
  */
-#include "map/grid_map.hpp"
+#include "map/core/grid_map.hpp"
 #include "path_planning/target_tracking/target_estimator.h"
 #include "path_planning/target_tracking/tracking_types.h"
 #include "path_planning/target_tracking/viewpoint_selector.h"
