@@ -9,8 +9,11 @@
 #include "ros2/color_msg_utils.hpp"
 #include <chrono>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <spdlog/spdlog.h>
 #include <geometry_msgs/msg/point.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
@@ -50,6 +53,38 @@ private:
         frontier_pub, esdf_pub, terrain_map_pub;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr mkr_arr_pub;
 
+    // 2D 地图/ESDF 的 revision 缓存：无订阅者或地图未变化时跳过扫描与消息分配。
+    // last_subs 用于识别“订阅者从无到有/数量增加”，此时强制重发一帧，避免新 RViz 客户端长时间空白。
+    std::optional<uint64_t> occ_map_last_rev_;
+    size_t occ_map_last_subs_ = 0;
+    std::optional<uint64_t> occ_grid_last_rev_;
+    size_t occ_grid_last_subs_ = 0;
+    std::optional<uint64_t> esdf_grid_last_rev_;
+    size_t esdf_grid_last_subs_ = 0;
+
+    template<typename PublisherT>
+    bool
+    should_publish(const PublisherT& pub, uint64_t revision, std::optional<uint64_t>& last_rev, size_t& last_subs) {
+        if (!pub) {
+            last_rev.reset();
+            last_subs = 0;
+            return false;
+        }
+        const size_t subs = pub->get_subscription_count();
+        if (subs == 0) {
+            last_rev.reset();
+            last_subs = 0;
+            return false;
+        }
+        if (last_rev.has_value() && last_rev.value() == revision && subs <= last_subs) {
+            last_subs = subs;
+            return false;
+        }
+        last_rev = revision;
+        last_subs = subs;
+        return true;
+    }
+
 public:
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr speedPub;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr thrPub;
@@ -82,6 +117,19 @@ public:
         esdf_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>("/ma_nav/map/esdf", 10);
         frontier_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>("/ma_nav/map/frontier", 10);
         mkr_arr_pub = node->create_publisher<visualization_msgs::msg::MarkerArray>("/ma_nav/map/map_bound", 10);
+    }
+
+    // 以下两个查询供 pub_callback 在取地图快照前判断是否真的需要可视化，
+    // 无订阅者时避免不必要的快照拷贝与 marker 构建。
+    bool map_viz_active() const {
+        const auto has_sub = [](const auto& pub) { return pub && pub->get_subscription_count() > 0; };
+        return has_sub(unknown_pub) || has_sub(unknown_inf_pub) || has_sub(frontier_pub) || has_sub(occ_pub)
+            || has_sub(occ_inf_pub) || has_sub(esdf_pub) || has_sub(mkr_arr_pub);
+    }
+
+    bool needs_grid_map_snapshot() const {
+        return (grid_occ_pub && grid_occ_pub->get_subscription_count() > 0)
+            || (grid_esdf_pub && grid_esdf_pub->get_subscription_count() > 0);
     }
 
     inline void
@@ -495,7 +543,7 @@ public:
     void PubOptPath(std::vector<Eigen::Vector2d>& path, std::string frame_id = "world") {
         nav_msgs::msg::Path nav_path;
         nav_path.header.frame_id = frame_id;
-        nav_path.header.stamp = rclcpp::Clock().now(); // 或使用 node->get_clock()->now()
+        nav_path.header.stamp = node->get_clock()->now(); // 或使用 node->get_clock()->now()
 
         for (const auto& pt: path) {
             geometry_msgs::msg::PoseStamped pose_stamped;
@@ -607,7 +655,7 @@ void PubOptPath(SplineTrajectory::PPolyND<2, 6> traj, const std::string& frame_i
     void PubGlobalPath(std::vector<Eigen::Vector2d>& path, std::string frame_id = "world") {
         nav_msgs::msg::Path nav_path;
         nav_path.header.frame_id = frame_id;
-        nav_path.header.stamp = rclcpp::Clock().now(); // 或使用 node->get_clock()->now()
+        nav_path.header.stamp = node->get_clock()->now(); // 或使用 node->get_clock()->now()
 
         for (const auto& pt: path) {
             geometry_msgs::msg::PoseStamped pose_stamped;
@@ -737,7 +785,7 @@ void PubOptPath(SplineTrajectory::PPolyND<2, 6> traj, const std::string& frame_i
         sensor_msgs::msg::PointCloud2 pcl_msg;
 
         // 设置时间戳和坐标系
-        pcl_msg.header.stamp = rclcpp::Clock().now();
+        pcl_msg.header.stamp = node->get_clock()->now();
         pcl_msg.header.frame_id = frame_id;
 
         // 设置点云属性
@@ -789,7 +837,7 @@ void PubOptPath(SplineTrajectory::PPolyND<2, 6> traj, const std::string& frame_i
         Mappub->publish(pcl_msg);
     }
     inline void visualize_occupied_map(const grid_map::GridMap& grid_map, const std::string& frame_id = "world") {
-        if (!Mappub) return;
+        if (!should_publish(Mappub, grid_map.revision(), occ_map_last_rev_, occ_map_last_subs_)) return;
 
         Eigen::Vector2i voxel_num = grid_map.getVoxelNum();
         // 先统计障碍物数量，以便预留空间
@@ -803,7 +851,7 @@ void PubOptPath(SplineTrajectory::PPolyND<2, 6> traj, const std::string& frame_i
         }
 
         sensor_msgs::msg::PointCloud2 pcl_msg;
-        pcl_msg.header.stamp = rclcpp::Clock().now();
+        pcl_msg.header.stamp = node->get_clock()->now();
         pcl_msg.header.frame_id = frame_id;
         pcl_msg.height = 1;
         pcl_msg.width = occ_cells.size();
@@ -845,7 +893,7 @@ void PubOptPath(SplineTrajectory::PPolyND<2, 6> traj, const std::string& frame_i
     }
     // 将 GridMap 占用栅格发布为 nav_msgs/OccupancyGrid（rviz2 直接显示二维地图）
     inline void visualize_occupied_grid(const grid_map::GridMap& grid_map, const std::string& frame_id = "world") {
-        if (!grid_occ_pub) return;
+        if (!should_publish(grid_occ_pub, grid_map.revision(), occ_grid_last_rev_, occ_grid_last_subs_)) return;
 
         const Eigen::Vector2i voxel_num = grid_map.getVoxelNum();
         const double res = grid_map.getResolution();
@@ -873,7 +921,7 @@ void PubOptPath(SplineTrajectory::PPolyND<2, 6> traj, const std::string& frame_i
     }
     // 将 GridMap 内部 2D ESDF 距离场发布为 nav_msgs/OccupancyGrid（灰度=距离，障碍内部为 0）
     inline void visualize_esdf_grid(const grid_map::GridMap& grid_map, const std::string& frame_id = "world") {
-        if (!grid_esdf_pub) return;
+        if (!should_publish(grid_esdf_pub, grid_map.esdf_revision(), esdf_grid_last_rev_, esdf_grid_last_subs_)) return;
 
         const Eigen::Vector2i voxel_num = grid_map.getVoxelNum();
         const double res = grid_map.getResolution();
@@ -920,7 +968,7 @@ void PubOptPath(SplineTrajectory::PPolyND<2, 6> traj, const std::string& frame_i
         sensor_msgs::msg::PointCloud2 pcl_msg;
 
         // 设置时间戳和坐标系
-        pcl_msg.header.stamp = rclcpp::Clock().now();
+        pcl_msg.header.stamp = node->get_clock()->now();
         pcl_msg.header.frame_id = frame_id;
 
         // 设置点云属性
@@ -1312,9 +1360,13 @@ void PubOptPath(SplineTrajectory::PPolyND<2, 6> traj, const std::string& frame_i
         cloud.header.stamp = node->get_clock()->now();
         cloud.header.frame_id = frame_id;
     }
-    void map_viz_callback(ma_map::MaMap& ma_map,std::string frame_id = "world") {
+    void map_viz_callback(ma_map::MaMap& ma_map, std::string frame_id = "world") {
         auto rog_map = ma_map.get_rog_map();
-        auto cfg_ = ma_map.get_config();
+        if (!rog_map) {
+            logger::ros2->warn("[ROGMap] Visualization skipped: rog_map is null.");
+            return;
+        }
+        const auto cfg_ = ma_map.get_config();
         utils::Vec3f box_max = rog_map->robot_state_.p + cfg_.visualization_range / 2;
         utils::Vec3f box_min = rog_map->robot_state_.p - cfg_.visualization_range / 2;
 
@@ -1324,72 +1376,80 @@ void PubOptPath(SplineTrajectory::PPolyND<2, 6> traj, const std::string& frame_i
             return;
         }
 
-        if (cfg_.pub_unknown_map_en && unknown_pub->get_subscription_count() >= 1) {
-            utils::vec_E<utils::Vec3f> unknown_map, inf_unknown_map;
-            rog_map->boxSearch(box_min, box_max, utils::UNKNOWN, unknown_map);
-            sensor_msgs::msg::PointCloud2 cloud_msg;
-            vecEVec3fToPC2(unknown_map, cloud_msg, frame_id);
-            cloud_msg.header.stamp = node->get_clock()->now();
-            unknown_pub->publish(cloud_msg);
-            if (cfg_.unk_inflation_en && unknown_inf_pub->get_subscription_count() >= 1) {
-                rog_map->boxSearchInflate(box_min, box_max, utils::UNKNOWN, inf_unknown_map);
-                vecEVec3fToPC2(inf_unknown_map, cloud_msg, frame_id);
+        // stvl_prior 后端下 rog_map 不承载感知数据，跳过 3D 体素 boxSearch/boxSearchInflate
+        // 与 ESDF 点云扫描；legacy_rog 保持完整旧可视化。
+        if (cfg_.perception_backend == "legacy_rog") {
+            if (cfg_.pub_unknown_map_en && unknown_pub->get_subscription_count() >= 1) {
+                utils::vec_E<utils::Vec3f> unknown_map, inf_unknown_map;
+                rog_map->boxSearch(box_min, box_max, utils::UNKNOWN, unknown_map);
+                sensor_msgs::msg::PointCloud2 cloud_msg;
+                vecEVec3fToPC2(unknown_map, cloud_msg, frame_id);
                 cloud_msg.header.stamp = node->get_clock()->now();
-                unknown_inf_pub->publish(cloud_msg);
-            }
-        }
-
-        if (cfg_.frontier_extraction_en && frontier_pub->get_subscription_count() >= 1) {
-            utils::vec_E<utils::Vec3f> frontier_map;
-            rog_map->boxSearch(box_min, box_max, utils::FRONTIER, frontier_map);
-            sensor_msgs::msg::PointCloud2 cloud_msg;
-            vecEVec3fToPC2(frontier_map, cloud_msg, frame_id);
-            cloud_msg.header.stamp = node->get_clock()->now();
-            frontier_pub->publish(cloud_msg);
-        }
-
-        utils::vec_E<utils::Vec3f> occ_map, inf_occ_map;
-        sensor_msgs::msg::PointCloud2 cloud_msg;
-
-        if (occ_pub->get_subscription_count() >= 1) {
-            rog_map->boxSearch(box_min, box_max, utils::OCCUPIED, occ_map);
-            vecEVec3fToPC2(occ_map, cloud_msg, frame_id);
-            occ_pub->publish(cloud_msg);
-        }
-
-        if (occ_inf_pub->get_subscription_count() >= 1) {
-            rog_map->boxSearchInflate(box_min, box_max, utils::OCCUPIED, inf_occ_map);
-            vecEVec3fToPC2(inf_occ_map, cloud_msg, frame_id);
-            cloud_msg.header.stamp = node->get_clock()->now();
-            occ_inf_pub->publish(cloud_msg);
-        }
-
-        /* visualize ESDF Map*/
-        if (cfg_.esdf_en) {
-            if (esdf_pub->get_subscription_count() >= 1) {
-                rog_map::PointCloud pc;
-                rog_map->get_esdf_map()
-                    ->getPositiveESDFPointCloud(box_min, box_max, rog_map->robot_state_.p.z() - 0.5, pc);
-                pcl::toROSMsg(pc, cloud_msg);
-                cloud_msg.header.frame_id = frame_id;
-                cloud_msg.header.stamp = node->get_clock()->now();
-                esdf_pub->publish(cloud_msg);
+                unknown_pub->publish(cloud_msg);
+                if (cfg_.unk_inflation_en && unknown_inf_pub->get_subscription_count() >= 1) {
+                    rog_map->boxSearchInflate(box_min, box_max, utils::UNKNOWN, inf_unknown_map);
+                    vecEVec3fToPC2(inf_unknown_map, cloud_msg, frame_id);
+                    cloud_msg.header.stamp = node->get_clock()->now();
+                    unknown_inf_pub->publish(cloud_msg);
+                }
             }
 
-            // if (vm_.esdf_neg_pub->get_subscription_count() >= 1) {
-            //     PointCloud pc;
-            //     esdf_map_->getNegativeESDFPointCloud(box_min, box_max,
-            //     robot_state_.p.z() - 0.5, pc); pcl::toROSMsg(pc, cloud_msg);
-            //     cloud_msg.header.frame_id = "world";
-            //     cloud_msg.header.stamp = nh_->get_clock()->now();
-            //     vm_.esdf_neg_pub->publish(cloud_msg);
-            // }
+            if (cfg_.frontier_extraction_en && frontier_pub->get_subscription_count() >= 1) {
+                utils::vec_E<utils::Vec3f> frontier_map;
+                rog_map->boxSearch(box_min, box_max, utils::FRONTIER, frontier_map);
+                sensor_msgs::msg::PointCloud2 cloud_msg;
+                vecEVec3fToPC2(frontier_map, cloud_msg, frame_id);
+                cloud_msg.header.stamp = node->get_clock()->now();
+                frontier_pub->publish(cloud_msg);
+            }
+
+            utils::vec_E<utils::Vec3f> occ_map, inf_occ_map;
+            sensor_msgs::msg::PointCloud2 cloud_msg;
+
+            if (occ_pub->get_subscription_count() >= 1) {
+                rog_map->boxSearch(box_min, box_max, utils::OCCUPIED, occ_map);
+                vecEVec3fToPC2(occ_map, cloud_msg, frame_id);
+                occ_pub->publish(cloud_msg);
+            }
+
+            if (occ_inf_pub->get_subscription_count() >= 1) {
+                rog_map->boxSearchInflate(box_min, box_max, utils::OCCUPIED, inf_occ_map);
+                vecEVec3fToPC2(inf_occ_map, cloud_msg, frame_id);
+                cloud_msg.header.stamp = node->get_clock()->now();
+                occ_inf_pub->publish(cloud_msg);
+            }
+
+            /* visualize ESDF Map*/
+            if (cfg_.esdf_en) {
+                if (esdf_pub->get_subscription_count() >= 1) {
+                    rog_map::PointCloud pc;
+                    rog_map->get_esdf_map()
+                        ->getPositiveESDFPointCloud(box_min, box_max, rog_map->robot_state_.p.z() - 0.5, pc);
+                    pcl::toROSMsg(pc, cloud_msg);
+                    cloud_msg.header.frame_id = frame_id;
+                    cloud_msg.header.stamp = node->get_clock()->now();
+                    esdf_pub->publish(cloud_msg);
+                }
+
+                // if (vm_.esdf_neg_pub->get_subscription_count() >= 1) {
+                //     PointCloud pc;
+                //     esdf_map_->getNegativeESDFPointCloud(box_min, box_max,
+                //     robot_state_.p.z() - 0.5, pc); pcl::toROSMsg(pc, cloud_msg);
+                //     cloud_msg.header.frame_id = "world";
+                //     cloud_msg.header.stamp = nh_->get_clock()->now();
+                //     vm_.esdf_neg_pub->publish(cloud_msg);
+                // }
 
 #ifdef ESDF_MAP_DEBUG
-            esdf_map_->getESDFOccPC2(box_min, box_max, cloud_msg);
-            cloud_msg.header.stamp = nh_->get_clock()->now();
-            vm_.esdf_occ_pub->publish(cloud_msg);
+                esdf_map_->getESDFOccPC2(box_min, box_max, cloud_msg);
+                cloud_msg.header.stamp = nh_->get_clock()->now();
+                vm_.esdf_occ_pub->publish(cloud_msg);
 #endif
+            }
+        }
+
+        if (!mkr_arr_pub || mkr_arr_pub->get_subscription_count() == 0) {
+            return;
         }
 
         /* Publish visualization range */
@@ -1483,7 +1543,7 @@ void PubOptPath(SplineTrajectory::PPolyND<2, 6> traj, const std::string& frame_i
             frame_id
         );
 
-        if (cfg_.esdf_en) {
+        if (cfg_.esdf_en && rog_map->get_esdf_map()) {
             utils::Vec3f esdf_box_max, esdf_box_min;
             rog_map->get_esdf_map()->getUpdatedBbox(esdf_box_min, esdf_box_max);
             visualizeText(

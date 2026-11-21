@@ -105,9 +105,9 @@ GlobalPlanner2d::GlobalPlanner2d(rclcpp::Node::SharedPtr nh_, std::string params
     );
 
     pub_viz_timer_ = nh->create_wall_timer(
-        std::chrono::milliseconds(10),
+        std::chrono::milliseconds(100),
         [this]() { pub_callback(); },
-        control_cb_group_ // 可视化放控制组（轻量）
+        map_cb_group_ // 可视化与地图/里程计同组串行，绝不阻塞 100Hz MPC 控制回调
     );
 
     // 接收 rviz2 "Publish Point" 工具点选的点（geometry_msgs/PointStamped，默认 /clicked_point），
@@ -164,15 +164,49 @@ GlobalPlanner2d::GlobalPlanner2d(rclcpp::Node::SharedPtr nh_, std::string params
         load_clicked_regions(config.tunnel_regions_path);
     }
 }
+
+auto GlobalPlanner2d::get_current_pose() const -> std::optional<utils::RobotState> {
+    std::lock_guard<std::mutex> lock(pose_mtx_);
+    return current_pose;
+}
+
+auto GlobalPlanner2d::get_current_xytheta() const -> std::optional<Eigen::Vector3d> {
+    std::lock_guard<std::mutex> lock(pose_mtx_);
+    return current_XYTheta;
+}
+
+void GlobalPlanner2d::set_current_state(const utils::RobotState& pose, const Eigen::Vector3d& xytheta) {
+    std::lock_guard<std::mutex> lock(pose_mtx_);
+    current_pose = pose;
+    current_XYTheta = xytheta;
+}
+
+auto GlobalPlanner2d::get_goal_pose() const -> std::optional<utils::RobotState> {
+    std::lock_guard<std::mutex> lock(nav_task_mtx_);
+    return goal_pose;
+}
+
+void GlobalPlanner2d::finish_nav_task(replan::FsmReplan::PathState state) {
+    {
+        std::lock_guard<std::mutex> lock(nav_task_mtx_);
+        nav_state = state;
+        goal_pose.reset();
+        plan_start_time_sec_.reset();
+    }
+    nav_feedback_pub_->publish(pub_nav_feedback());
+}
+
 void GlobalPlanner2d::controller_callback() {
-    if (!current_XYTheta.has_value()) return;
-    if (!current_pose.has_value()) return;
+    const auto current_xytheta = get_current_xytheta();
+    const auto current_pose_snapshot = get_current_pose();
+    if (!current_xytheta.has_value()) return;
+    if (!current_pose_snapshot.has_value()) return;
 
     if (!ma_traj_interface_ || !ma_traj_interface_->valid()) {
         return;
     }
 
-    Eigen::Vector2d pos(current_XYTheta->x(), current_XYTheta->y());
+    Eigen::Vector2d pos(current_xytheta->x(), current_xytheta->y());
 
     // 急停：刹车距离不够，刹车段时长内直接发零速（不经过 MPC）
     if (emergency_stop_until_sec_.has_value()) {
@@ -203,7 +237,7 @@ void GlobalPlanner2d::controller_callback() {
     double t_now = t_track_;
 
     // yaw 只用于速度坐标变换
-    const double yaw = current_XYTheta->z();
+    const double yaw = current_xytheta->z();
     const double c = std::cos(yaw);
     const double s = std::sin(yaw);
 
@@ -219,8 +253,8 @@ void GlobalPlanner2d::controller_callback() {
         // 第一帧：用里程计速度，但限幅到合理范围，避免一开始就 infeasible
         // Super-LIO /lio/base_odom 的 twist.linear 是世界系速度（ESKF 中 v 由 R*acc+g 积分），
         // child_frame_id=base_link 只是标注，不需要再按 yaw 旋转。
-        const double vx_world_odom = current_pose->v.x();
-        const double vy_world_odom = current_pose->v.y();
+        const double vx_world_odom = current_pose_snapshot->v.x();
+        const double vy_world_odom = current_pose_snapshot->v.y();
 
         // 限幅到 MPC 速度约束内
         constexpr double kMaxVel = 3.0;
@@ -230,7 +264,7 @@ void GlobalPlanner2d::controller_callback() {
 
     // 4 状态 MPC: [x, y, vx, vy]
     control::StateVector x0;
-    x0 << current_XYTheta->x(), current_XYTheta->y(), vx_world_state, vy_world_state;
+    x0 << current_xytheta->x(), current_xytheta->y(), vx_world_state, vy_world_state;
 
     control::InputVector u_cmd;
     std::vector<control::StateVector> predicted_states;
@@ -306,54 +340,49 @@ void GlobalPlanner2d::planner_callback() {
     GlobalPlanner2d::plan_omni();
 }
 void GlobalPlanner2d::plan_omni() {
-    if (this->goal_pose == std::nullopt) {
+    const auto goal_pose_snapshot = get_goal_pose();
+    if (!goal_pose_snapshot.has_value()) {
         logger::debug(logger::ros2, "no goal");
         return;
     }
-    if (this->current_pose == std::nullopt) {
+    const auto current_pose_snapshot = get_current_pose();
+    if (!current_pose_snapshot.has_value()) {
         logger::debug(logger::ros2, "no current_pose");
         return;
     }
     const double now = clock_.nowSec();
-    if (!plan_start_time_sec_.has_value()) {
-        plan_start_time_sec_ = now;
+    double deadline = 0.0;
+    {
+        std::lock_guard<std::mutex> lock(nav_task_mtx_);
+        if (!plan_start_time_sec_.has_value()) {
+            plan_start_time_sec_ = now;
+        }
+        deadline = plan_start_time_sec_.value() + 20.0;
     }
-    const double deadline = plan_start_time_sec_.value() + 20.0;
     if (now >= deadline) {
         logger::warn(logger::ros2, "navigation task exceeded 20s -> nav:failed");
-        nav_state = replan::FsmReplan::PathState::FAILED;
-        nav_feedback_pub_->publish(pub_nav_feedback());
-        goal_pose.reset();
-        plan_start_time_sec_.reset();
+        finish_nav_task(replan::FsmReplan::PathState::FAILED);
         return;
     }
 
-    const double dist_to_goal = (current_pose->p.head<2>() - goal_pose->p.head<2>()).norm();
+    const double dist_to_goal = (current_pose_snapshot->p.head<2>() - goal_pose_snapshot->p.head<2>()).norm();
     if (dist_to_goal < config.planner_config.replan_params.goal_reached_radius) {
-        nav_state = replan::FsmReplan::PathState::SUCCESSED;
-
-        auto msg = pub_nav_feedback(); // 打印 SUCCESSED
-        nav_feedback_pub_->publish(msg);
-
         // 到达后收尾，避免重复触发
-        goal_pose.reset();
-        plan_start_time_sec_.reset();
+        finish_nav_task(replan::FsmReplan::PathState::SUCCESSED);
         return;
     }
 
     // 本次规划全程使用同一份地图快照（双缓冲），地图线程的更新不会改写它。
     const auto plan_map = ma_map_->get_grid_map();
-    auto result = fsm_replanner.plan(goal_pose.value(), current_pose.value(), plan_map);
+    auto result = fsm_replanner.plan(goal_pose_snapshot.value(), current_pose_snapshot.value(), plan_map);
     const double finished_at = clock_.nowSec();
     if (finished_at >= deadline) {
         logger::warn(logger::ros2, "planning result arrived after 20s -> nav:failed");
-        nav_state = replan::FsmReplan::PathState::FAILED;
-        nav_feedback_pub_->publish(pub_nav_feedback());
-        goal_pose.reset();
-        plan_start_time_sec_.reset();
+        finish_nav_task(replan::FsmReplan::PathState::FAILED);
         return;
     }
     if (!result) {
+        std::lock_guard<std::mutex> lock(nav_task_mtx_);
         nav_state = replan::FsmReplan::PathState::RUNNING;
         return;
     }
@@ -362,6 +391,7 @@ void GlobalPlanner2d::plan_omni() {
     // 规划失败保留当前任务，下一帧继续重试；20 秒期限由上方统一处理。
     if (path_result.path_state != replan::FsmReplan::PathState::SUCCESSED) {
         logger::debug(logger::ros2, "PathState not SUCCESSED, waiting...");
+        std::lock_guard<std::mutex> lock(nav_task_mtx_);
         nav_state = replan::FsmReplan::PathState::RUNNING;
         return;
     }
@@ -369,10 +399,7 @@ void GlobalPlanner2d::plan_omni() {
     // 交接前再次检查，过期结果不能下发给控制器。
     if (clock_.nowSec() >= deadline) {
         logger::warn(logger::ros2, "planning result expired before handoff -> nav:failed");
-        nav_state = replan::FsmReplan::PathState::FAILED;
-        nav_feedback_pub_->publish(pub_nav_feedback());
-        goal_pose.reset();
-        plan_start_time_sec_.reset();
+        finish_nav_task(replan::FsmReplan::PathState::FAILED);
         return;
     }
 
@@ -414,8 +441,9 @@ void GlobalPlanner2d::plan_omni() {
             //publish_fold_cmd(desired_fold_state);
             current_fold_state_ = desired_fold_state;
         }
-        if (current_XYTheta.has_value()) {
-            Eigen::Vector2d pos(current_XYTheta->x(), current_XYTheta->y());
+        const auto current_xytheta = get_current_xytheta();
+        if (current_xytheta.has_value()) {
+            Eigen::Vector2d pos(current_xytheta->x(), current_xytheta->y());
             t_track_ = ma_traj_interface_->nearest_time(pos);
         } else {
             t_track_ = 0.0;
@@ -461,7 +489,12 @@ void GlobalPlanner2d::plan_omni() {
 }
 auto GlobalPlanner2d::pub_nav_feedback() -> std_msgs::msg::Int16 {
     std_msgs::msg::Int16 msg;
-    switch (nav_state) {
+    replan::FsmReplan::PathState state;
+    {
+        std::lock_guard<std::mutex> lock(nav_task_mtx_);
+        state = nav_state;
+    }
+    switch (state) {
         case replan::FsmReplan::PathState::IDLE:
             msg.data = 0;
             logger::info(logger::ros2, "nav_feedback:msg:IDLE");
@@ -496,29 +529,25 @@ static void warn_frame_mismatch_once(
 
 void GlobalPlanner2d::odom_callback(const nav_msgs::msg::Odometry::SharedPtr& msg) {
     warn_frame_mismatch_once(odom_frame_warned_, config.odom_topic_name, msg->header.frame_id, frame_id);
-    if (!current_pose.has_value()) {
-        current_pose = utils::RobotState();
-    }
-    if (!current_XYTheta.has_value()) {
-        current_XYTheta = Eigen::Vector3d::Zero();
-    }
     const auto& quat = msg->pose.pose.orientation;
     tf2::Quaternion tf_quat(quat.x, quat.y, quat.z, quat.w);
     double roll, pitch, yaw;
     tf2::Matrix3x3(tf_quat).getRPY(roll, pitch, yaw);
 
-    current_pose->p.x() = msg->pose.pose.position.x;
-    current_pose->p.y() = msg->pose.pose.position.y;
-    current_pose->p.z() = msg->pose.pose.position.z;
+    // 在局部构造完整快照后一次性替换，避免控制/规划线程看到半更新的位姿。
+    utils::RobotState pose_state {};
+    pose_state.p.x() = msg->pose.pose.position.x;
+    pose_state.p.y() = msg->pose.pose.position.y;
+    pose_state.p.z() = msg->pose.pose.position.z;
     const auto& twist = msg->twist.twist;
-    current_pose->v.x() = twist.linear.x;
-    current_pose->v.y() = twist.linear.y;
-    current_pose->v.z() = twist.linear.z;
-    current_pose->yaw = yaw;
-    current_pose->wz = twist.angular.z;
-    current_XYTheta->x() = msg->pose.pose.position.x;
-    current_XYTheta->y() = msg->pose.pose.position.y;
-    current_XYTheta->z() = yaw;
+    pose_state.v.x() = twist.linear.x;
+    pose_state.v.y() = twist.linear.y;
+    pose_state.v.z() = twist.linear.z;
+    pose_state.yaw = yaw;
+    pose_state.wz = twist.angular.z;
+    const Eigen::Vector3d xytheta(msg->pose.pose.position.x, msg->pose.pose.position.y, yaw);
+    set_current_state(pose_state, xytheta);
+
     rog_map::Pose pose;
     pose.first = Eigen::Vector3d(msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z);
     pose.second = Eigen::Quaterniond(
@@ -569,9 +598,15 @@ void GlobalPlanner2d::pub_callback() {
             last_pub_sec_ = now_sec;
         }
     }
-    visualizer.map_viz_callback(*ma_map_,frame_id);
-    // 取当前快照（与地图线程不共享同一个 shared_ptr 变量，避免并发读写指针本身）
-    if (mapInitialized) {
+    if (!ma_map_) return;
+
+    // 纯可视化回调：不包含 cmd_vel/折叠/任务状态等控制关键逻辑。
+    // 无订阅者时不取快照、不构建 marker；有订阅时才按 revision 缓存决定是否重绘。
+    if (visualizer.map_viz_active()) {
+        visualizer.map_viz_callback(*ma_map_, frame_id);
+    }
+    if (mapInitialized && visualizer.needs_grid_map_snapshot()) {
+        // 取当前快照（与地图线程不共享同一个 shared_ptr 变量，避免并发读写指针本身）
         const auto viz_map = ma_map_->get_grid_map();
         if (viz_map) {
             visualizer.visualize_occupied_grid(*viz_map, frame_id);
@@ -630,11 +665,15 @@ void GlobalPlanner2d::target_callback(const geometry_msgs::msg::PoseStamped::Sha
     utils::RobotState temp_goal_pose;
     temp_goal_pose.p = goal;
     temp_goal_pose.yaw = atan2(msg->pose.orientation.z, msg->pose.orientation.w) * 2.0;
-    goal_pose = temp_goal_pose;
+    // goal/nav_state/plan_start_time_sec_ 会被 planner 组并发读取，短临界区内整体更新。
+    {
+        std::lock_guard<std::mutex> lock(nav_task_mtx_);
+        goal_pose = temp_goal_pose;
+        nav_state = replan::FsmReplan::PathState::RUNNING;
+        //logger::info(logger::ros2, "set goal success");
+        plan_start_time_sec_ = clock_.nowSec();
+    }
     old_goal_pose_ = goal;
-    nav_state = replan::FsmReplan::PathState::RUNNING;
-    //logger::info(logger::ros2, "set goal success");
-    plan_start_time_sec_ = clock_.nowSec();
 }
 
 void GlobalPlanner2d::publish_clicked_regions() {

@@ -52,6 +52,7 @@
 #include <cmath>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <string>
 #include <vector>
@@ -70,7 +71,7 @@ private:
 private:
     rclcpp::CallbackGroup::SharedPtr map_cb_group_;
     rclcpp::CallbackGroup::SharedPtr planner_cb_group_;
-    rclcpp::CallbackGroup::SharedPtr control_cb_group_; // 控制器 + 可视化
+    rclcpp::CallbackGroup::SharedPtr control_cb_group_; // 控制器
 
     // 保护 clicked_regions_ 与语义区域写入临界区（MaMap 快照读写由内部锁保护）
     mutable std::shared_mutex map_mutex_;
@@ -80,6 +81,13 @@ private:
     utils::AtomicClockSource sim_clock_source_;
     utils::Clock clock_ = utils::Clock::steady();
     rclcpp::Subscription<rosgraph_msgs::msg::Clock>::SharedPtr sim_clock_sub_;
+
+    // 跨回调组共享状态：current_pose/current_XYTheta 由 map 组（odom_callback）写，
+    // planner/control 组只读取快照；锁仅在短拷贝期间持有。
+    mutable std::mutex pose_mtx_;
+    // 任务状态 goal_pose/nav_state/plan_start_time_sec_ 由 control 组（target_callback）
+    // 与 planner 组（plan_omni）共享，同样只做短临界区保护。
+    mutable std::mutex nav_task_mtx_;
 
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr map_sub_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr target_sub_;
@@ -137,7 +145,8 @@ private:
     std::vector<FoldEvent> fold_events_;
     size_t next_fold_event_idx_ = 0;
     // 当前下发的云台状态：true=折叠，false=抬升
-    bool current_fold_state_ = false;
+    // planner 组与 control 组都会读写，用原子量避免数据竞争（折叠事件表本身仍按既有流程使用）。
+    std::atomic<bool> current_fold_state_ = false;
     std::vector<TunnelInterval> detect_tunnel_intervals(
         const ma_spline_opt::MAsplineOutput& ma_traj,
         const grid_map::GridMap& map,
@@ -151,6 +160,14 @@ private:
         double margin,
         double sample_dt = 0.002
     );
+
+    // 跨回调组状态快照接口：持锁只做拷贝，调用方在锁外使用快照。
+    auto get_current_pose() const -> std::optional<utils::RobotState>;
+    auto get_current_xytheta() const -> std::optional<Eigen::Vector3d>;
+    void set_current_state(const utils::RobotState& pose, const Eigen::Vector3d& xytheta);
+    auto get_goal_pose() const -> std::optional<utils::RobotState>;
+    // 结束当前导航任务（成功/失败共用）：清空 goal 与计时并按状态发布 nav_feedback。
+    void finish_nav_task(replan::FsmReplan::PathState state);
 
 private:
     //contorller
