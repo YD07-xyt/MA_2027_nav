@@ -1194,7 +1194,8 @@ auto run_sanity_checks(BenchEnv& env) -> bool {
             scfg.t_base_lidar = Eigen::Vector3d(0.0, 0.0, 0.194);
             scfg.rpy_deg = Eigen::Vector3d(0.0, -20.0, 0.0); // REP-103: pitch=-20° => +X 上仰 20°
             ma_map::SensorModel sm(scfg);
-            const ma_map::SensorPose sp = sm.computePose(Eigen::Vector3d(1.0, 2.0, 0.0), Eigen::Quaterniond::Identity());
+            const ma_map::SensorPose sp =
+                sm.computePose(Eigen::Vector3d(1.0, 2.0, 0.0), Eigen::Quaterniond::Identity());
             const Eigen::Vector3d p_w = sp.p_lidar_w + sp.R_w_lidar * Eigen::Vector3d(1.0, 0.0, 0.0);
             const double rad20 = 20.0 * 3.14159265358979323846 / 180.0;
             ok &= check(
@@ -1205,8 +1206,7 @@ auto run_sanity_checks(BenchEnv& env) -> bool {
             const Eigen::Vector3d rt = sp.worldToLidar(p_w);
             ok &= check((rt - Eigen::Vector3d(1.0, 0.0, 0.0)).norm() < 1e-9, "SensorPose worldToLidar round-trip");
             ok &= check(
-                sm.isSelfHit(Eigen::Vector3d(1.1, 2.0, 0.15), sp)
-                    && !sm.isSelfHit(Eigen::Vector3d(2.5, 2.0, 0.15), sp),
+                sm.isSelfHit(Eigen::Vector3d(1.1, 2.0, 0.15), sp) && !sm.isSelfHit(Eigen::Vector3d(2.5, 2.0, 0.15), sp),
                 "SensorModel base-frame AABB self-filter"
             );
             ok &= check(
@@ -1214,10 +1214,13 @@ auto run_sanity_checks(BenchEnv& env) -> bool {
                 "SensorModel Mid-360 vertical FOV check"
             );
             const Eigen::Quaterniond q_yaw(Eigen::AngleAxisd(1.2, Eigen::Vector3d::UnitZ()));
-            const Eigen::Quaterniond q_pitch(Eigen::AngleAxisd(10.0 * 3.14159265358979323846 / 180.0, Eigen::Vector3d::UnitY()));
+            const Eigen::Quaterniond q_pitch(
+                Eigen::AngleAxisd(10.0 * 3.14159265358979323846 / 180.0, Eigen::Vector3d::UnitY())
+            );
             ok &= check(
                 ma_map::SensorModel::tiltAngleDeg(Eigen::Quaterniond::Identity(), q_yaw) < 1e-6
-                    && std::abs(ma_map::SensorModel::tiltAngleDeg(Eigen::Quaterniond::Identity(), q_pitch) - 10.0) < 1e-3,
+                    && std::abs(ma_map::SensorModel::tiltAngleDeg(Eigen::Quaterniond::Identity(), q_pitch) - 10.0)
+                        < 1e-3,
                 "SensorModel tiltAngleDeg ignores pure yaw and measures pitch accurately"
             );
         }
@@ -1293,10 +1296,8 @@ auto run_sanity_checks(BenchEnv& env) -> bool {
                     && std::abs(rs.terrain_prior.overhang_min_z[bar_high] - 0.25f) < 1e-4f,
                 "StaticTerrainBuilder 0.25m height-limit bar FREE with accurate overhang_min_z"
             );
-            ok &= check(
-                rs.cells[bar_low] == ma_map::CellState::OCCUPIED,
-                "StaticTerrainBuilder 0.16m low bar OCCUPIED"
-            );
+            ok &=
+                check(rs.cells[bar_low] == ma_map::CellState::OCCUPIED, "StaticTerrainBuilder 0.16m low bar OCCUPIED");
         }
 
         // 8d. OnlineTerrainMapper: 零先验建图 + 信任半径截断远距噪点 + 3D 射线清除动态过客 + 坐标严格对齐
@@ -1381,8 +1382,7 @@ auto run_sanity_checks(BenchEnv& env) -> bool {
                             == ma_map::CellState::FREE
                         && std::abs(
                                built->terrain_prior.ground_z[static_cast<size_t>(built->geometry.toAddress(flr_idx))]
-                           )
-                            < 0.03f,
+                           ) < 0.03f,
                     "OnlineTerrainMapper recovers accurate ground_z"
                 );
             }
@@ -1409,7 +1409,8 @@ auto run_sanity_checks(BenchEnv& env) -> bool {
             ma_map::SaveOptions ns_opts;
             ns_opts.crop_to_explored = false;
             ns_opts.save_terrain_prior = true;
-            const auto n_saved = ma_map::MapIO::save((tmp_dir / "stvl_static").string(), n_geom, n_cells, ns_opts, &n_prior);
+            const auto n_saved =
+                ma_map::MapIO::save((tmp_dir / "stvl_static").string(), n_geom, n_cells, ns_opts, &n_prior);
             ok &= check(n_saved.has_value() && n_saved->saved_terrain_prior, "DynamicStvlLayer test static map saved");
 
             ma_map::LayeredMap::Config lm_cfg;
@@ -1421,7 +1422,10 @@ auto run_sanity_checks(BenchEnv& env) -> bool {
             ma_map::LayeredMap nav_lm(lm_cfg);
             nav_lm.setMode(ma_map::MapMode::NAVIGATION);
             const auto n_loaded = nav_lm.loadStaticMap(n_saved->pgm_path);
-            ok &= check(n_loaded.has_value() && n_loaded->has_terrain_prior, "LayeredMap loads static map + terrain prior");
+            ok &= check(
+                n_loaded.has_value() && n_loaded->has_terrain_prior,
+                "LayeredMap loads static map + terrain prior"
+            );
             const ma_map::StaticNavContext sctx = nav_lm.getStaticNavContext();
             ok &= check(
                 sctx.static_esdf != nullptr && sctx.terrain_prior != nullptr,
@@ -1454,8 +1458,10 @@ auto run_sanity_checks(BenchEnv& env) -> bool {
                     }
                 }
                 // 静态墙体背景点（作为射线清除背景）
+                // 墙顶需覆盖最高动态体素在 x=3.025 处的投影：z_wall = 0.194 + (0.675-0.194)*3.025/1.725
+                // = 1.0375m；原 0.85+0.10=0.95m 不与该射线相交，导致顶层体素永远无“后方回波”。
                 for (double y = -1.2; y <= 1.2; y += 0.05) {
-                    for (double z = 0.15; z <= 0.85; z += 0.05) {
+                    for (double z = 0.15; z <= 1.10; z += 0.05) {
                         pts.emplace_back(3.025, y, z + kDriftZ);
                     }
                 }
@@ -1501,6 +1507,363 @@ auto run_sanity_checks(BenchEnv& env) -> bool {
             ok &= check(
                 f4.obstacle_cells.empty() && stvl.activeVoxelCount() == 0,
                 "DynamicStvlLayer ray-clears vanished dynamic obstacle within 2 frames (zero ghosting)"
+            );
+        }
+    }
+
+    // 9. 回归自检：边界/退化输入与算法修复（mergeSpans NaN、Z 漂移重捕获、无先验斜坡、ESDF/碰撞边界）
+    {
+        const float kNaN = std::numeric_limits<float>::quiet_NaN();
+
+        // 9a. StaticTerrainBuilder::mergeSpans：过滤 NaN/Inf，并在排序前归一化倒置上下界
+        {
+            const auto ms_geom =
+                grid_map::GridGeometry::fromOriginAndSize(Eigen::Vector2d(0.0, 0.0), Eigen::Vector2i(4, 4), 0.05);
+            ma_map::StaticTerrainBuilder ms_builder;
+            auto ms_grid = ma_map::StaticTerrainBuilder::VoxelColumnGrid::create(ms_geom, true, false);
+            for (int ix = 0; ix < 4; ++ix) {
+                for (int iy = 0; iy < 4; ++iy) {
+                    auto& spans = ms_grid.occ_spans[static_cast<size_t>(ix * 4 + iy)];
+                    spans.push_back({-0.05f, 0.0f});
+                    spans.push_back({0.10f, 0.0f}); // 倒置：应归一化为 [0.0, 0.10] 后与地面段合并
+                    if (ix == 0 && iy == 0) {
+                        spans.push_back({kNaN, kNaN});
+                        spans.push_back({kNaN, 0.20f});
+                    }
+                }
+            }
+            const auto ms_res = ms_builder.build(ms_grid);
+            bool ms_ok = ms_res.free_count == 16 && ms_res.occupied_count == 0 && ms_res.unknown_count == 0;
+            for (int i = 0; i < 16; ++i) {
+                const float gz = ms_res.terrain_prior.ground_z[static_cast<size_t>(i)];
+                ms_ok = ms_ok && std::isfinite(gz) && std::abs(gz - 0.10f) < 1e-4f;
+            }
+            ok &= check(ms_ok, "StaticTerrainBuilder mergeSpans filters NaN/Inf and normalizes inverted spans");
+        }
+
+        // 9b. DynamicStvlLayer：LIO Z 突跳 > 0.25m 后 3 帧内用宽门限立即重捕获（不再永久锁死）
+        {
+            const auto dg_geom =
+                grid_map::GridGeometry::fromOriginAndSize(Eigen::Vector2d(-1.0, -1.0), Eigen::Vector2i(100, 100), 0.05);
+            auto dprior =
+                std::make_shared<ma_map::StaticTerrainPrior>(ma_map::StaticTerrainPrior::createEmpty(dg_geom));
+            std::fill(dprior->ground_z.begin(), dprior->ground_z.end(), 0.0f);
+            ma_map::StaticNavContext dctx;
+            dctx.terrain_prior = dprior;
+
+            ma_map::DynamicStvlLayer::Config dcfg;
+            dcfg.drift_max_abs = 0.60f; // 允许 0.30m 突跳落入宽门限
+            dcfg.drift_min_samples = 30;
+            ma_map::DynamicStvlLayer drift_layer(dcfg);
+            ma_map::SensorModel dsm;
+
+            const Eigen::Quaterniond q_id = Eigen::Quaterniond::Identity();
+            const ma_map::SensorPose d_sp = dsm.computePose(Eigen::Vector3d::Zero(), q_id);
+
+            auto make_ground = [](double z_off) {
+                std::vector<Eigen::Vector3d> pts;
+                for (double x = 0.6; x <= 3.0 + 1e-9; x += 0.10) {
+                    for (double y = -1.5; y <= 1.5 + 1e-9; y += 0.10) {
+                        pts.emplace_back(x, y, z_off);
+                    }
+                }
+                return pts;
+            };
+
+            const auto g_base = make_ground(0.02);
+            (void)drift_layer.update(g_base, d_sp, q_id, dsm, dctx, 0.0);
+            ok &= check(
+                std::abs(drift_layer.estimatedDriftZ() - 0.02f) < 0.03f,
+                "DynamicStvlLayer acquires initial Z-drift within wide gate"
+            );
+
+            const auto g_jump = make_ground(0.32); // +0.30m，超过 0.25m 窄门限但 <= drift_max_abs
+            for (int f = 1; f <= 3; ++f) {
+                (void)drift_layer.update(g_jump, d_sp, q_id, dsm, dctx, 0.1 * static_cast<double>(f));
+            }
+            ok &= check(
+                std::abs(drift_layer.estimatedDriftZ() - 0.32f) < 0.03f && drift_layer.estimatedDriftZ() > 0.10f,
+                "DynamicStvlLayer re-acquires >0.25m Z-drift jump within 3 frames"
+            );
+        }
+
+        // 9c. DynamicStvlLayer 无先验：±20° 倾斜坡面零误检，且能检测坡面上 0.35m 障碍
+        {
+            ma_map::DynamicStvlLayer::Config rcfg;
+            rcfg.fast_confirm_with_neighbor = true;
+            ma_map::DynamicStvlLayer ramp_layer(rcfg);
+            ma_map::SensorModel rsm;
+            ma_map::StaticNavContext no_prior_ctx; // 无 terrain_prior / static_esdf / snapshot
+
+            constexpr double kPi = 3.14159265358979323846;
+            const double rad20 = 20.0 * kPi / 180.0;
+
+            for (const int sign: {-1, 1}) {
+                const double theta = static_cast<double>(sign) * rad20;
+                const double tan_theta = std::tan(theta);
+                const Eigen::Quaterniond q_ramp(Eigen::AngleAxisd(theta, Eigen::Vector3d::UnitY()));
+                const ma_map::SensorPose ramp_sp = rsm.computePose(Eigen::Vector3d::Zero(), q_ramp);
+                const Eigen::Vector3d base_z = ramp_sp.R_w_base.col(2);
+                ok &= check(
+                    std::abs(base_z.z() - std::cos(rad20)) < 1e-9,
+                    "DynamicStvlLayer no-prior ramp test uses 20deg tilted base Z axis"
+                );
+
+                // 坡面过原点且与 base Z 轴垂直：z = -tan(theta) * x。
+                auto make_ramp = [&](bool with_obstacle) {
+                    std::vector<Eigen::Vector3d> pts;
+                    for (double x = 0.8; x <= 3.0 + 1e-9; x += 0.08) {
+                        for (double y = -1.0; y <= 1.0 + 1e-9; y += 0.10) {
+                            pts.emplace_back(x, y, -tan_theta * x);
+                        }
+                    }
+                    if (with_obstacle) {
+                        for (int ix = -1; ix <= 1; ++ix) {
+                            for (int iy = -1; iy <= 1; ++iy) {
+                                for (int iz = 0; iz <= 2; ++iz) {
+                                    const double x = 1.8 + 0.05 * static_cast<double>(ix);
+                                    const double y = 0.05 * static_cast<double>(iy);
+                                    const Eigen::Vector3d base_on_plane(x, y, -tan_theta * x);
+                                    pts.push_back(base_on_plane + base_z * (0.35 + 0.05 * static_cast<double>(iz)));
+                                }
+                            }
+                        }
+                    }
+                    return pts;
+                };
+
+                const auto ramp_only = make_ramp(false);
+                const auto ramp_with_obstacle = make_ramp(true);
+
+                const auto r0 = ramp_layer.update(ramp_only, ramp_sp, q_ramp, rsm, no_prior_ctx, 0.0);
+                ok &= check(
+                    r0.obstacle_cells.empty(),
+                    sign < 0 ? "DynamicStvlLayer no-prior -20deg ramp emits zero false obstacles"
+                             : "DynamicStvlLayer no-prior +20deg ramp emits zero false obstacles"
+                );
+
+                (void)ramp_layer.update(ramp_with_obstacle, ramp_sp, q_ramp, rsm, no_prior_ctx, 0.1);
+                const auto r2 = ramp_layer.update(ramp_with_obstacle, ramp_sp, q_ramp, rsm, no_prior_ctx, 0.2);
+                ok &= check(
+                    !r2.obstacle_cells.empty(),
+                    sign < 0 ? "DynamicStvlLayer no-prior -20deg ramp detects 0.35m obstacle above tilted ground"
+                             : "DynamicStvlLayer no-prior +20deg ramp detects 0.35m obstacle above tilted ground"
+                );
+
+                ramp_layer.reset();
+            }
+        }
+
+        // 9d. GridMap：safe_threshold <= 0 时占据格仍判碰撞，相邻自由格不误判
+        {
+            const auto g_geom =
+                grid_map::GridGeometry::fromOriginAndSize(Eigen::Vector2d(0.0, 0.0), Eigen::Vector2i(21, 21), 0.1);
+            grid_map::GridMap surf;
+            surf.init(g_geom, grid_map::OutOfBoundsPolicy::FREE);
+            grid_map::RowMatrixXi occ = grid_map::RowMatrixXi::Zero(21, 21);
+            occ(10, 10) = 1;
+            ok &=
+                check(surf.overwriteMapAndUpdateEsdf(occ), "GridMap single-obstacle ESDF for collision boundary test");
+
+            Eigen::Vector2d p_occ;
+            Eigen::Vector2d p_free;
+            surf.indexToPos(Eigen::Vector2i(10, 10), p_occ);
+            surf.indexToPos(Eigen::Vector2i(11, 10), p_free);
+            ok &= check(
+                std::abs(surf.getDistance(p_occ)) < 1e-12 && surf.isCollision(p_occ, 0.0)
+                    && surf.isCollision(p_occ, -1.0),
+                "GridMap isCollision(threshold<=0) true on zero-ESDF occupied cell"
+            );
+            ok &= check(
+                surf.getDistance(p_free) > 0.0 && !surf.isCollision(p_free, 0.0),
+                "GridMap isCollision(threshold=0) false on adjacent free cell (esdf=+res)"
+            );
+
+            // 地图边界格（采样走双线性分支）同样不得漏判
+            const auto b_geom =
+                grid_map::GridGeometry::fromOriginAndSize(Eigen::Vector2d(0.0, 0.0), Eigen::Vector2i(11, 11), 0.1);
+            grid_map::GridMap border;
+            border.init(b_geom, grid_map::OutOfBoundsPolicy::FREE);
+            grid_map::RowMatrixXi bocc = grid_map::RowMatrixXi::Zero(11, 11);
+            bocc(0, 0) = 1;
+            ok &= check(border.overwriteMapAndUpdateEsdf(bocc), "GridMap border-obstacle ESDF");
+            Eigen::Vector2d b_occ;
+            Eigen::Vector2d b_free;
+            border.indexToPos(Eigen::Vector2i(0, 0), b_occ);
+            border.indexToPos(Eigen::Vector2i(1, 0), b_free);
+            ok &= check(
+                border.isCollision(b_occ, 0.0) && !border.isCollision(b_free, 0.0),
+                "GridMap border obstacle collision at threshold 0 without adjacent free false positive"
+            );
+        }
+
+        // 9e. GridMap::isLineOccupancy：精确终点 p2、对角内部障碍与自由线
+        {
+            const auto g_geom =
+                grid_map::GridGeometry::fromOriginAndSize(Eigen::Vector2d(0.0, 0.0), Eigen::Vector2i(21, 21), 0.1);
+            grid_map::GridMap line_map;
+            line_map.init(g_geom, grid_map::OutOfBoundsPolicy::FREE);
+            grid_map::RowMatrixXi occ = grid_map::RowMatrixXi::Zero(21, 21);
+            occ(10, 10) = 1;
+            ok &= check(line_map.overwriteMapAndUpdateEsdf(occ), "GridMap line-occupancy ESDF");
+
+            Eigen::Vector2d l_a;
+            Eigen::Vector2d l_b;
+            line_map.indexToPos(Eigen::Vector2i(5, 10), l_a);
+            line_map.indexToPos(Eigen::Vector2i(10, 10), l_b);
+            ok &= check(line_map.isLineOccupancy(l_a, l_b), "GridMap isLineOccupancy checks exact endpoint p2");
+
+            Eigen::Vector2d d_a;
+            Eigen::Vector2d d_b;
+            line_map.indexToPos(Eigen::Vector2i(6, 6), d_a);
+            line_map.indexToPos(Eigen::Vector2i(14, 14), d_b);
+            ok &=
+                check(line_map.isLineOccupancy(d_a, d_b), "GridMap isLineOccupancy catches diagonal interior obstacle");
+
+            Eigen::Vector2d f_a;
+            Eigen::Vector2d f_b;
+            line_map.indexToPos(Eigen::Vector2i(5, 5), f_a);
+            line_map.indexToPos(Eigen::Vector2i(9, 9), f_b);
+            ok &= check(!line_map.isLineOccupancy(f_a, f_b), "GridMap isLineOccupancy free line remains clear");
+        }
+
+        // 9f. GridMap ESDF：混合图全有限且对角距离精确；全空闲/全占据退化仍有限
+        {
+            const auto g_geom =
+                grid_map::GridGeometry::fromOriginAndSize(Eigen::Vector2d(0.0, 0.0), Eigen::Vector2i(21, 21), 0.1);
+            grid_map::GridMap mixed;
+            mixed.init(g_geom, grid_map::OutOfBoundsPolicy::FREE);
+            grid_map::RowMatrixXi occ = grid_map::RowMatrixXi::Zero(21, 21);
+            occ(10, 10) = 1;
+            ok &= check(mixed.overwriteMapAndUpdateEsdf(occ), "GridMap mixed ESDF");
+
+            bool all_finite = true;
+            for (const double v: mixed.esdfData()) {
+                all_finite = all_finite && std::isfinite(v);
+            }
+            Eigen::Vector2d p00;
+            mixed.indexToPos(Eigen::Vector2i(0, 0), p00);
+            const double expected = std::sqrt(200.0) * 0.1;
+            ok &= check(
+                all_finite && std::abs(mixed.getDistance(p00) - expected) < 1e-4,
+                "GridMap fillESDF skips +inf sites without NaN and keeps exact diagonal distance"
+            );
+
+            grid_map::GridMap deg_free;
+            deg_free.init(g_geom, grid_map::OutOfBoundsPolicy::FREE);
+            const grid_map::RowMatrixXi deg_free_occ = grid_map::RowMatrixXi::Zero(21, 21);
+            ok &= check(deg_free.overwriteMapAndUpdateEsdf(deg_free_occ), "GridMap all-free fillESDF guard");
+            bool free_finite = true;
+            for (const double v: deg_free.esdfData()) {
+                free_finite = free_finite && std::isfinite(v) && v > 0.0;
+            }
+            ok &= check(free_finite, "GridMap all-free ESDF is finite positive");
+
+            grid_map::GridMap deg_occ;
+            deg_occ.init(g_geom, grid_map::OutOfBoundsPolicy::FREE);
+            const grid_map::RowMatrixXi deg_occ_grid = grid_map::RowMatrixXi::Ones(21, 21);
+            ok &= check(deg_occ.overwriteMapAndUpdateEsdf(deg_occ_grid), "GridMap all-occupied fillESDF guard");
+            bool occ_finite = true;
+            for (const double v: deg_occ.esdfData()) {
+                occ_finite = occ_finite && std::isfinite(v) && v < 0.0;
+            }
+            ok &= check(occ_finite, "GridMap all-occupied ESDF is finite negative");
+        }
+
+        // 9g. SensorModel::setConfig：NaN / 倒置边界净化后仍可安全计算
+        {
+            const double dNaN = std::numeric_limits<double>::quiet_NaN();
+            ma_map::SensorModel::Config bad;
+            bad.t_base_lidar = Eigen::Vector3d::Constant(dNaN);
+            bad.rpy_deg = Eigen::Vector3d::Constant(dNaN);
+            bad.min_range = dNaN;
+            bad.max_range = dNaN;
+            bad.fov_min_elev_deg = 60.0; // 倒置：min > max
+            bad.fov_max_elev_deg = -10.0;
+            bad.fov_margin_deg = -5.0; // 负容差必须钳制为非负
+            bad.self_filter_min = Eigen::Vector3d::Constant(dNaN);
+            bad.self_filter_max = Eigen::Vector3d::Constant(dNaN);
+
+            ma_map::SensorModel bad_sm(bad);
+            const auto& bcfg = bad_sm.config();
+            ok &= check(
+                bcfg.t_base_lidar.allFinite() && bcfg.rpy_deg.allFinite() && bcfg.self_filter_min.allFinite()
+                    && bcfg.self_filter_max.allFinite(),
+                "SensorModel setConfig sanitizes non-finite extrinsics/self-filter"
+            );
+            ok &= check(
+                std::isfinite(bcfg.min_range) && std::isfinite(bcfg.max_range) && bcfg.min_range <= bcfg.max_range
+                    && bcfg.fov_min_elev_deg <= bcfg.fov_max_elev_deg && bcfg.fov_margin_deg >= 0.0,
+                "SensorModel setConfig sanitizes NaN/inverted range and FOV bounds"
+            );
+
+            const auto bad_pose = bad_sm.computePose(Eigen::Vector3d::Constant(dNaN), Eigen::Quaterniond::Identity());
+            ok &= check(
+                bad_pose.p_base_w.allFinite() && bad_pose.R_w_base.allFinite() && bad_pose.p_lidar_w.allFinite(),
+                "SensorModel computePose guards non-finite base position"
+            );
+            ok &= check(
+                !bad_sm.inFov(Eigen::Vector3d::Constant(dNaN)),
+                "SensorModel inFov rejects non-finite lidar point"
+            );
+
+            ma_map::SensorModel::Config inverted;
+            inverted.min_range = 20.0;
+            inverted.max_range = 0.5;
+            ma_map::SensorModel inverted_sm(inverted);
+            ok &= check(
+                inverted_sm.config().min_range <= inverted_sm.config().max_range,
+                "SensorModel setConfig clamps inverted range bounds"
+            );
+        }
+
+        // 9h. utils::Clock / ManualClock / AtomicClockSource 与时钟回退保护
+        {
+            utils::ManualClock mclk;
+            mclk.setNs(1'000'000'000LL);
+            const utils::Clock clk = mclk.asClock();
+            ok &= check(std::abs(clk.nowSec() - 1.0) < 1e-9, "utils::ManualClock initial time");
+            mclk.advanceSec(0.5);
+            ok &= check(std::abs(clk.nowSec() - 1.5) < 1e-9, "utils::ManualClock advanceSec");
+
+            utils::AtomicClockSource aclk;
+            aclk.storeSec(42.25);
+            ok &= check(std::abs(aclk.asClock().nowSec() - 42.25) < 1e-6, "utils::AtomicClockSource store/load");
+
+            ma_map::SensorModel::Config sc;
+            sc.t_base_lidar = Eigen::Vector3d(0.0, 0.0, 0.15);
+            sc.rpy_deg = Eigen::Vector3d::Zero();
+            ma_map::SensorModel sm(sc);
+            const auto sp = sm.computePose(Eigen::Vector3d(0.0, 0.0, 0.06), Eigen::Quaterniond::Identity());
+
+            ma_map::DynamicStvlLayer::Config dc;
+            dc.decay_in_fov_sec = 0.30f;
+            dc.decay_blind_sec = 0.30f;
+            dc.fallback_ground_offset = 0.06f;
+            ma_map::DynamicStvlLayer dl(dc);
+            dl.setClock(clk);
+
+            ma_map::StaticNavContext empty_ctx;
+            std::vector<Eigen::Vector3d> obs_pts;
+            for (double x = 1.6; x <= 1.8; x += 0.05) {
+                for (double y = -0.1; y <= 0.1; y += 0.05) {
+                    for (double z = 0.25; z <= 0.45; z += 0.05) {
+                        obs_pts.emplace_back(x, y, z);
+                    }
+                }
+            }
+            dl.update(obs_pts, sp, Eigen::Quaterniond::Identity(), sm, empty_ctx, -1.0);
+            const size_t active_before = dl.activeVoxelCount();
+            // 模拟仿真重置时钟回退：体素不应因负 dt 崩溃或异常消失
+            mclk.setSec(0.1);
+            dl.update({}, sp, Eigen::Quaterniond::Identity(), sm, empty_ctx, -1.0);
+            const size_t active_after_back = dl.activeVoxelCount();
+            // 回退后再推进超过 decay 时间：应正常按注入时钟衰减清除
+            mclk.advanceSec(0.5);
+            dl.update({}, sp, Eigen::Quaterniond::Identity(), sm, empty_ctx, -1.0);
+            ok &= check(
+                active_before > 0 && active_after_back == active_before && dl.activeVoxelCount() == 0,
+                "DynamicStvlLayer handles injected ManualClock and backward clock jump"
             );
         }
     }

@@ -121,6 +121,7 @@ private:
         const SensorModel& sensor,
         const StaticNavContext& static_ctx
     ) -> void;
+    auto estimateRobustDrift(std::vector<float>& samples, float& est) -> bool;
     auto isRayClearedInRangeImage(int az_idx, int el_idx, float voxel_range) const -> bool;
 
     Config cfg_;
@@ -131,11 +132,16 @@ private:
     std::unordered_map<VoxelKey, DynamicVoxel, VoxelKeyHash> active_voxels_;
     std::vector<float> range_img_; // kAzBins * kElBins，0.0f 表示该角格无回波，>0 表示该角格最小测距 (m)
     std::vector<float> drift_samples_;
+    std::vector<float> drift_wide_samples_;
+    std::vector<float> drift_inliers_;
     std::vector<VoxelKey> erase_scratch_;
+    std::vector<VoxelKey> confirmed_voxels_scratch_;
+    std::vector<uint64_t> emitted_xy_scratch_;
 
     uint32_t frame_seq_ = 0;
     float delta_z_ = 0.0f;
     bool has_delta_z_ = false;
+    int drift_miss_frames_ = 0;
     const StaticTerrainPrior* last_prior_ptr_ = nullptr;
 
     bool has_prev_pose_ = false;

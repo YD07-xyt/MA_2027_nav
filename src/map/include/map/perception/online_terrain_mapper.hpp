@@ -124,11 +124,7 @@ private:
     auto findChunkLocked(const ChunkKey& key) const -> const Chunk*;
     auto findChunkMutableLocked(const ChunkKey& key) -> Chunk*;
 
-    auto castClearRayLocked(
-        const Eigen::Vector3d& origin,
-        const Eigen::Vector3d& target,
-        uint32_t frame_seq
-    ) -> void;
+    auto castClearRayLocked(const Eigen::Vector3d& origin, const Eigen::Vector3d& target, uint32_t frame_seq) -> void;
 
     auto extractColumnGridLocked(int32_t min_vx, int32_t max_vx, int32_t min_vy, int32_t max_vy) const
         -> StaticTerrainBuilder::VoxelColumnGrid;
@@ -140,6 +136,7 @@ private:
     mutable std::mutex mtx_;
     std::unordered_map<ChunkKey, std::unique_ptr<Chunk>, ChunkKeyHash> chunks_;
     std::unordered_map<uint64_t, float> footprint_ground_;
+    std::vector<Eigen::Vector3d> clear_targets_scratch_; // 每帧复用，避免 3D DDA 目标列表重复分配
     uint32_t frame_seq_ = 0;
     bool has_prev_pose_ = false;
     Eigen::Quaterniond prev_q_base_w_ = Eigen::Quaterniond::Identity();

@@ -314,6 +314,15 @@ auto LayeredMap::getStaticNavContext() const -> StaticNavContext {
         if (static_esdf_dirty_.load(std::memory_order_relaxed)) {
             rebuildStaticEsdfLocked();
         }
+        // 在持有 back_mtx_ 的同一临界区内捕获三个指针，避免 rebuild 释放 back_mtx_ 后、
+        // 重新获取 front_mtx_ 之前被写线程插入发布新快照导致上下文错位。
+        // 锁序保持 back_mtx_ -> front_mtx_。
+        std::lock_guard<std::mutex> front_lock(front_mtx_);
+        StaticNavContext ctx;
+        ctx.static_esdf = front_static_esdf_;
+        ctx.terrain_prior = front_terrain_prior_;
+        ctx.current_snapshot = front_snapshot_;
+        return ctx;
     }
     std::lock_guard<std::mutex> lock(front_mtx_);
     StaticNavContext ctx;
@@ -536,9 +545,12 @@ auto LayeredMap::publishComposedLocked(bool force_publish) -> void {
     }
 
     auto slot = snapshot_pool_->acquire();
-    if (same_occ && !same_oob && slot.map->copyOccAndEsdfFrom(*current_front)) {
-        // 仅越界策略变化且占据未变：直接复用 ESDF 并更新越界策略（递增 esdf_revision_ 与 revision_）
-        slot.map->setOutOfBoundsPolicy(oob_policy_);
+    // 几何与占据完全一致时（无论 oob 是否变化、是否 force_publish）直接复用已算好的 ESDF，
+    // 避免对相同 composed_occ_ 反复做全图 2D ESDF 重建；几何或占据变化时才必须重建。
+    if (same_geom && same_occ && slot.map->copyOccAndEsdfFrom(*current_front)) {
+        if (!same_oob) {
+            slot.map->setOutOfBoundsPolicy(oob_policy_);
+        }
     } else {
         current_front.reset();
         slot.map->setOutOfBoundsPolicy(oob_policy_);

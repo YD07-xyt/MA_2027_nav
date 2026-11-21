@@ -4,6 +4,7 @@
 #include <Eigen/Geometry>
 
 #include <atomic>
+#include <limits>
 #include <span>
 
 namespace ma_map {
@@ -23,6 +24,9 @@ struct SensorPose {
     }
 
     auto worldToLidar(const Eigen::Vector3d& p_world) const -> Eigen::Vector3d {
+        if (!p_world.allFinite() || !p_lidar_w.allFinite() || !R_lidar_w.allFinite()) {
+            return Eigen::Vector3d::Constant(std::numeric_limits<double>::quiet_NaN());
+        }
         return R_lidar_w * (p_world - p_lidar_w);
     }
 };

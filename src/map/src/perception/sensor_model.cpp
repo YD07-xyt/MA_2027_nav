@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <utility>
 #include <vector>
 
 namespace ma_map {
@@ -25,6 +26,72 @@ SensorModel::SensorModel(const Config& cfg) {
 
 auto SensorModel::setConfig(const Config& cfg) -> void {
     cfg_ = cfg;
+    const Config defaults {};
+
+    auto sanitizeVec3 = [](Eigen::Vector3d& v, const Eigen::Vector3d& def, const char* name) {
+        if (!v.allFinite()) {
+            logger::MaMap->warn(
+                "[SensorModel] non-finite {} [{}, {}, {}]; falling back to default [{}, {}, {}]",
+                name,
+                v.x(),
+                v.y(),
+                v.z(),
+                def.x(),
+                def.y(),
+                def.z()
+            );
+            v = def;
+        }
+    };
+    auto sanitizeScalar = [](double& v, double def, const char* name) {
+        if (!std::isfinite(v)) {
+            logger::MaMap->warn("[SensorModel] non-finite {} = {}; falling back to {}", name, v, def);
+            v = def;
+        }
+    };
+
+    sanitizeVec3(cfg_.t_base_lidar, defaults.t_base_lidar, "t_base_lidar");
+    sanitizeVec3(cfg_.rpy_deg, defaults.rpy_deg, "rpy_deg");
+    sanitizeVec3(cfg_.self_filter_min, defaults.self_filter_min, "self_filter_min");
+    sanitizeVec3(cfg_.self_filter_max, defaults.self_filter_max, "self_filter_max");
+
+    sanitizeScalar(cfg_.min_range, defaults.min_range, "min_range");
+    sanitizeScalar(cfg_.max_range, defaults.max_range, "max_range");
+    sanitizeScalar(cfg_.fov_min_elev_deg, defaults.fov_min_elev_deg, "fov_min_elev_deg");
+    sanitizeScalar(cfg_.fov_max_elev_deg, defaults.fov_max_elev_deg, "fov_max_elev_deg");
+    sanitizeScalar(cfg_.fov_margin_deg, defaults.fov_margin_deg, "fov_margin_deg");
+
+    if (cfg_.min_range < 0.0) {
+        logger::MaMap->warn("[SensorModel] negative min_range {}; clamping to 0", cfg_.min_range);
+        cfg_.min_range = 0.0;
+    }
+    if (cfg_.max_range < cfg_.min_range) {
+        logger::MaMap->warn(
+            "[SensorModel] max_range {} < min_range {}; clamping max_range to min_range",
+            cfg_.max_range,
+            cfg_.min_range
+        );
+        cfg_.max_range = cfg_.min_range;
+    }
+    if (cfg_.fov_margin_deg < 0.0) {
+        // 视场边界容差必须为非负扩张量，负值会反向收窄视场。
+        logger::MaMap->warn("[SensorModel] negative fov_margin_deg {}; clamping to 0", cfg_.fov_margin_deg);
+        cfg_.fov_margin_deg = 0.0;
+    }
+    if (cfg_.fov_min_elev_deg > cfg_.fov_max_elev_deg) {
+        logger::MaMap->warn(
+            "[SensorModel] fov_min_elev_deg {} > fov_max_elev_deg {}; swapping bounds",
+            cfg_.fov_min_elev_deg,
+            cfg_.fov_max_elev_deg
+        );
+        std::swap(cfg_.fov_min_elev_deg, cfg_.fov_max_elev_deg);
+    }
+    for (int i = 0; i < 3; ++i) {
+        if (cfg_.self_filter_min[i] > cfg_.self_filter_max[i]) {
+            std::swap(cfg_.self_filter_min[i], cfg_.self_filter_max[i]);
+        }
+    }
+
     const double roll = cfg_.rpy_deg.x() * kDegToRad;
     const double pitch = cfg_.rpy_deg.y() * kDegToRad;
     const double yaw = cfg_.rpy_deg.z() * kDegToRad;
@@ -45,9 +112,9 @@ auto SensorModel::setConfig(const Config& cfg) -> void {
 
 auto SensorModel::computePose(const Eigen::Vector3d& p_base_w, const Eigen::Quaterniond& q_base_w) const -> SensorPose {
     SensorPose pose;
-    pose.p_base_w = p_base_w;
-    const Eigen::Quaterniond q_norm =
-        (q_base_w.squaredNorm() > 1e-12) ? q_base_w.normalized() : Eigen::Quaterniond::Identity();
+    pose.p_base_w = p_base_w.allFinite() ? p_base_w : Eigen::Vector3d::Zero();
+    const bool q_valid = q_base_w.coeffs().allFinite() && q_base_w.squaredNorm() > 1e-12;
+    const Eigen::Quaterniond q_norm = q_valid ? q_base_w.normalized() : Eigen::Quaterniond::Identity();
     pose.R_w_base = q_norm.toRotationMatrix();
     const Eigen::Matrix3d R_bw = pose.R_w_base.transpose();
     pose.R_base_w = R_bw;
@@ -71,6 +138,9 @@ auto SensorModel::inFov(const Eigen::Vector3d& p_lidar) const -> bool {
 }
 
 auto SensorModel::inFov(const Eigen::Vector3d& p_lidar, double max_range_override) const -> bool {
+    if (!p_lidar.allFinite() || !std::isfinite(max_range_override)) {
+        return false;
+    }
     const double r_sq = p_lidar.squaredNorm();
     const double r_max_sq = max_range_override * max_range_override;
     if (r_sq < min_range_sq_ || r_sq > r_max_sq) {

@@ -327,31 +327,67 @@ private:
         std::vector<int>& v,
         std::vector<double>& z
     ) {
+        const double kInf = std::numeric_limits<double>::infinity();
+        const double kMax = std::numeric_limits<double>::max();
+
+        // 用 -inf / +inf 作为抛物线下包络哨兵；+inf / DBL_MAX 输入代表“本方向无占据元”，
+        // 直接跳过不参与下包络构造，避免 inf - inf = NaN。
+        bool has_site = false;
         int k = start;
         v[start] = start;
-        z[start] = -std::numeric_limits<double>::max();
-        z[start + 1] = std::numeric_limits<double>::max();
+        z[start] = -kInf;
+        z[start + 1] = kInf;
 
-        for (int q = start + 1; q <= end; q++) {
-            k++;
-            double s;
+        for (int q = start; q <= end; q++) {
+            const double fq = f_get_val(q);
+            if (!std::isfinite(fq) || fq >= kMax) {
+                continue;
+            }
+            if (!has_site) {
+                has_site = true;
+                k = start;
+                v[start] = q;
+                z[start] = -kInf;
+                z[start + 1] = kInf;
+                continue;
+            }
 
+            ++k;
+            double s = 0.0;
             do {
-                k--;
-                s = ((f_get_val(q) + q * q) - (f_get_val(v[k]) + v[k] * v[k])) / (2 * q - 2 * v[k]);
+                // k 永远不能递减到 start 以下（start 是最左有效站点）。
+                if (k <= start) {
+                    s = -kInf;
+                    break;
+                }
+                --k;
+                const double fk = f_get_val(v[k]);
+                const double denom = 2.0 * static_cast<double>(q) - 2.0 * static_cast<double>(v[k]);
+                s = ((fq + static_cast<double>(q) * static_cast<double>(q))
+                     - (fk + static_cast<double>(v[k]) * static_cast<double>(v[k])))
+                    / denom;
             } while (s <= z[k]);
 
             k++;
             v[k] = q;
             z[k] = s;
-            z[k + 1] = std::numeric_limits<double>::max();
+            z[k + 1] = kInf;
+        }
+
+        if (!has_site) {
+            for (int q = start; q <= end; q++) {
+                f_set_val(q, kInf);
+            }
+            return;
         }
 
         k = start;
         for (int q = start; q <= end; q++) {
-            while (z[k + 1] < q)
+            while (z[k + 1] < static_cast<double>(q)) {
                 k++;
-            double val = (q - v[k]) * (q - v[k]) + f_get_val(v[k]);
+            }
+            const double dq = static_cast<double>(q) - static_cast<double>(v[k]);
+            const double val = dq * dq + f_get_val(v[k]);
             f_set_val(q, val);
         }
     }

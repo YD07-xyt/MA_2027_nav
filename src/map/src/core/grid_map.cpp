@@ -357,7 +357,21 @@ auto GridMap::isCollision(const Eigen::Vector2d& pos, double safe_threshold) con
             computeBoundaryDistanceAndNormal(pos, d_bound, nullptr);
             distance = std::min(distance, d_bound);
         }
-        return distance < safe_threshold;
+        // 占据/边界格 ESDF 恰为 0.0：safe_threshold <= 0 时 distance < threshold 会漏判，
+        // 因此显式把非正 ESDF（占据或贴边）视为碰撞；孤立单格障碍的离中心点双线性 ESDF 略大于 0
+        // （理论上界 <= 0.854 * resolution），在 distance < resolution 时补查格内原始占据位，
+        // 既杜绝离中心点穿透单格障碍，又对远处自由格零额外开销。
+        if (distance <= 0.0 || distance < safe_threshold) {
+            return true;
+        }
+        if (distance < geometry_.resolution) {
+            Eigen::Vector2i idx;
+            posToIndex(pos, idx);
+            if (isInMap(idx) && occ_buffer_[toAddress(idx)] != 0) {
+                return true;
+            }
+        }
+        return false;
     }
     if (!pos.allFinite()) {
         return true;
@@ -369,15 +383,23 @@ auto GridMap::isLineOccupancy(const Eigen::Vector2d& p1, const Eigen::Vector2d& 
     if (!geometry_.isValid()) {
         return oob_policy_ == OutOfBoundsPolicy::OCCUPIED;
     }
+    if (!p1.allFinite() || !p2.allFinite()) {
+        return true;
+    }
     const Eigen::Vector2d diff = p2 - p1;
     const double max_dist = diff.norm();
     if (max_dist < 1e-6) return isCollision(p1);
 
+    // 采样步长 <= 0.25 * resolution（远小于 0.5 * resolution），保证对角线不会跨过角点障碍。
+    const double step = std::max(1e-6, geometry_.resolution * 0.25);
+    const int n_steps = std::max(1, static_cast<int>(std::ceil(max_dist / step)));
     const Eigen::Vector2d dir = diff / max_dist;
-    const double step = geometry_.resolution * 0.1;
 
-    for (double d = 0.0; d <= max_dist; d += step) {
-        const Eigen::Vector2d pt = p1 + dir * d;
+    // 始终显式检查两个精确端点，避免采样点因浮点累加错过 p2。
+    if (isCollision(p1)) return true;
+    if (isCollision(p2)) return true;
+    for (int i = 1; i < n_steps; ++i) {
+        const Eigen::Vector2d pt = p1 + dir * (static_cast<double>(i) * step);
         if (isCollision(pt)) return true;
     }
     return false;
@@ -476,7 +498,7 @@ auto GridMap::updateESDF(EsdfWorkspace* workspace) -> void {
 
     for (int x = 0; x < rows; ++x) {
         fillESDF(
-            [&](int y) { return occ_buffer_[toAddress(x, y)] ? 0.0 : std::numeric_limits<double>::max(); },
+            [&](int y) { return occ_buffer_[toAddress(x, y)] ? 0.0 : std::numeric_limits<double>::infinity(); },
             [&](int y, double val) { tmp_buffer(x, y) = val; },
             0,
             cols - 1,
@@ -498,7 +520,7 @@ auto GridMap::updateESDF(EsdfWorkspace* workspace) -> void {
 
     for (int x = 0; x < rows; ++x) {
         fillESDF(
-            [&](int y) { return occ_buffer_[toAddress(x, y)] == 0 ? 0.0 : std::numeric_limits<double>::max(); },
+            [&](int y) { return occ_buffer_[toAddress(x, y)] == 0 ? 0.0 : std::numeric_limits<double>::infinity(); },
             [&](int y, double val) { tmp_buffer(x, y) = val; },
             0,
             cols - 1,

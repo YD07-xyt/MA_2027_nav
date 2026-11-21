@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <unordered_set>
 
 namespace ma_map {
 
@@ -11,6 +10,8 @@ namespace {
     constexpr double kPi = 3.14159265358979323846;
     constexpr double kHalfPi = 0.5 * kPi;
     constexpr double kRadToDeg = 180.0 / kPi;
+    constexpr float kNarrowDriftGate = 0.25f; // 已锁定后允许跟踪的窄门限 (m)
+    constexpr int kDriftReacquireMissFrames = 3; // 连续窄门限丢失帧数达到后立即用宽门限重捕获
 
     inline auto packXY(int32_t vx, int32_t vy) -> uint64_t {
         return (static_cast<uint64_t>(static_cast<uint32_t>(vx)) << 32U)
@@ -54,17 +55,26 @@ auto DynamicStvlLayer::setConfig(const Config& cfg) -> void {
     inv_voxel_size_ = 1.0 / cfg_.voxel_size;
     range_img_.assign(static_cast<size_t>(kAzBins) * static_cast<size_t>(kElBins), 0.0f);
     drift_samples_.reserve(2048);
+    drift_wide_samples_.reserve(2048);
+    drift_inliers_.reserve(2048);
     erase_scratch_.reserve(512);
+    confirmed_voxels_scratch_.reserve(std::min<size_t>(cfg_.max_active_voxels, 4096));
+    emitted_xy_scratch_.reserve(std::min<size_t>(cfg_.max_active_voxels, 4096));
 }
 
 auto DynamicStvlLayer::reset() -> void {
     active_voxels_.clear();
     std::fill(range_img_.begin(), range_img_.end(), 0.0f);
     drift_samples_.clear();
+    drift_wide_samples_.clear();
+    drift_inliers_.clear();
     erase_scratch_.clear();
+    confirmed_voxels_scratch_.clear();
+    emitted_xy_scratch_.clear();
     frame_seq_ = 0;
     delta_z_ = 0.0f;
     has_delta_z_ = false;
+    drift_miss_frames_ = 0;
     last_prior_ptr_ = nullptr;
     has_prev_pose_ = false;
     prev_q_base_w_ = Eigen::Quaterniond::Identity();
@@ -122,20 +132,22 @@ auto DynamicStvlLayer::updateDriftEstimate(
     if (prior == nullptr || !prior->isValid()) {
         delta_z_ = 0.0f;
         has_delta_z_ = false;
+        drift_miss_frames_ = 0;
         last_prior_ptr_ = nullptr;
         return;
     }
     if (prior != last_prior_ptr_) {
         delta_z_ = 0.0f;
         has_delta_z_ = false;
+        drift_miss_frames_ = 0;
         last_prior_ptr_ = prior;
     }
 
     drift_samples_.clear();
+    drift_wide_samples_.clear();
     const double max_r_sq = cfg_.nav_max_range * cfg_.nav_max_range;
     const double min_r_sq = sensor.config().min_range * sensor.config().min_range;
     const size_t stride = std::max<size_t>(1, pts_world.size() / 2048);
-    const float gate = has_delta_z_ ? 0.25f : cfg_.drift_max_abs;
 
     for (size_t i = 0; i < pts_world.size(); i += stride) {
         const Eigen::Vector3d& pw = pts_world[i];
@@ -162,43 +174,79 @@ auto DynamicStvlLayer::updateDriftEstimate(
             continue;
         }
         const float diff = static_cast<float>(pw.z()) - gz;
-        if (std::abs(diff - delta_z_) <= gate) {
-            drift_samples_.push_back(diff);
+        if (std::abs(diff) > cfg_.drift_max_abs) {
+            continue;
         }
+        if (!has_delta_z_) {
+            // 首次捕获用宽门限（绝对物理漂移上限），避免初始 LIO 漂移超过 0.25m 时锁死。
+            drift_samples_.push_back(diff);
+        } else {
+            drift_wide_samples_.push_back(diff);
+            if (std::abs(diff - delta_z_) <= kNarrowDriftGate) {
+                drift_samples_.push_back(diff);
+            }
+        }
+    }
+
+    if (has_delta_z_) {
+        if (static_cast<int>(drift_samples_.size()) < cfg_.drift_min_samples) {
+            if (drift_miss_frames_ < kDriftReacquireMissFrames) {
+                ++drift_miss_frames_;
+            }
+            // LIO Z 突跳 > 0.25m 时（即使有少量噪声点落在旧窄门限内），连续丢失 3 帧后用宽门限样本立即重捕获。
+            if (drift_miss_frames_ >= kDriftReacquireMissFrames
+                && static_cast<int>(drift_wide_samples_.size()) >= cfg_.drift_min_samples)
+            {
+                float est = 0.0f;
+                if (estimateRobustDrift(drift_wide_samples_, est)) {
+                    delta_z_ = est;
+                    drift_miss_frames_ = 0;
+                }
+            }
+            return;
+        }
+        drift_miss_frames_ = 0;
     }
 
     if (static_cast<int>(drift_samples_.size()) < cfg_.drift_min_samples) {
         return;
     }
 
-    // 用第 25 百分位作为地面下界锚点，再取 [p25 - 0.04, p25 + 0.06] 的中位数，
-    // 在无障碍时零偏估计，有低矮动态障碍时完全免疫上拉。
-    const size_t q25_idx = drift_samples_.size() / 4;
-    std::nth_element(
-        drift_samples_.begin(),
-        drift_samples_.begin() + static_cast<std::ptrdiff_t>(q25_idx),
-        drift_samples_.end()
-    );
-    const float p25 = drift_samples_[q25_idx];
-
-    std::vector<float> inliers;
-    inliers.reserve(drift_samples_.size());
-    for (float d: drift_samples_) {
-        if (d >= p25 - 0.04f && d <= p25 + 0.06f) {
-            inliers.push_back(d);
-        }
-    }
-    if (static_cast<int>(inliers.size()) < std::max(10, cfg_.drift_min_samples / 2)) {
+    float est = 0.0f;
+    if (!estimateRobustDrift(drift_samples_, est)) {
         return;
     }
-
-    const float est = std::clamp(medianOf(inliers), -cfg_.drift_max_abs, cfg_.drift_max_abs);
     if (!has_delta_z_) {
         delta_z_ = est;
         has_delta_z_ = true;
     } else {
         delta_z_ = std::clamp(0.65f * delta_z_ + 0.35f * est, -cfg_.drift_max_abs, cfg_.drift_max_abs);
     }
+}
+
+auto DynamicStvlLayer::estimateRobustDrift(std::vector<float>& samples, float& est) -> bool {
+    if (static_cast<int>(samples.size()) < cfg_.drift_min_samples) {
+        return false;
+    }
+
+    // 用第 25 百分位作为地面下界锚点，再取 [p25 - 0.04, p25 + 0.06] 的中位数，
+    // 在无障碍时零偏估计，有低矮动态障碍时完全免疫上拉。
+    const size_t q25_idx = samples.size() / 4;
+    std::nth_element(samples.begin(), samples.begin() + static_cast<std::ptrdiff_t>(q25_idx), samples.end());
+    const float p25 = samples[q25_idx];
+
+    drift_inliers_.clear();
+    for (float d: samples) {
+        if (d >= p25 - 0.04f && d <= p25 + 0.06f) {
+            drift_inliers_.push_back(d);
+        }
+    }
+    if (static_cast<int>(drift_inliers_.size()) < std::max(10, cfg_.drift_min_samples / 2)) {
+        return false;
+    }
+
+    est = std::clamp(medianOf(drift_inliers_), -cfg_.drift_max_abs, cfg_.drift_max_abs);
+    return true;
 }
 
 auto DynamicStvlLayer::isRayClearedInRangeImage(int az_idx, int el_idx, float voxel_range) const -> bool {
@@ -275,15 +323,16 @@ auto DynamicStvlLayer::update(
 
         std::fill(range_img_.begin(), range_img_.end(), 0.0f);
 
-        const StaticTerrainPrior* prior =
-            (static_ctx.terrain_prior && static_ctx.terrain_prior->isValid()) ? static_ctx.terrain_prior.get() : nullptr;
+        const StaticTerrainPrior* prior = (static_ctx.terrain_prior && static_ctx.terrain_prior->isValid())
+            ? static_ctx.terrain_prior.get()
+            : nullptr;
         const grid_map::GridMap* static_esdf = static_ctx.static_esdf.get();
         const grid_map::GridMap* sem_snap = static_ctx.current_snapshot.get();
 
         const double min_r_sq = sensor.config().min_range * sensor.config().min_range;
         const double sensor_max_r_sq = sensor.config().max_range * sensor.config().max_range;
         const double nav_max_r_sq = cfg_.nav_max_range * cfg_.nav_max_range;
-        const float fallback_g_z = static_cast<float>(pose.p_base_w.z() - cfg_.fallback_ground_offset);
+        const Eigen::Vector3d base_z_axis = pose.R_w_base.col(2);
 
         for (const Eigen::Vector3d& pw: pts_world) {
             if (!pw.allFinite() || sensor.isSelfHit(pw, pose)) {
@@ -300,8 +349,8 @@ auto DynamicStvlLayer::update(
             int az_idx = 0;
             int el_idx = 0;
             lidarDirToBins(pl, az_idx, el_idx);
-            float& bin_r = range_img_[static_cast<size_t>(el_idx) * static_cast<size_t>(kAzBins)
-                                      + static_cast<size_t>(az_idx)];
+            float& bin_r =
+                range_img_[static_cast<size_t>(el_idx) * static_cast<size_t>(kAzBins) + static_cast<size_t>(az_idx)];
             if (bin_r <= 0.0f || r_f < bin_r) {
                 bin_r = r_f;
             }
@@ -326,20 +375,29 @@ auto DynamicStvlLayer::update(
                 }
             }
 
-            // 2.5D 地面高度与悬空下沿剥离
-            float g_z = fallback_g_z;
+            // 2.5D 地面高度与悬空下沿剥离：有先验时用先验地面 + Z 漂移；
+            // 无先验（或先验缺格）时用机体倾斜地面平面，避免上下坡把坡面点误判为动态障碍。
+            float height_above_ground = 0.0f;
             float z_corr = static_cast<float>(pw.z());
+            bool used_prior = false;
             if (prior != nullptr) {
+                z_corr = static_cast<float>(pw.z()) - delta_z_;
                 const float prior_gz = prior->sampleGroundZ(xy, 2);
                 if (std::isfinite(prior_gz)) {
-                    g_z = prior_gz;
-                    z_corr = static_cast<float>(pw.z()) - delta_z_;
+                    height_above_ground = z_corr - prior_gz;
+                    used_prior = true;
                 }
+            }
+            if (!used_prior) {
+                // z_rel_base = base_z_axis · (pw - p_base)：平地时 base_z_axis=(0,0,1)，
+                // 完全退化为 pw.z - (p_base.z - fallback_ground_offset)。
+                const Eigen::Vector3d rel = pw - pose.p_base_w;
+                height_above_ground = static_cast<float>(base_z_axis.dot(rel)) + cfg_.fallback_ground_offset;
             }
 
             const float r_xy = static_cast<float>(std::sqrt(r_xy_sq));
             const float ground_margin = cfg_.ground_margin_base + cfg_.ground_margin_per_m * r_xy;
-            if (z_corr < g_z + ground_margin || z_corr > g_z + cfg_.dynamic_max_height) {
+            if (height_above_ground < ground_margin || height_above_ground > cfg_.dynamic_max_height) {
                 continue;
             }
 
@@ -349,9 +407,8 @@ auto DynamicStvlLayer::update(
                 if (std::isfinite(oh_z) && z_corr >= oh_z - cfg_.overhang_margin) {
                     continue;
                 }
-            } else if (sem_snap != nullptr && sem_snap->isInsideMap(xy)
-                       && sem_snap->is_tunnel(xy)
-                       && z_corr >= g_z + cfg_.tunnel_clearance_z)
+            } else if (sem_snap != nullptr && sem_snap->isInsideMap(xy) && sem_snap->is_tunnel(xy)
+                       && height_above_ground >= cfg_.tunnel_clearance_z)
             {
                 continue;
             }
@@ -417,7 +474,9 @@ auto DynamicStvlLayer::update(
 
         const Eigen::Vector3d pl = pose.worldToLidar(p_vox);
         const bool in_fov = sensor.inFov(pl, cfg_.nav_max_range);
-        if (!tilt_held && in_fov) {
+        // 射线清除不再受名义 inFov() 硬门控：只要极坐标深度图在体素方向存在严格更远的真实回波，
+        // 该激光束就物理穿过了体素（即使落在视场边界容差附近）。in_fov 仍只用于选择衰减时间常数。
+        if (!tilt_held && pl.allFinite()) {
             int az_idx = 0;
             int el_idx = 0;
             lidarDirToBins(pl, az_idx, el_idx);
@@ -438,12 +497,12 @@ auto DynamicStvlLayer::update(
     }
 
     // 4. 动态体素确认（2 帧确认，或单帧 3D 成簇即刻确认）并投影到 2D obstacle_cells
-    std::unordered_set<uint64_t> emitted_xy;
-    emitted_xy.reserve(active_voxels_.size());
+    // 使用可复用 scratch 向量排序去重，避免每帧构造 unordered_set 的节点分配。
     if (debug_cloud != nullptr) {
         debug_cloud->clear();
         debug_cloud->reserve(active_voxels_.size());
     }
+    confirmed_voxels_scratch_.clear();
 
     for (const auto& kv: active_voxels_) {
         const VoxelKey& key = kv.first;
@@ -471,15 +530,42 @@ auto DynamicStvlLayer::update(
             continue;
         }
 
-        const double wx = (static_cast<double>(key.vx) + 0.5) * cfg_.voxel_size;
-        const double wy = (static_cast<double>(key.vy) + 0.5) * cfg_.voxel_size;
-        const double wz = (static_cast<double>(key.vz) + 0.5) * cfg_.voxel_size;
+        confirmed_voxels_scratch_.push_back(key);
         if (debug_cloud != nullptr) {
-            debug_cloud->emplace_back(static_cast<float>(wx), static_cast<float>(wy), static_cast<float>(wz));
+            debug_cloud->emplace_back(
+                static_cast<float>((static_cast<double>(key.vx) + 0.5) * cfg_.voxel_size),
+                static_cast<float>((static_cast<double>(key.vy) + 0.5) * cfg_.voxel_size),
+                static_cast<float>((static_cast<double>(key.vz) + 0.5) * cfg_.voxel_size)
+            );
         }
-        if (emitted_xy.insert(packXY(key.vx, key.vy)).second) {
-            frame.obstacle_cells.emplace_back(wx, wy, wz);
+    }
+
+    std::sort(
+        confirmed_voxels_scratch_.begin(),
+        confirmed_voxels_scratch_.end(),
+        [](const VoxelKey& a, const VoxelKey& b) {
+            if (a.vx != b.vx) {
+                return a.vx < b.vx;
+            }
+            if (a.vy != b.vy) {
+                return a.vy < b.vy;
+            }
+            return a.vz < b.vz;
         }
+    );
+
+    emitted_xy_scratch_.clear();
+    for (const VoxelKey& key: confirmed_voxels_scratch_) {
+        const uint64_t xy = packXY(key.vx, key.vy);
+        if (!emitted_xy_scratch_.empty() && emitted_xy_scratch_.back() == xy) {
+            continue;
+        }
+        emitted_xy_scratch_.push_back(xy);
+        frame.obstacle_cells.emplace_back(
+            (static_cast<double>(key.vx) + 0.5) * cfg_.voxel_size,
+            (static_cast<double>(key.vy) + 0.5) * cfg_.voxel_size,
+            (static_cast<double>(key.vz) + 0.5) * cfg_.voxel_size
+        );
     }
 
     return frame;

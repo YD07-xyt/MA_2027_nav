@@ -23,6 +23,20 @@ namespace {
         if (spans.empty()) {
             return;
         }
+        // 过滤非有限段（NaN/Inf 会让 std::sort 违反严格弱序并触发 UB）并在排序前把倒置上下界归一化。
+        size_t write_in = 0;
+        for (size_t i = 0; i < spans.size(); ++i) {
+            const float z_lo = spans[i].z_lo;
+            const float z_hi = spans[i].z_hi;
+            if (!std::isfinite(z_lo) || !std::isfinite(z_hi)) {
+                continue;
+            }
+            spans[write_in++] = StaticTerrainBuilder::ZSpan {std::min(z_lo, z_hi), std::max(z_lo, z_hi)};
+        }
+        spans.resize(write_in);
+        if (spans.empty()) {
+            return;
+        }
         std::sort(spans.begin(), spans.end(), [](const auto& a, const auto& b) {
             if (a.z_lo != b.z_lo) {
                 return a.z_lo < b.z_lo;
@@ -54,11 +68,7 @@ namespace {
     }
 
     // 计算 [z_bot, z_top] 区间内被射线扫空的总有效覆盖厚度
-    auto clearedCoverage(
-        const std::vector<StaticTerrainBuilder::ZSpan>& cleared,
-        float z_bot,
-        float z_top
-    ) -> float {
+    auto clearedCoverage(const std::vector<StaticTerrainBuilder::ZSpan>& cleared, float z_bot, float z_top) -> float {
         if (cleared.empty() || z_top <= z_bot) {
             return 0.0f;
         }
@@ -154,8 +164,7 @@ auto StaticTerrainBuilder::build(const VoxelColumnGrid& grid) const -> BuildResu
         if (has_cleared && !grid.cleared_spans[idx].empty()) {
             merged_clr = grid.cleared_spans[idx];
             mergeSpans(merged_clr, 0.01f);
-            const float clr_below =
-                clearedCoverage(merged_clr, cfg_.min_ground_height, first_z_lo - 0.02f);
+            const float clr_below = clearedCoverage(merged_clr, cfg_.min_ground_height, first_z_lo - 0.02f);
             if (clr_below >= cfg_.min_cleared_overhang_span) {
                 has_cleared_below[idx] = 1;
             }
@@ -163,6 +172,7 @@ auto StaticTerrainBuilder::build(const VoxelColumnGrid& grid) const -> BuildResu
 
         bool found_ground = false;
         bool hit_vertical_wall = false;
+        bool hard_blocked = false;
         for (size_t k = first_valid; k < merged_occ.size(); ++k) {
             const ZSpan& span = merged_occ[k];
             if (span.z_hi > cfg_.max_ground_height) {
@@ -185,7 +195,12 @@ auto StaticTerrainBuilder::build(const VoxelColumnGrid& grid) const -> BuildResu
                     found_ground = true;
                     break;
                 }
-                // 净空不足：机器人钻不过这段缝隙，继续检查上一段顶面（如高台/台阶面；若为低杆则由阶段 4 步高判障碍）
+                // 净空不足：mergeSpans 已保证上下段之间存在 > gap_fill_distance 的真实空气间隙。
+                // 机器人无法从下方钻过低矮悬空结构，也不能把其顶面当作可行驶地面（否则 3x3 均匀低杆顶会在阶段 4
+                // 被误判为平整地面）。因此整列判为硬障碍。
+                col_kind[idx] = ColKind::HARD_OCC;
+                hard_blocked = true;
+                break;
             } else {
                 col_kind[idx] = ColKind::CANDIDATE_GROUND;
                 raw_ground[idx] = g_cand;
@@ -196,7 +211,7 @@ auto StaticTerrainBuilder::build(const VoxelColumnGrid& grid) const -> BuildResu
         }
 
         if (!found_ground) {
-            if (hit_vertical_wall) {
+            if (hit_vertical_wall || hard_blocked) {
                 col_kind[idx] = ColKind::HARD_OCC;
             } else {
                 col_kind[idx] = ColKind::MAYBE_OVERHANG;
@@ -220,9 +235,9 @@ auto StaticTerrainBuilder::build(const VoxelColumnGrid& grid) const -> BuildResu
                 }
 
                 // 情况 A：射线直接扫空了最低占据下方（即使阶段 1 暂将杆顶当成了 CANDIDATE_GROUND，也纠正为悬空！）
-                const bool ray_confirmed_overhang = (!grid.is_solid_mesh && has_cleared_below[idx] != 0
-                                                     && (kind_snap[idx] == ColKind::MAYBE_OVERHANG
-                                                         || kind_snap[idx] == ColKind::CANDIDATE_GROUND));
+                const bool ray_confirmed_overhang =
+                    (!grid.is_solid_mesh && has_cleared_below[idx] != 0
+                     && (kind_snap[idx] == ColKind::MAYBE_OVERHANG || kind_snap[idx] == ColKind::CANDIDATE_GROUND));
                 // 情况 B：无射线模式（静态 PCD）中高于 max_ground_height 的高空屋顶/桥底，且紧邻双侧均有地面
                 const bool high_arch_candidate =
                     (!has_cleared && kind_snap[idx] == ColKind::MAYBE_OVERHANG && z_lo > cfg_.max_ground_height);
@@ -444,9 +459,7 @@ auto StaticTerrainBuilder::build(const VoxelColumnGrid& grid) const -> BuildResu
                     }
                     const float d_xy = std::hypot(static_cast<float>(dx), static_cast<float>(dy)) * res;
                     if (std::abs(gn - g0) <= d_xy * tan_plane_include + 0.04f) {
-                        plane_pts.push_back(
-                            SamplePt {static_cast<float>(dx) * res, static_cast<float>(dy) * res, gn}
-                        );
+                        plane_pts.push_back(SamplePt {static_cast<float>(dx) * res, static_cast<float>(dy) * res, gn});
                     }
                 }
             }
