@@ -6,6 +6,7 @@
 
 #include <Eigen/Core>
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -62,16 +63,33 @@ public:
 
     // 融入一帧世界系点云与 6-DoF 位姿：
     // - 仅对水平距离 <= trust_range 的点写入命中（每体素每帧最多计 1 次命中，记录连续 [z_min, z_max]）；
-    // - 对距离 <= clear_range 的有效回波执行 3D DDA 扫空（仅遍历已分配 chunk，不分配新内存）；
-    // - 当 build_local_preview=true 时，同步提取车周 preview_radius 内的 LocalTerrainFrame 用于实时 2D 预览。
+    // - 对距离 <= clear_range 的有效回波执行 3D DDA 扫空（优先遍历已分配 chunk；当下方 chunk 正上方已有静态命中块
+    //   且位于 trust_range 与 min_ground_height 之上时，按需分配以记录无地面悬空结构的下沿净空）；
+    // - 当 build_local_preview=true 时，同步提取车周 preview_radius 内的 LocalTerrainFrame 用于实时 2D 预览；
+    // - 当 filtered_cloud != nullptr 时，输出本帧通过前端过滤（finite/Z/自滤/min_range/trust_range）后写入体素的 3D 点云。
     auto integrateFrame(
         std::span<const Eigen::Vector3d> pts_world,
         const SensorPose& pose,
         const Eigen::Quaterniond& q_base_w,
         const SensorModel& sensor,
         bool build_local_preview = true,
-        std::vector<Eigen::Vector3f>* preview_cloud = nullptr
+        std::vector<Eigen::Vector3f>* preview_cloud = nullptr,
+        std::vector<Eigen::Vector3f>* filtered_cloud = nullptr
     ) -> std::optional<LocalTerrainFrame>;
+
+    // 在世界系 AABB [box_min, box_max] 内提取满足静态判据（hits >= static_min_hits 且未被射线扫空）的 3D 体素点云。
+    // 线程安全（内部持有 mtx_）；max_points > 0 时截断上限以限制可视化带宽；返回当前单调版本号。
+    auto extractStaticVoxelCloud(
+        const Eigen::Vector3d& box_min,
+        const Eigen::Vector3d& box_max,
+        std::vector<Eigen::Vector3f>& out,
+        size_t max_points = 300000
+    ) const -> uint64_t;
+
+    // 建图稀疏块单调版本号（integrateFrame 有效写入或 reset 后递增），无锁原子读取。
+    auto revision() const -> uint64_t {
+        return revision_.load(std::memory_order_acquire);
+    }
 
     // 全量扫描所有已累积 3D 稀疏块与脚印地面，统一通过 StaticTerrainBuilder 构建全局三态 2D 图 + 2.5D 地形先验。
     // 无任何有效静态数据时返回 std::nullopt。
@@ -135,6 +153,8 @@ private:
 
     mutable std::mutex mtx_;
     std::unordered_map<ChunkKey, std::unique_ptr<Chunk>, ChunkKeyHash> chunks_;
+    // (cx, cy) -> 已写入静态命中的最大 cz，用于悬空下方按需分配净空块
+    std::unordered_map<uint64_t, int32_t> tile_max_cz_;
     std::unordered_map<uint64_t, float> footprint_ground_;
     std::vector<Eigen::Vector3d> clear_targets_scratch_; // 每帧复用，避免 3D DDA 目标列表重复分配
     uint32_t frame_seq_ = 0;
@@ -142,6 +162,7 @@ private:
     Eigen::Quaterniond prev_q_base_w_ = Eigen::Quaterniond::Identity();
     int tilt_hold_left_ = 0;
     bool chunk_limit_warned_ = false;
+    std::atomic<uint64_t> revision_ {0};
 };
 
 } // namespace ma_map

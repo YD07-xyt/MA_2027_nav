@@ -332,6 +332,14 @@ auto LayeredMap::getStaticNavContext() const -> StaticNavContext {
     return ctx;
 }
 
+auto LayeredMap::getStaticTerrainPrior(uint64_t* revision) const -> std::shared_ptr<const StaticTerrainPrior> {
+    std::lock_guard<std::mutex> lock(front_mtx_);
+    if (revision != nullptr) {
+        *revision = front_terrain_prior_rev_;
+    }
+    return front_terrain_prior_;
+}
+
 auto LayeredMap::defaultSaveOptions() const -> SaveOptions {
     SaveOptions opts;
     opts.crop_to_explored = true;
@@ -592,10 +600,14 @@ auto LayeredMap::rebuildStaticEsdfLocked() const -> void {
     std::shared_ptr<const StaticTerrainPrior> old_prior;
     {
         std::lock_guard<std::mutex> lock(front_mtx_);
+        const bool prior_changed = (front_terrain_prior_.get() != next_prior.get());
         old_static = std::move(front_static_esdf_);
         old_prior = std::move(front_terrain_prior_);
         front_static_esdf_ = std::move(next_static);
         front_terrain_prior_ = std::move(next_prior);
+        if (prior_changed) {
+            ++front_terrain_prior_rev_;
+        }
     }
     static_esdf_dirty_.store(false, std::memory_order_release);
 }

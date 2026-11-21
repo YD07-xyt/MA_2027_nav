@@ -601,7 +601,9 @@ void GlobalPlanner2d::pub_callback() {
     if (!ma_map_) return;
 
     // 纯可视化回调：不包含 cmd_vel/折叠/任务状态等控制关键逻辑。
+    // 先同步 stvl_prior 3D 调试点云按需采集开关（退订时立即关闭采集并释放缓存）；
     // 无订阅者时不取快照、不构建 marker；有订阅时才按 revision 缓存决定是否重绘。
+    visualizer.sync_stvl_viz_capture(*ma_map_);
     if (visualizer.map_viz_active()) {
         visualizer.map_viz_callback(*ma_map_, frame_id);
     }

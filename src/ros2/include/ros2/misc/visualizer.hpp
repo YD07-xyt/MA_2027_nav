@@ -7,13 +7,16 @@
 #include "traj_optimize/gcopter/trajectory.hpp"
 #include "utils/eigen_alias.hpp"
 #include "ros2/color_msg_utils.hpp"
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <vector>
 #include <spdlog/spdlog.h>
 #include <geometry_msgs/msg/point.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
@@ -51,9 +54,15 @@ private:
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr OptPathPub;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr occ_pub, unknown_pub, occ_inf_pub, unknown_inf_pub,
         frontier_pub, esdf_pub, terrain_map_pub;
+    // stvl_prior 独立 3D 可视化话题（不复用 /ma_nav/map/occ，全部按订阅者按需发布）
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr filtered_cloud_pub;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr stvl_dynamic_pub;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr static_3d_pub;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr prior_ground_pub;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr prior_overhang_pub;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr mkr_arr_pub;
 
-    // 2D 地图/ESDF 的 revision 缓存：无订阅者或地图未变化时跳过扫描与消息分配。
+    // 2D 地图/ESDF 与 stvl_prior 3D 调试图层的 revision 缓存：无订阅者或数据未变化时跳过扫描与消息分配。
     // last_subs 用于识别“订阅者从无到有/数量增加”，此时强制重发一帧，避免新 RViz 客户端长时间空白。
     std::optional<uint64_t> occ_map_last_rev_;
     size_t occ_map_last_subs_ = 0;
@@ -61,6 +70,32 @@ private:
     size_t occ_grid_last_subs_ = 0;
     std::optional<uint64_t> esdf_grid_last_rev_;
     size_t esdf_grid_last_subs_ = 0;
+    std::optional<uint64_t> filtered_cloud_last_rev_;
+    size_t filtered_cloud_last_subs_ = 0;
+    std::optional<uint64_t> stvl_dynamic_last_rev_;
+    size_t stvl_dynamic_last_subs_ = 0;
+    std::optional<uint64_t> static_3d_last_rev_;
+    size_t static_3d_last_subs_ = 0;
+    double static_3d_last_pub_sec_ = -1.0;
+    std::optional<uint64_t> prior_ground_last_rev_;
+    size_t prior_ground_last_subs_ = 0;
+    std::optional<uint64_t> prior_overhang_last_rev_;
+    size_t prior_overhang_last_subs_ = 0;
+    std::vector<Eigen::Vector3f> viz_cloud_scratch_;
+
+    static constexpr double kStatic3dMinIntervalSec = 0.5; // 建图静态 3D 体素最高 2 Hz 限频
+    static constexpr size_t kStatic3dMaxPoints = 300000;
+
+    static void reset_if_unsubscribed(
+        const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr& pub,
+        std::optional<uint64_t>& last_rev,
+        size_t& last_subs
+    ) {
+        if (!pub || pub->get_subscription_count() == 0) {
+            last_rev.reset();
+            last_subs = 0;
+        }
+    }
 
     template<typename PublisherT>
     bool
@@ -116,7 +151,30 @@ public:
         unknown_inf_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>("/ma_nav/map/inf_unk", 10);
         esdf_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>("/ma_nav/map/esdf", 10);
         frontier_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>("/ma_nav/map/frontier", 10);
+        filtered_cloud_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>("/ma_nav/map/filtered_cloud", 10);
+        stvl_dynamic_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>("/ma_nav/map/stvl_dynamic", 10);
+        static_3d_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>("/ma_nav/map/static_3d", 10);
+        prior_ground_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>("/ma_nav/map/prior_ground", 10);
+        prior_overhang_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>("/ma_nav/map/prior_overhang", 10);
         mkr_arr_pub = node->create_publisher<visualization_msgs::msg::MarkerArray>("/ma_nav/map/map_bound", 10);
+    }
+
+    // 根据订阅者数量同步 stvl_prior 3D 调试点云采集开关，并在退订时重置 revision 缓存，
+    // 确保无订阅时感知主路径零拷贝、再次订阅时立即可见。
+    void sync_stvl_viz_capture(ma_map::MaMap& ma_map) {
+        const bool sub_filtered = filtered_cloud_pub && filtered_cloud_pub->get_subscription_count() > 0;
+        const bool sub_dynamic = stvl_dynamic_pub && stvl_dynamic_pub->get_subscription_count() > 0;
+        ma_map.set_viz_capture(ma_map::MaMap::VizCaptureFlags {sub_filtered, sub_dynamic});
+
+        reset_if_unsubscribed(filtered_cloud_pub, filtered_cloud_last_rev_, filtered_cloud_last_subs_);
+        reset_if_unsubscribed(stvl_dynamic_pub, stvl_dynamic_last_rev_, stvl_dynamic_last_subs_);
+        if (!static_3d_pub || static_3d_pub->get_subscription_count() == 0) {
+            static_3d_last_rev_.reset();
+            static_3d_last_subs_ = 0;
+            static_3d_last_pub_sec_ = -1.0;
+        }
+        reset_if_unsubscribed(prior_ground_pub, prior_ground_last_rev_, prior_ground_last_subs_);
+        reset_if_unsubscribed(prior_overhang_pub, prior_overhang_last_rev_, prior_overhang_last_subs_);
     }
 
     // 以下两个查询供 pub_callback 在取地图快照前判断是否真的需要可视化，
@@ -124,7 +182,9 @@ public:
     bool map_viz_active() const {
         const auto has_sub = [](const auto& pub) { return pub && pub->get_subscription_count() > 0; };
         return has_sub(unknown_pub) || has_sub(unknown_inf_pub) || has_sub(frontier_pub) || has_sub(occ_pub)
-            || has_sub(occ_inf_pub) || has_sub(esdf_pub) || has_sub(mkr_arr_pub);
+            || has_sub(occ_inf_pub) || has_sub(esdf_pub) || has_sub(filtered_cloud_pub) || has_sub(stvl_dynamic_pub)
+            || has_sub(static_3d_pub) || has_sub(prior_ground_pub) || has_sub(prior_overhang_pub)
+            || has_sub(mkr_arr_pub);
     }
 
     bool needs_grid_map_snapshot() const {
@@ -1360,13 +1420,187 @@ void PubOptPath(SplineTrajectory::PPolyND<2, 6> traj, const std::string& frame_i
         cloud.header.stamp = node->get_clock()->now();
         cloud.header.frame_id = frame_id;
     }
-    void map_viz_callback(ma_map::MaMap& ma_map, std::string frame_id = "world") {
-        auto rog_map = ma_map.get_rog_map();
-        if (!rog_map) {
-            logger::ros2->warn("[ROGMap] Visualization skipped: rog_map is null.");
+    void publishEigenVec3fCloud(
+        const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr& pub,
+        const std::vector<Eigen::Vector3f>& points,
+        const std::string& frame_id
+    ) const {
+        if (!pub) {
             return;
         }
+        static_assert(sizeof(Eigen::Vector3f) == 12, "Eigen::Vector3f must be tightly packed 3 floats");
+        sensor_msgs::msg::PointCloud2 pcl_msg;
+        pcl_msg.header.stamp = node->get_clock()->now();
+        pcl_msg.header.frame_id = frame_id;
+        pcl_msg.height = 1;
+        pcl_msg.width = static_cast<uint32_t>(points.size());
+        pcl_msg.is_dense = true;
+        pcl_msg.is_bigendian = false;
+        pcl_msg.fields.resize(3);
+        pcl_msg.fields[0].name = "x";
+        pcl_msg.fields[0].offset = 0;
+        pcl_msg.fields[0].datatype = sensor_msgs::msg::PointField::FLOAT32;
+        pcl_msg.fields[0].count = 1;
+        pcl_msg.fields[1].name = "y";
+        pcl_msg.fields[1].offset = 4;
+        pcl_msg.fields[1].datatype = sensor_msgs::msg::PointField::FLOAT32;
+        pcl_msg.fields[1].count = 1;
+        pcl_msg.fields[2].name = "z";
+        pcl_msg.fields[2].offset = 8;
+        pcl_msg.fields[2].datatype = sensor_msgs::msg::PointField::FLOAT32;
+        pcl_msg.fields[2].count = 1;
+        pcl_msg.point_step = 12;
+        pcl_msg.row_step = pcl_msg.point_step * pcl_msg.width;
+        if (!points.empty()) {
+            pcl_msg.data.resize(static_cast<size_t>(pcl_msg.row_step));
+            std::memcpy(pcl_msg.data.data(), points.data(), pcl_msg.data.size());
+        }
+        pub->publish(pcl_msg);
+    }
+
+    void publish_stvl_prior_3d_viz(
+        ma_map::MaMap& ma_map,
+        const std::shared_ptr<rog_map::ROGMap>& rog_map,
+        const rog_map::Config& cfg,
+        const std::string& frame_id
+    ) {
+        // 1. 前端过滤后的当帧 3D 点云（建图/导航通用）
+        if (should_publish(
+                filtered_cloud_pub,
+                ma_map.filtered_cloud_revision(),
+                filtered_cloud_last_rev_,
+                filtered_cloud_last_subs_
+            ))
+        {
+            filtered_cloud_last_rev_ = ma_map.copy_filtered_cloud(viz_cloud_scratch_);
+            publishEigenVec3fCloud(filtered_cloud_pub, viz_cloud_scratch_, frame_id);
+        }
+
+        // 2. 导航模式 STVL 已确认动态障碍 3D 体素中心点云
+        if (should_publish(
+                stvl_dynamic_pub,
+                ma_map.dynamic_3d_revision(),
+                stvl_dynamic_last_rev_,
+                stvl_dynamic_last_subs_
+            ))
+        {
+            stvl_dynamic_last_rev_ = ma_map.copy_dynamic_3d_cloud(viz_cloud_scratch_);
+            publishEigenVec3fCloud(stvl_dynamic_pub, viz_cloud_scratch_, frame_id);
+        }
+
+        // 3. 建图模式 OnlineTerrainMapper 累积静态 3D 体素点云（最高 2 Hz 限频，新订阅立即发一帧）
+        if (static_3d_pub && static_3d_pub->get_subscription_count() > 0) {
+            const uint64_t static_rev = ma_map.static_3d_revision();
+            const size_t static_subs = static_3d_pub->get_subscription_count();
+            const bool new_sub = !static_3d_last_rev_.has_value() || static_subs > static_3d_last_subs_;
+            const double now_sec = node->get_clock()->now().seconds();
+            const bool throttled = !new_sub && static_3d_last_pub_sec_ >= 0.0 && now_sec >= static_3d_last_pub_sec_
+                && (now_sec - static_3d_last_pub_sec_) < kStatic3dMinIntervalSec;
+            if (!throttled && should_publish(static_3d_pub, static_rev, static_3d_last_rev_, static_3d_last_subs_)) {
+                const Eigen::Vector3d center = (rog_map && rog_map->robot_state_.p.allFinite())
+                    ? Eigen::Vector3d(rog_map->robot_state_.p)
+                    : Eigen::Vector3d(0.0, 0.0, 0.0);
+                const Eigen::Vector3d half_range = cfg.visualization_range.allFinite()
+                    ? Eigen::Vector3d(0.5 * cfg.visualization_range.cwiseAbs())
+                    : Eigen::Vector3d(50.0, 30.0, 2.0);
+                const Eigen::Vector3d stvl_min(
+                    center.x() - half_range.x(),
+                    center.y() - half_range.y(),
+                    std::min(center.z() - half_range.z(), cfg.perception_map_min_z)
+                );
+                const Eigen::Vector3d stvl_max(
+                    center.x() + half_range.x(),
+                    center.y() + half_range.y(),
+                    std::max(center.z() + half_range.z(), cfg.perception_map_max_z)
+                );
+                static_3d_last_rev_ =
+                    ma_map.extract_static_3d_cloud(stvl_min, stvl_max, viz_cloud_scratch_, kStatic3dMaxPoints);
+                publishEigenVec3fCloud(static_3d_pub, viz_cloud_scratch_, frame_id);
+                static_3d_last_pub_sec_ = now_sec;
+            }
+        }
+
+        // 4. 导航模式 .terrain.bin 2.5D 静态先验（地面高度层与悬空结构下沿层，按先验 revision/新订阅按需发一次）
+        const bool want_prior_ground = prior_ground_pub && prior_ground_pub->get_subscription_count() > 0;
+        const bool want_prior_overhang = prior_overhang_pub && prior_overhang_pub->get_subscription_count() > 0;
+        if (want_prior_ground || want_prior_overhang) {
+            uint64_t prior_rev = 0;
+            const auto prior = ma_map.get_static_terrain_prior(&prior_rev);
+            if (want_prior_ground
+                && should_publish(prior_ground_pub, prior_rev, prior_ground_last_rev_, prior_ground_last_subs_))
+            {
+                viz_cloud_scratch_.clear();
+                if (prior && prior->isValid()) {
+                    const auto& geom = prior->geometry;
+                    const int nx = geom.voxel_num.x();
+                    const int ny = geom.voxel_num.y();
+                    viz_cloud_scratch_.reserve(geom.cellCount());
+                    for (int ix = 0; ix < nx; ++ix) {
+                        const float wx =
+                            static_cast<float>(geom.origin.x() + (static_cast<double>(ix) + 0.5) * geom.resolution);
+                        const size_t row_off = static_cast<size_t>(ix) * static_cast<size_t>(ny);
+                        for (int iy = 0; iy < ny; ++iy) {
+                            const float gz = prior->ground_z[row_off + static_cast<size_t>(iy)];
+                            if (std::isfinite(gz)) {
+                                const float wy = static_cast<float>(
+                                    geom.origin.y() + (static_cast<double>(iy) + 0.5) * geom.resolution
+                                );
+                                viz_cloud_scratch_.emplace_back(wx, wy, gz);
+                            }
+                        }
+                    }
+                }
+                publishEigenVec3fCloud(prior_ground_pub, viz_cloud_scratch_, frame_id);
+            }
+            if (want_prior_overhang
+                && should_publish(prior_overhang_pub, prior_rev, prior_overhang_last_rev_, prior_overhang_last_subs_))
+            {
+                viz_cloud_scratch_.clear();
+                if (prior && prior->isValid()) {
+                    const auto& geom = prior->geometry;
+                    const int nx = geom.voxel_num.x();
+                    const int ny = geom.voxel_num.y();
+                    for (int ix = 0; ix < nx; ++ix) {
+                        const float wx =
+                            static_cast<float>(geom.origin.x() + (static_cast<double>(ix) + 0.5) * geom.resolution);
+                        const size_t row_off = static_cast<size_t>(ix) * static_cast<size_t>(ny);
+                        for (int iy = 0; iy < ny; ++iy) {
+                            const float oz = prior->overhang_min_z[row_off + static_cast<size_t>(iy)];
+                            if (std::isfinite(oz)) {
+                                const float wy = static_cast<float>(
+                                    geom.origin.y() + (static_cast<double>(iy) + 0.5) * geom.resolution
+                                );
+                                viz_cloud_scratch_.emplace_back(wx, wy, oz);
+                            }
+                        }
+                    }
+                }
+                publishEigenVec3fCloud(prior_overhang_pub, viz_cloud_scratch_, frame_id);
+            }
+        }
+    }
+
+    void map_viz_callback(ma_map::MaMap& ma_map, std::string frame_id = "world") {
+        auto rog_map = ma_map.get_rog_map();
         const auto cfg_ = ma_map.get_config();
+
+        if (cfg_.perception_backend == "stvl_prior") {
+            publish_stvl_prior_3d_viz(ma_map, rog_map, cfg_, frame_id);
+        }
+
+        if (!rog_map) {
+            if (cfg_.perception_backend == "legacy_rog") {
+                logger::ros2->warn("[ROGMap] Visualization skipped: rog_map is null.");
+            }
+            return;
+        }
+
+        const bool need_legacy_3d = (cfg_.perception_backend == "legacy_rog");
+        const bool need_mkr_arr = (mkr_arr_pub && mkr_arr_pub->get_subscription_count() > 0);
+        if (!need_legacy_3d && !need_mkr_arr) {
+            return;
+        }
+
         utils::Vec3f box_max = rog_map->robot_state_.p + cfg_.visualization_range / 2;
         utils::Vec3f box_min = rog_map->robot_state_.p - cfg_.visualization_range / 2;
 
@@ -1378,7 +1612,7 @@ void PubOptPath(SplineTrajectory::PPolyND<2, 6> traj, const std::string& frame_i
 
         // stvl_prior 后端下 rog_map 不承载感知数据，跳过 3D 体素 boxSearch/boxSearchInflate
         // 与 ESDF 点云扫描；legacy_rog 保持完整旧可视化。
-        if (cfg_.perception_backend == "legacy_rog") {
+        if (need_legacy_3d) {
             if (cfg_.pub_unknown_map_en && unknown_pub->get_subscription_count() >= 1) {
                 utils::vec_E<utils::Vec3f> unknown_map, inf_unknown_map;
                 rog_map->boxSearch(box_min, box_max, utils::UNKNOWN, unknown_map);

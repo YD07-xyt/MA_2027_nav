@@ -62,6 +62,11 @@
 
 4. 优化建图和导航模式
 
+5. 非法位姿被静默替换为原点，守卫成死代码；NaN 先闯进 ROGMap 做整数转换
+
+6. NAV 依赖的 .terrain.bin 在 map/ 下缺失，加载静默降级且日志不提示
+
+7. stvl_prior 仍完整初始化 ROGMap（≈50 MB），且有进程级 init_once 抛异常
 
 ## 重规划
 

@@ -280,8 +280,15 @@ auto DynamicStvlLayer::update(
     const SensorModel& sensor,
     const StaticNavContext& static_ctx,
     double now_sec,
-    std::vector<Eigen::Vector3f>* debug_cloud
+    std::vector<Eigen::Vector3f>* debug_cloud,
+    std::vector<Eigen::Vector3f>* filtered_cloud
 ) -> LocalTerrainFrame {
+    if (debug_cloud != nullptr) {
+        debug_cloud->clear();
+    }
+    if (filtered_cloud != nullptr) {
+        filtered_cloud->clear();
+    }
     LocalTerrainFrame frame;
     frame.terrain_resolution = cfg_.voxel_size;
     if (pose.p_base_w.allFinite()) {
@@ -333,6 +340,10 @@ auto DynamicStvlLayer::update(
         const double sensor_max_r_sq = sensor.config().max_range * sensor.config().max_range;
         const double nav_max_r_sq = cfg_.nav_max_range * cfg_.nav_max_range;
         const Eigen::Vector3d base_z_axis = pose.R_w_base.col(2);
+        const bool collect_filtered = (filtered_cloud != nullptr);
+        if (collect_filtered && filtered_cloud->capacity() < pts_world.size()) {
+            filtered_cloud->reserve(pts_world.size());
+        }
 
         for (const Eigen::Vector3d& pw: pts_world) {
             if (!pw.allFinite() || sensor.isSelfHit(pw, pose)) {
@@ -342,6 +353,10 @@ auto DynamicStvlLayer::update(
             const double r_sq = pl.squaredNorm();
             if (r_sq < min_r_sq || r_sq > sensor_max_r_sq) {
                 continue;
+            }
+            if (collect_filtered) {
+                filtered_cloud
+                    ->emplace_back(static_cast<float>(pw.x()), static_cast<float>(pw.y()), static_cast<float>(pw.z()));
             }
             const float r_f = static_cast<float>(std::sqrt(r_sq));
 

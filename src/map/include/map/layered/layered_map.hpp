@@ -93,6 +93,8 @@ public:
 
     auto getSnapshot() const -> grid_map::GridMap::ConstPtr;
     auto getStaticNavContext() const -> StaticNavContext;
+    // 轻量获取当前 2.5D 静态地形先验只读快照及其单调版本号（仅持 front_mtx_，不触发 ESDF 重算）。
+    auto getStaticTerrainPrior(uint64_t* revision = nullptr) const -> std::shared_ptr<const StaticTerrainPrior>;
     auto defaultSaveOptions() const -> SaveOptions;
     auto getOccupancyMatrix() const -> grid_map::RowMatrixXi;
     auto getStaticOccupancyMatrix() const -> grid_map::RowMatrixXi;
@@ -123,6 +125,7 @@ private:
     grid_map::GridMap::ConstPtr front_snapshot_;
     mutable grid_map::GridMap::ConstPtr front_static_esdf_;
     mutable std::shared_ptr<const StaticTerrainPrior> front_terrain_prior_;
+    mutable uint64_t front_terrain_prior_rev_ = 0;
     mutable std::atomic<bool> static_esdf_dirty_ {false};
 
     mutable std::mutex back_mtx_;

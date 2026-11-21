@@ -64,6 +64,8 @@ public:
     // 处理一帧导航模式世界系点云：
     // - now_sec >= 0 时使用调用方提供的仿真/回放时间 (s)；now_sec < 0 时自动读取注入的 clock_。
     // - 输出仅包含本帧已确认动态障碍的 LocalTerrainFrame（供 DynamicObstacleLayer 整帧覆盖）。
+    // - debug_cloud != nullptr 时输出已确认的 3D 动态障碍体素中心；
+    // - filtered_cloud != nullptr 时输出本帧通过前端过滤（finite/自滤/min_range/max_range）的 3D 点云。
     auto update(
         std::span<const Eigen::Vector3d> pts_world,
         const SensorPose& pose,
@@ -71,7 +73,8 @@ public:
         const SensorModel& sensor,
         const StaticNavContext& static_ctx,
         double now_sec = -1.0,
-        std::vector<Eigen::Vector3f>* debug_cloud = nullptr
+        std::vector<Eigen::Vector3f>* debug_cloud = nullptr,
+        std::vector<Eigen::Vector3f>* filtered_cloud = nullptr
     ) -> LocalTerrainFrame;
 
     auto estimatedDriftZ() const -> float {

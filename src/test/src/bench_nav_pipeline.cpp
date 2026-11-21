@@ -1298,6 +1298,108 @@ auto run_sanity_checks(BenchEnv& env) -> bool {
             );
             ok &=
                 check(rs.cells[bar_low] == ma_map::CellState::OCCUPIED, "StaticTerrainBuilder 0.16m low bar OCCUPIED");
+
+            // 8c-2. 点云模式：宽厚/分层无地面隧道悬空过滤 + 无地面/开放 0.16m 矮杆保持 OCCUPIED
+            auto tunnel_scene = ma_map::StaticTerrainBuilder::VoxelColumnGrid::create(t_geom, false, true);
+            for (int ix = 0; ix < 40; ++ix) {
+                for (int iy = 0; iy < 20; ++iy) {
+                    const size_t idx = static_cast<size_t>(ix * 20 + iy);
+                    if (ix >= 7 && ix <= 21 && iy >= 3 && iy <= 16) {
+                        // 宽无地面隧道（宽 15 格 = 0.75m > 2 * overhang_ground_radius）：厚顶 + 分层顶 + 薄顶
+                        if (ix <= 11) {
+                            tunnel_scene.occ_spans[idx].push_back({0.30f, 0.48f});
+                        } else if (ix <= 16) {
+                            tunnel_scene.occ_spans[idx].push_back({0.30f, 0.34f});
+                            tunnel_scene.occ_spans[idx].push_back({0.42f, 0.46f});
+                        } else {
+                            tunnel_scene.occ_spans[idx].push_back({0.30f, 0.34f});
+                        }
+                        tunnel_scene.cleared_spans[idx].push_back({0.02f, 0.28f});
+                    } else if (ix >= 25 && ix <= 27 && iy >= 3 && iy <= 16) {
+                        // 无地面 0.16m 低杆（下方有射线扫空但净空 0.16 < 0.225 -> 必须保持 OCCUPIED）
+                        tunnel_scene.occ_spans[idx].push_back({0.16f, 0.20f});
+                        tunnel_scene.cleared_spans[idx].push_back({-0.01f, 0.15f});
+                    } else if (ix >= 30 && ix <= 38 && iy >= 3 && iy <= 16) {
+                        // 有地面但夹层被射线扫空的 0.16m 宽矮雨棚 -> 必须保持 OCCUPIED（不得被高台恢复误放）
+                        tunnel_scene.occ_spans[idx].push_back({-0.01f, 0.01f});
+                        tunnel_scene.occ_spans[idx].push_back({0.16f, 0.20f});
+                        tunnel_scene.cleared_spans[idx].push_back({0.02f, 0.15f});
+                    } else {
+                        tunnel_scene.occ_spans[idx].push_back({-0.01f, 0.01f});
+                    }
+                }
+            }
+            const auto rt = builder.build(tunnel_scene);
+            const size_t tun_thick = static_cast<size_t>(9 * 20 + 10);
+            const size_t tun_deep_split = static_cast<size_t>(14 * 20 + 10);
+            const size_t tun_thin = static_cast<size_t>(19 * 20 + 10);
+            const size_t bar_groundless_low = static_cast<size_t>(26 * 20 + 10);
+            const size_t awning_low = static_cast<size_t>(34 * 20 + 10);
+            ok &= check(
+                rt.cells[tun_thick] == ma_map::CellState::FREE && rt.cells[tun_deep_split] == ma_map::CellState::FREE
+                    && rt.cells[tun_thin] == ma_map::CellState::FREE
+                    && std::abs(rt.terrain_prior.ground_z[tun_deep_split]) < 0.03f
+                    && std::isfinite(rt.terrain_prior.overhang_min_z[tun_deep_split])
+                    && std::abs(rt.terrain_prior.overhang_min_z[tun_deep_split] - 0.30f) < 0.03f,
+                "StaticTerrainBuilder filters wide thick/split groundless tunnel overhang"
+            );
+            ok &= check(
+                rt.cells[bar_groundless_low] == ma_map::CellState::OCCUPIED
+                    && rt.cells[awning_low] == ma_map::CellState::OCCUPIED,
+                "StaticTerrainBuilder keeps groundless 0.16m low bar and ray-cleared 0.16m awning OCCUPIED"
+            );
+
+            // 8c-3. 点云模式：空心高台底缝透射低地漏点恢复 + 内部单格孔洞修补 + 台沿/柱子/窄低杆保持 OCCUPIED
+            auto plat_scene = ma_map::StaticTerrainBuilder::VoxelColumnGrid::create(t_geom, false, true);
+            for (int ix = 0; ix < 40; ++ix) {
+                for (int iy = 0; iy < 20; ++iy) {
+                    const size_t idx = static_cast<size_t>(ix * 20 + iy);
+                    if (ix >= 4 && ix <= 15 && iy >= 4 && iy <= 15) {
+                        if (ix == 4 || ix == 15 || iy == 4 || iy == 15) {
+                            // 高台竖直台沿（HARD_OCC）
+                            plat_scene.occ_spans[idx].push_back({-0.01f, 0.22f});
+                        } else if (ix >= 12 && ix <= 13 && iy >= 12 && iy <= 13) {
+                            // 高台内部 2x2 立柱（HARD_OCC）
+                            plat_scene.occ_spans[idx].push_back({0.18f, 0.60f});
+                        } else if (ix == 9 && iy == 9) {
+                            // 仅剩低地漏点的 1 格内部孔洞
+                            plat_scene.occ_spans[idx].push_back({-0.01f, 0.01f});
+                        } else if (ix == 10 && iy == 10) {
+                            // 未观测扫描缝（1 格内部孔洞）
+                        } else {
+                            // 低地漏点 + 0.20m 高台顶面双层叠置（夹层无射线扫空）
+                            plat_scene.occ_spans[idx].push_back({-0.01f, 0.01f});
+                            plat_scene.occ_spans[idx].push_back({0.18f, 0.22f});
+                        }
+                    } else if (ix >= 22 && ix <= 24 && iy >= 4 && iy <= 15) {
+                        // 0.15m 窄低杆（即使夹层无扫空，宽度不足 0.35m 仍须保持 OCCUPIED）
+                        plat_scene.occ_spans[idx].push_back({-0.01f, 0.01f});
+                        plat_scene.occ_spans[idx].push_back({0.16f, 0.20f});
+                    } else {
+                        plat_scene.occ_spans[idx].push_back({-0.01f, 0.01f});
+                    }
+                }
+            }
+            const auto rp = builder.build(plat_scene);
+            const size_t hp_in = static_cast<size_t>(7 * 20 + 7);
+            const size_t hp_hole_low = static_cast<size_t>(9 * 20 + 9);
+            const size_t hp_hole_unobs = static_cast<size_t>(10 * 20 + 10);
+            const size_t hp_curb = static_cast<size_t>(4 * 20 + 10);
+            const size_t hp_pillar = static_cast<size_t>(12 * 20 + 12);
+            const size_t hp_narrow_bar = static_cast<size_t>(23 * 20 + 10);
+            ok &= check(
+                rp.cells[hp_in] == ma_map::CellState::FREE && rp.cells[hp_hole_low] == ma_map::CellState::FREE
+                    && rp.cells[hp_hole_unobs] == ma_map::CellState::FREE
+                    && std::abs(rp.terrain_prior.ground_z[hp_in] - 0.20f) < 0.03f
+                    && std::abs(rp.terrain_prior.ground_z[hp_hole_low] - 0.20f) < 0.03f
+                    && std::abs(rp.terrain_prior.ground_z[hp_hole_unobs] - 0.20f) < 0.03f,
+                "StaticTerrainBuilder recovers hollow 0.20m platform with leaked low floor and fills 1-cell interior holes"
+            );
+            ok &= check(
+                rp.cells[hp_curb] == ma_map::CellState::OCCUPIED && rp.cells[hp_pillar] == ma_map::CellState::OCCUPIED
+                    && rp.cells[hp_narrow_bar] == ma_map::CellState::OCCUPIED,
+                "StaticTerrainBuilder preserves raised-platform curb, interior pillar, and narrow 0.16m bar OCCUPIED"
+            );
         }
 
         // 8d. OnlineTerrainMapper: 零先验建图 + 信任半径截断远距噪点 + 3D 射线清除动态过客 + 坐标严格对齐
@@ -1384,6 +1486,89 @@ auto run_sanity_checks(BenchEnv& env) -> bool {
                                built->terrain_prior.ground_z[static_cast<size_t>(built->geometry.toAddress(flr_idx))]
                            ) < 0.03f,
                     "OnlineTerrainMapper recovers accurate ground_z"
+                );
+            }
+
+            // 8d-2. 浅向下掠射防误擦除（含 hits==0 预清除保护）+ 跨 chunk Z 边界无地面悬空按需分配净空块
+            {
+                ma_map::OnlineTerrainMapper::Config mcfg2 = mcfg;
+                mcfg2.max_clear_rays_per_frame = 4000;
+                ma_map::OnlineTerrainMapper graze_mapper(mcfg2);
+
+                std::vector<Eigen::Vector3d> graze_only;
+                for (double y = -0.475; y <= 0.475; y += 0.05) {
+                    // origin.z=0.194 -> target.z=0.150（落差 0.044 < 0.05），浅向下掠射经过 x=1.525, z=0.172
+                    graze_only.emplace_back(3.025, y, 0.15);
+                }
+                std::vector<Eigen::Vector3d> graze_with_plat = graze_only;
+                for (double x = 1.025; x <= 2.175; x += 0.05) {
+                    for (double y = -0.475; y <= 0.475; y += 0.05) {
+                        graze_with_plat.emplace_back(x, y, 0.17);
+                    }
+                }
+                for (int f = 0; f < 6; ++f) {
+                    (void)graze_mapper.integrateFrame(graze_only, sp, q_base, sm, false);
+                }
+                for (int f = 0; f < 3; ++f) {
+                    (void)graze_mapper.integrateFrame(graze_with_plat, sp, q_base, sm, false);
+                }
+                const auto g_built = graze_mapper.buildGlobalStaticMap();
+                bool graze_ok = false;
+                if (g_built && g_built->geometry.isValid()) {
+                    const auto pi = g_built->geometry.posToIndex(Eigen::Vector2d(1.525, 0.025));
+                    if (g_built->geometry.isInside(pi)) {
+                        const size_t pa = static_cast<size_t>(g_built->geometry.toAddress(pi));
+                        graze_ok = (g_built->cells[pa] == ma_map::CellState::FREE)
+                            && std::abs(g_built->terrain_prior.ground_z[pa] - 0.17f) < 0.03f;
+                    }
+                }
+                ok &= check(graze_ok, "OnlineTerrainMapper preserves platform top under shallow downward grazing rays");
+
+                ma_map::OnlineTerrainMapper overhang_mapper(mcfg2);
+                std::vector<Eigen::Vector3d> ov_pts;
+                // 前后地面 z=0，中间 x in [1.60, 2.40) 无地面（对应整个 chunk cx=2, cz=0 零命中）
+                for (double x = 0.525; x <= 1.525; x += 0.05) {
+                    for (double y = -0.675; y <= 0.675; y += 0.05) {
+                        ov_pts.emplace_back(x, y, 0.0);
+                    }
+                }
+                for (double x = 2.425; x <= 3.175; x += 0.05) {
+                    for (double y = -0.675; y <= 0.675; y += 0.05) {
+                        ov_pts.emplace_back(x, y, 0.0);
+                    }
+                }
+                // 无地面厚顶棚位于 cz=1 (z in [0.85, 1.00], 厚度 0.15 > 0.11)，下方 cz=0 仅靠扫空射线按需分配
+                for (double x = 1.625; x <= 2.375; x += 0.05) {
+                    for (double y = -0.575; y <= 0.575; y += 0.05) {
+                        for (double z = 0.85; z <= 1.001; z += 0.05) {
+                            ov_pts.emplace_back(x, y, z);
+                        }
+                    }
+                }
+                // 远端背景墙：让穿洞射线穿过 chunk (cx=2, cz=0) 并记录净空
+                for (double y = -0.675; y <= 0.675; y += 0.05) {
+                    for (double z = 0.025; z <= 0.675; z += 0.05) {
+                        ov_pts.emplace_back(3.025, y, z);
+                    }
+                }
+                for (int f = 0; f < 4; ++f) {
+                    (void)overhang_mapper.integrateFrame(ov_pts, sp, q_base, sm, false);
+                }
+                const auto ov_built = overhang_mapper.buildGlobalStaticMap();
+                bool ov_ok = false;
+                if (ov_built && ov_built->geometry.isValid()) {
+                    const auto oi = ov_built->geometry.posToIndex(Eigen::Vector2d(2.025, 0.025));
+                    if (ov_built->geometry.isInside(oi)) {
+                        const size_t oa = static_cast<size_t>(ov_built->geometry.toAddress(oi));
+                        ov_ok = (ov_built->cells[oa] == ma_map::CellState::FREE)
+                            && std::abs(ov_built->terrain_prior.ground_z[oa]) < 0.03f
+                            && std::isfinite(ov_built->terrain_prior.overhang_min_z[oa])
+                            && ov_built->terrain_prior.overhang_min_z[oa] >= 0.80f;
+                    }
+                }
+                ok &= check(
+                    ov_ok,
+                    "OnlineTerrainMapper allocates lower clear chunk and filters groundless cross-chunk thick overhang"
                 );
             }
         }
@@ -1865,6 +2050,244 @@ auto run_sanity_checks(BenchEnv& env) -> bool {
                 active_before > 0 && active_after_back == active_before && dl.activeVoxelCount() == 0,
                 "DynamicStvlLayer handles injected ManualClock and backward clock jump"
             );
+        }
+
+        // 9i. stvl_prior 3D 可视化按需采集：过滤后点云 / 动态 3D / 建图静态 3D / 2.5D 先验快照版本号
+        {
+            ma_map::SensorModel::Config sc;
+            sc.t_base_lidar = Eigen::Vector3d(0.0, 0.0, 0.2);
+            sc.rpy_deg = Eigen::Vector3d::Zero();
+            sc.min_range = 0.25;
+            sc.max_range = 8.0;
+            sc.self_filter_min = Eigen::Vector3d(-0.35, -0.35, -0.10);
+            sc.self_filter_max = Eigen::Vector3d(0.35, 0.35, 0.55);
+            ma_map::SensorModel sm(sc);
+            const auto sp = sm.computePose(Eigen::Vector3d(0.0, 0.0, 0.0), Eigen::Quaterniond::Identity());
+
+            // 9i-1. OnlineTerrainMapper: filtered_cloud 与 extractStaticVoxelCloud + revision
+            ma_map::OnlineTerrainMapper::Config mc;
+            mc.resolution = 0.05;
+            mc.min_z = -0.5;
+            mc.max_z = 2.0;
+            mc.trust_range = 5.0;
+            mc.static_min_hits = 2;
+            mc.preview_radius = 4.0;
+            ma_map::OnlineTerrainMapper mapper(mc);
+
+            const double dNaN = std::numeric_limits<double>::quiet_NaN();
+            std::vector<Eigen::Vector3d> map_pts;
+            map_pts.emplace_back(dNaN, 0.0, 0.0); // NaN：必须滤除
+            map_pts.emplace_back(0.1, 0.0, 0.2); // 自遮挡：必须滤除
+            map_pts.emplace_back(2.0, 0.0, 3.0); // 超 max_z：必须滤除
+            map_pts.emplace_back(6.5, 0.0, 0.3); // 超 trust_range：必须滤除
+            map_pts.emplace_back(2.0, 0.0, 0.3); // 有效点 1
+            map_pts.emplace_back(2.0, 0.5, 0.5); // 有效点 2
+
+            std::vector<Eigen::Vector3f> filtered;
+            const uint64_t rev0 = mapper.revision();
+            mapper.integrateFrame(map_pts, sp, Eigen::Quaterniond::Identity(), sm, false, nullptr, &filtered);
+            const uint64_t rev1 = mapper.revision();
+            mapper.integrateFrame(map_pts, sp, Eigen::Quaterniond::Identity(), sm, false, nullptr, &filtered);
+            const uint64_t rev2 = mapper.revision();
+
+            ok &= check(
+                rev0 == 0 && rev1 > rev0 && rev2 > rev1 && filtered.size() == 2,
+                "OnlineTerrainMapper filtered_cloud retains only valid in-range non-self points and bumps revision"
+            );
+
+            std::vector<Eigen::Vector3f> static_voxels;
+            const uint64_t ext_rev = mapper.extractStaticVoxelCloud(
+                Eigen::Vector3d(-1.0, -1.0, -0.5),
+                Eigen::Vector3d(4.0, 1.0, 2.0),
+                static_voxels,
+                1000
+            );
+            std::vector<Eigen::Vector3f> capped_voxels;
+            mapper.extractStaticVoxelCloud(
+                Eigen::Vector3d(-1.0, -1.0, -0.5),
+                Eigen::Vector3d(4.0, 1.0, 2.0),
+                capped_voxels,
+                1
+            );
+            std::vector<Eigen::Vector3f> out_box_voxels;
+            mapper.extractStaticVoxelCloud(
+                Eigen::Vector3d(10.0, 10.0, 0.0),
+                Eigen::Vector3d(12.0, 12.0, 2.0),
+                out_box_voxels,
+                1000
+            );
+            ok &= check(
+                ext_rev == rev2 && static_voxels.size() == 2 && capped_voxels.size() == 1 && out_box_voxels.empty(),
+                "OnlineTerrainMapper extractStaticVoxelCloud honors AABB window and max_points cap"
+            );
+
+            mapper.reset();
+            std::vector<Eigen::Vector3f> reset_voxels;
+            const uint64_t reset_rev = mapper.extractStaticVoxelCloud(
+                Eigen::Vector3d(-1.0, -1.0, -0.5),
+                Eigen::Vector3d(4.0, 1.0, 2.0),
+                reset_voxels,
+                1000
+            );
+            ok &= check(
+                reset_rev > rev2 && reset_voxels.empty(),
+                "OnlineTerrainMapper reset bumps revision and clears static 3D voxels"
+            );
+
+            // 9i-2. DynamicStvlLayer: filtered_cloud 与 debug_cloud
+            ma_map::DynamicStvlLayer::Config dc;
+            dc.voxel_size = 0.05;
+            dc.confirm_min_frames = 2;
+            dc.fast_confirm_with_neighbor = true;
+            dc.fallback_ground_offset = 0.0;
+            ma_map::DynamicStvlLayer stvl(dc);
+            ma_map::StaticNavContext empty_ctx;
+
+            std::vector<Eigen::Vector3d> nav_pts;
+            nav_pts.emplace_back(dNaN, 0.0, 0.0); // NaN：滤除
+            nav_pts.emplace_back(0.05, 0.0, 0.2); // 自遮挡：滤除
+            nav_pts.emplace_back(9.5, 0.0, 0.3); // 超 max_range：滤除
+            for (double x = 2.0; x <= 2.15; x += 0.05) {
+                for (double y = -0.05; y <= 0.05; y += 0.05) {
+                    for (double z = 0.25; z <= 0.45; z += 0.05) {
+                        nav_pts.emplace_back(x, y, z);
+                    }
+                }
+            }
+            const size_t valid_nav_pts = nav_pts.size() - 3;
+            std::vector<Eigen::Vector3f> dyn_debug;
+            std::vector<Eigen::Vector3f> nav_filtered;
+            stvl.update(nav_pts, sp, Eigen::Quaterniond::Identity(), sm, empty_ctx, 1.0, &dyn_debug, &nav_filtered);
+            ok &= check(
+                nav_filtered.size() == valid_nav_pts && !dyn_debug.empty(),
+                "DynamicStvlLayer outputs filtered 3D cloud and confirmed 3D dynamic voxels"
+            );
+            stvl.reset();
+            stvl.update({}, sp, Eigen::Quaterniond::Identity(), sm, empty_ctx, 2.0, &dyn_debug, &nav_filtered);
+            ok &= check(
+                nav_filtered.empty() && dyn_debug.empty(),
+                "DynamicStvlLayer clears filtered_cloud and debug_cloud on empty scan"
+            );
+
+            // 9i-3. LayeredMap::getStaticTerrainPrior 轻量快照与版本号
+            const auto tmp_dir = std::filesystem::temp_directory_path() / "ma_nav_viz_prior_test";
+            std::filesystem::create_directories(tmp_dir);
+            const auto tmp_map_base = tmp_dir / "prior_viz_map";
+            {
+                ma_map::LayeredMap::Config lcfg;
+                lcfg.x_left = 2.0;
+                lcfg.x_right = 2.0;
+                lcfg.y_left = 2.0;
+                lcfg.y_right = 2.0;
+                lcfg.resolution = 0.1;
+                ma_map::LayeredMap lm(lcfg);
+
+                uint64_t prior_rev_init = 999;
+                const auto prior_init = lm.getStaticTerrainPrior(&prior_rev_init);
+                ok &= check(
+                    prior_init == nullptr && prior_rev_init == 0,
+                    "LayeredMap getStaticTerrainPrior initially null with rev=0"
+                );
+
+                // 构建含地面+悬空的最小 .pgm/.yaml + .terrain.bin 并加载验证 revision 递增
+                const auto geom = grid_map::GridGeometry::fromOriginAndSize(
+                    Eigen::Vector2d(-2.0, -2.0),
+                    Eigen::Vector2i(40, 40),
+                    0.1
+                );
+                std::vector<ma_map::CellState> cells(geom.cellCount(), ma_map::CellState::FREE);
+                auto prior = ma_map::StaticTerrainPrior::createEmpty(geom);
+                for (int ix = 0; ix < 40; ++ix) {
+                    for (int iy = 0; iy < 40; ++iy) {
+                        prior.setGroundZ(ix, iy, 0.0f);
+                    }
+                }
+                prior.setOverhangMinZ(20, 20, 1.2f);
+                ma_map::SaveOptions sopts;
+                sopts.crop_to_explored = false;
+                sopts.save_terrain_prior = true;
+                const auto saved = ma_map::MapIO::save(tmp_map_base.string(), geom, cells, sopts, &prior);
+                const auto loaded =
+                    saved ? lm.loadStaticMap(saved->yaml_path) : tl::make_unexpected(std::string("save failed"));
+                uint64_t prior_rev_loaded = 0;
+                const auto prior_loaded = lm.getStaticTerrainPrior(&prior_rev_loaded);
+                ok &= check(
+                    saved.has_value() && loaded.has_value() && loaded->has_terrain_prior && prior_loaded != nullptr
+                        && prior_loaded->isValid() && prior_rev_loaded > 0
+                        && std::isfinite(prior_loaded->overhangMinZAt(20, 20)),
+                    "LayeredMap getStaticTerrainPrior returns valid snapshot and increments revision on load"
+                );
+            }
+            std::filesystem::remove_all(tmp_dir);
+
+            // 9i-4. MaMap 端到端按需采集：关闭时零采集，开启后可读取 filtered/dynamic_3d，关闭后立即清缓存
+            const auto orig_mode = env.ma_map->mode();
+            env.ma_map->set_global_map(grid_map::RowMatrixXi::Zero(env.ma_occ_a.rows(), env.ma_occ_a.cols()));
+            env.ma_map->set_mode(ma_map::MapMode::NAVIGATION);
+            env.ma_map->set_viz_capture(ma_map::MaMap::VizCaptureFlags {false, false});
+
+            const rog_map::Pose pose_zero {Eigen::Vector3d(0.0, 0.0, 0.0), Eigen::Quaterniond::Identity()};
+            rog_map::PointCloud pc;
+            for (double x = 2.0; x <= 2.15; x += 0.05) {
+                for (double y = -0.05; y <= 0.05; y += 0.05) {
+                    for (double z = 0.25; z <= 0.45; z += 0.05) {
+                        pcl::PointXYZI pt;
+                        pt.x = static_cast<float>(x);
+                        pt.y = static_cast<float>(y);
+                        pt.z = static_cast<float>(z);
+                        pt.intensity = 10.0f;
+                        pc.push_back(pt);
+                    }
+                }
+            }
+            // 自遮挡点，开启过滤采集后也必须被剔除
+            {
+                pcl::PointXYZI self_pt;
+                self_pt.x = 0.05f;
+                self_pt.y = 0.0f;
+                self_pt.z = 0.15f;
+                self_pt.intensity = 10.0f;
+                pc.push_back(self_pt);
+            }
+            const size_t expected_filtered_cnt = pc.size() - 1;
+
+            const uint64_t f_rev_off0 = env.ma_map->filtered_cloud_revision();
+            const uint64_t d_rev_off0 = env.ma_map->dynamic_3d_revision();
+            env.ma_map->update_odom(pose_zero, 100.0);
+            env.ma_map->update_cloud(pc, 100.0);
+            env.ma_map->update_map();
+            std::vector<Eigen::Vector3f> mm_filtered;
+            std::vector<Eigen::Vector3f> mm_dyn;
+            env.ma_map->copy_filtered_cloud(mm_filtered);
+            env.ma_map->copy_dynamic_3d_cloud(mm_dyn);
+            ok &= check(
+                env.ma_map->filtered_cloud_revision() == f_rev_off0 && env.ma_map->dynamic_3d_revision() == d_rev_off0
+                    && mm_filtered.empty() && mm_dyn.empty(),
+                "MaMap unsubscribed viz capture keeps zero capture and empty debug caches"
+            );
+
+            env.ma_map->set_viz_capture(ma_map::MaMap::VizCaptureFlags {true, true});
+            env.ma_map->update_odom(pose_zero, 100.1);
+            env.ma_map->update_cloud(pc, 100.1);
+            env.ma_map->update_map();
+            const uint64_t f_rev_on = env.ma_map->copy_filtered_cloud(mm_filtered);
+            const uint64_t d_rev_on = env.ma_map->copy_dynamic_3d_cloud(mm_dyn);
+            ok &= check(
+                f_rev_on > f_rev_off0 && d_rev_on > d_rev_off0 && mm_filtered.size() == expected_filtered_cnt
+                    && !mm_dyn.empty(),
+                "MaMap subscribed viz capture populates filtered_cloud and dynamic_3d"
+            );
+
+            env.ma_map->set_viz_capture(ma_map::MaMap::VizCaptureFlags {false, false});
+            env.ma_map->copy_filtered_cloud(mm_filtered);
+            env.ma_map->copy_dynamic_3d_cloud(mm_dyn);
+            ok &= check(
+                mm_filtered.empty() && mm_dyn.empty(),
+                "MaMap disabling viz capture immediately clears cached debug clouds"
+            );
+
+            env.ma_map->set_mode(orig_mode);
+            env.ma_map->set_global_map(env.ma_occ_a);
         }
     }
 

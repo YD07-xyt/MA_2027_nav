@@ -19,3 +19,4 @@ docs/架构图
 docs/ai_refactor_records
 __pycache__/
 *.pyc
+tmp

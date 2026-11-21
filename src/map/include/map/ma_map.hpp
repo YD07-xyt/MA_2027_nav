@@ -4,6 +4,7 @@
 #include "map/3d_occ_map/rog_map.h"
 #include "map/core/grid_map.hpp"
 #include "map/core/map_io.hpp"
+#include "map/core/static_terrain_prior.hpp"
 #include "map/layered/layered_map.hpp"
 #include "map/layered/map_layers.hpp"
 #include "map/perception/ground_layer.hpp"
@@ -12,6 +13,7 @@
 
 #include <Eigen/Core>
 
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -72,6 +74,37 @@ public:
     auto get_occupancy_2d() const -> grid_map::RowMatrixXi;
     auto get_global_occ() const -> grid_map::RowMatrixXi;
     auto get_terrain_map() const -> utils::vec_E<utils::Vec3f>;
+
+    // 按需 3D 调试点云采集开关（默认全关；由可视化层按订阅者数量设置，关闭时感知主路径零开销）。
+    struct VizCaptureFlags {
+        bool filtered_cloud = false;
+        bool dynamic_3d = false;
+    };
+
+    // 设置按需采集开关（线程安全；关闭某开关时立即释放对应调试点云缓存）。
+    auto set_viz_capture(VizCaptureFlags flags) -> void;
+
+    // 查询前端过滤后的当帧 3D 点云（世界系, m）与单调版本号；线程安全。
+    auto filtered_cloud_revision() const -> uint64_t;
+    auto copy_filtered_cloud(std::vector<Eigen::Vector3f>& out) const -> uint64_t;
+
+    // 查询导航模式 STVL 已确认 3D 动态障碍体素中心点云（世界系, m）与单调版本号；线程安全。
+    auto dynamic_3d_revision() const -> uint64_t;
+    auto copy_dynamic_3d_cloud(std::vector<Eigen::Vector3f>& out) const -> uint64_t;
+
+    // 查询建图模式 OnlineTerrainMapper 累积静态 3D 体素版本号及 AABB 窗口内静态体素点云（世界系, m）；线程安全。
+    // max_points > 0 时限制输出点数上限；非 stvl_prior 后端返回 0 并清空 out。
+    auto static_3d_revision() const -> uint64_t;
+    auto extract_static_3d_cloud(
+        const Eigen::Vector3d& box_min,
+        const Eigen::Vector3d& box_max,
+        std::vector<Eigen::Vector3f>& out,
+        size_t max_points = 300000
+    ) const -> uint64_t;
+
+    // 获取当前已加载 2.5D 静态地形先验只读快照（.terrain.bin）及其单调版本号；仅持轻量 front_mtx_，不触发 ESDF 重算。
+    auto get_static_terrain_prior(uint64_t* revision = nullptr) const -> std::shared_ptr<const StaticTerrainPrior>;
+
     // 持久地面层（只读，地图线程外读取需自行保证不与 update_map 并发）
     auto get_ground_layer() const -> const Terrain::GroundLayer&;
     auto get_rog_map() const -> std::shared_ptr<rog_map::ROGMap>;

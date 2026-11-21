@@ -68,6 +68,7 @@ auto OnlineTerrainMapper::setConfig(const Config& cfg) -> void {
 auto OnlineTerrainMapper::reset() -> void {
     std::lock_guard<std::mutex> lock(mtx_);
     chunks_.clear();
+    tile_max_cz_.clear();
     footprint_ground_.clear();
     clear_targets_scratch_.clear();
     frame_seq_ = 0;
@@ -75,6 +76,7 @@ auto OnlineTerrainMapper::reset() -> void {
     prev_q_base_w_ = Eigen::Quaterniond::Identity();
     tilt_hold_left_ = 0;
     chunk_limit_warned_ = false;
+    revision_.fetch_add(1, std::memory_order_release);
 }
 
 auto OnlineTerrainMapper::getOrCreateChunkLocked(const ChunkKey& key) -> Chunk* {
@@ -130,8 +132,12 @@ auto OnlineTerrainMapper::castClearRayLocked(
     }
 
     const Eigen::Vector3d dir = delta / dist;
-    const bool downward_ray = (target.z() < origin.z() - 0.05);
+    // 任何向下倾斜的射线（含高台顶面浅掠射）在接近落点上方 3 cm 时停止扫空，
+    // 避免在首次命中前后误擦除高台/地面薄表面；严格水平射线（dir.z() == 0）仍允许穿透清除动态障碍。
+    const bool downward_ray = (dir.z() < -1e-6);
     const double min_clear_z = target.z() + 0.03;
+    const double trust_r_sq = cfg_.trust_range * cfg_.trust_range;
+    const double chunk_z_size = static_cast<double>(kChunkSize) * cfg_.resolution;
 
     const Eigen::Vector3d p_start = origin + dir * start_dist;
     int32_t vx = static_cast<int32_t>(std::floor(p_start.x() * inv_res_));
@@ -180,6 +186,18 @@ auto OnlineTerrainMapper::castClearRayLocked(
         if (!has_cached || !(ck == cached_ck)) {
             cached_ck = ck;
             cached_chunk = findChunkMutableLocked(ck);
+            if (cached_chunk == nullptr
+                && static_cast<double>(ck.cz + 1) * chunk_z_size > static_cast<double>(cfg_.terrain.min_ground_height))
+            {
+                const double rx = p_start.x() + dir.x() * t_mid - origin.x();
+                const double ry = p_start.y() + dir.y() * t_mid - origin.y();
+                if (rx * rx + ry * ry <= trust_r_sq) {
+                    const auto max_it = tile_max_cz_.find(packXY(ck.cx, ck.cy));
+                    if (max_it != tile_max_cz_.end() && ck.cz < max_it->second) {
+                        cached_chunk = getOrCreateChunkLocked(ck);
+                    }
+                }
+            }
             has_cached = true;
         }
 
@@ -306,8 +324,12 @@ auto OnlineTerrainMapper::integrateFrame(
     const Eigen::Quaterniond& q_base_w,
     const SensorModel& sensor,
     bool build_local_preview,
-    std::vector<Eigen::Vector3f>* preview_cloud
+    std::vector<Eigen::Vector3f>* preview_cloud,
+    std::vector<Eigen::Vector3f>* filtered_cloud
 ) -> std::optional<LocalTerrainFrame> {
+    if (filtered_cloud != nullptr) {
+        filtered_cloud->clear();
+    }
     if (!pose.p_base_w.allFinite() || !pose.p_lidar_w.allFinite()) {
         return std::nullopt;
     }
@@ -390,6 +412,11 @@ auto OnlineTerrainMapper::integrateFrame(
             }
         }
 
+        const bool collect_filtered = (filtered_cloud != nullptr);
+        if (collect_filtered && filtered_cloud->capacity() < pts_world.size()) {
+            filtered_cloud->reserve(pts_world.size());
+        }
+
         bool has_cached = false;
         ChunkKey cached_ck {};
         Chunk* cached_chunk = nullptr;
@@ -417,6 +444,11 @@ auto OnlineTerrainMapper::integrateFrame(
                 continue;
             }
 
+            if (collect_filtered) {
+                filtered_cloud
+                    ->emplace_back(static_cast<float>(pw.x()), static_cast<float>(pw.y()), static_cast<float>(pw.z()));
+            }
+
             const int32_t vx = static_cast<int32_t>(std::floor(pw.x() * inv_res_));
             const int32_t vy = static_cast<int32_t>(std::floor(pw.y() * inv_res_));
             const int32_t vz = static_cast<int32_t>(std::floor(pw.z() * inv_res_));
@@ -426,6 +458,13 @@ auto OnlineTerrainMapper::integrateFrame(
                 cached_ck = ck;
                 cached_chunk = getOrCreateChunkLocked(ck);
                 has_cached = true;
+                if (cached_chunk != nullptr) {
+                    const uint64_t tile_key = packXY(ck.cx, ck.cy);
+                    const auto [it, inserted] = tile_max_cz_.emplace(tile_key, ck.cz);
+                    if (!inserted && ck.cz > it->second) {
+                        it->second = ck.cz;
+                    }
+                }
             }
             if (cached_chunk == nullptr) {
                 continue;
@@ -452,6 +491,8 @@ auto OnlineTerrainMapper::integrateFrame(
         for (const auto& target: clear_targets) {
             castClearRayLocked(pose.p_lidar_w, target, cur_frame);
         }
+
+        revision_.fetch_add(1, std::memory_order_release);
 
         // 5. 若需要实时 2D 预览，短锁提取车周 preview_radius 内的稀疏列后在锁外运行 StaticTerrainBuilder
         if (build_local_preview && cfg_.preview_radius > 0.0) {
@@ -515,6 +556,83 @@ auto OnlineTerrainMapper::integrateFrame(
     }
 
     return frame;
+}
+
+auto OnlineTerrainMapper::extractStaticVoxelCloud(
+    const Eigen::Vector3d& box_min,
+    const Eigen::Vector3d& box_max,
+    std::vector<Eigen::Vector3f>& out,
+    size_t max_points
+) const -> uint64_t {
+    out.clear();
+    if (!box_min.allFinite() || !box_max.allFinite() || box_max.x() < box_min.x() || box_max.y() < box_min.y()
+        || box_max.z() < box_min.z())
+    {
+        return revision_.load(std::memory_order_acquire);
+    }
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    const uint64_t rev = revision_.load(std::memory_order_acquire);
+    if (chunks_.empty()) {
+        return rev;
+    }
+
+    const int32_t min_vx = static_cast<int32_t>(std::floor(box_min.x() * inv_res_));
+    const int32_t max_vx = static_cast<int32_t>(std::floor(box_max.x() * inv_res_));
+    const int32_t min_vy = static_cast<int32_t>(std::floor(box_min.y() * inv_res_));
+    const int32_t max_vy = static_cast<int32_t>(std::floor(box_max.y() * inv_res_));
+    const int32_t min_vz = static_cast<int32_t>(std::floor(box_min.z() * inv_res_));
+    const int32_t max_vz = static_cast<int32_t>(std::floor(box_max.z() * inv_res_));
+
+    for (const auto& kv: chunks_) {
+        const ChunkKey& ck = kv.first;
+        const int32_t base_x = ck.cx * kChunkSize;
+        const int32_t base_y = ck.cy * kChunkSize;
+        const int32_t base_z = ck.cz * kChunkSize;
+        if (base_x + kChunkSize - 1 < min_vx || base_x > max_vx || base_y + kChunkSize - 1 < min_vy || base_y > max_vy
+            || base_z + kChunkSize - 1 < min_vz || base_z > max_vz)
+        {
+            continue;
+        }
+
+        const int32_t x_lo = std::max(base_x, min_vx);
+        const int32_t x_hi = std::min(base_x + kChunkSize - 1, max_vx);
+        const int32_t y_lo = std::max(base_y, min_vy);
+        const int32_t y_hi = std::min(base_y + kChunkSize - 1, max_vy);
+        const int32_t z_lo = std::max(base_z, min_vz);
+        const int32_t z_hi = std::min(base_z + kChunkSize - 1, max_vz);
+
+        const Chunk& chunk = *kv.second;
+        for (int32_t vx = x_lo; vx <= x_hi; ++vx) {
+            const int32_t lx = vx - base_x;
+            const float wx = static_cast<float>((static_cast<double>(vx) + 0.5) * cfg_.resolution);
+            for (int32_t vy = y_lo; vy <= y_hi; ++vy) {
+                const int32_t ly = vy - base_y;
+                const float wy = static_cast<float>((static_cast<double>(vy) + 0.5) * cfg_.resolution);
+                for (int32_t vz = z_lo; vz <= z_hi; ++vz) {
+                    const int32_t lz = vz - base_z;
+                    const VoxelCell& cell = chunk.cells[localVoxelIndex(lx, ly, lz)];
+                    if (static_cast<int>(cell.hits) < cfg_.static_min_hits) {
+                        continue;
+                    }
+                    if (static_cast<float>(cell.clears) > cfg_.static_clear_ratio * static_cast<float>(cell.hits)) {
+                        continue;
+                    }
+                    if (cell.z_min_mm > cell.z_max_mm) {
+                        continue;
+                    }
+                    const float wz = 0.0005f
+                        * static_cast<float>(static_cast<int32_t>(cell.z_min_mm) + static_cast<int32_t>(cell.z_max_mm));
+                    out.emplace_back(wx, wy, wz);
+                    if (max_points > 0 && out.size() >= max_points) {
+                        return rev;
+                    }
+                }
+            }
+        }
+    }
+
+    return rev;
 }
 
 auto OnlineTerrainMapper::buildGlobalStaticMap() const -> std::optional<StaticTerrainBuilder::BuildResult> {

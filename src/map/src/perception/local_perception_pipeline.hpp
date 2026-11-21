@@ -35,11 +35,10 @@ public:
     explicit LocalPerceptionPipeline(const rog_map::Config& cfg);
 
     auto setMode(MapMode mode) -> void;
-    auto resetDynamic() -> void {
-        dynamic_stvl_.reset();
-    }
+    auto resetDynamic() -> void;
     auto setForgetThresholdForMode(bool mapping_mode) -> void;
     auto setClock(utils::Clock clock) -> void;
+    auto setVizCapture(bool filtered_cloud, bool dynamic_3d) -> void;
     auto updateOdom(const rog_map::Pose& pose, double stamp_sec = std::numeric_limits<double>::quiet_NaN()) -> void;
     auto
     updateCloud(const rog_map::PointCloud& cloud, double stamp_sec = std::numeric_limits<double>::quiet_NaN()) -> void;
@@ -61,6 +60,23 @@ public:
     }
 
     auto getLastTerrainMap() const -> utils::vec_E<utils::Vec3f>;
+    auto filteredCloudRevision() const -> uint64_t {
+        return filtered_cloud_rev_.load(std::memory_order_acquire);
+    }
+    auto copyFilteredCloud(std::vector<Eigen::Vector3f>& out) const -> uint64_t;
+    auto dynamic3dRevision() const -> uint64_t {
+        return dynamic_3d_rev_.load(std::memory_order_acquire);
+    }
+    auto copyDynamic3dCloud(std::vector<Eigen::Vector3f>& out) const -> uint64_t;
+    auto static3dRevision() const -> uint64_t {
+        return use_stvl_prior_ ? online_mapper_.revision() : 0;
+    }
+    auto extractStatic3dCloud(
+        const Eigen::Vector3d& box_min,
+        const Eigen::Vector3d& box_max,
+        std::vector<Eigen::Vector3f>& out,
+        size_t max_points = 300000
+    ) const -> uint64_t;
     auto getGroundLayer() const -> const Terrain::GroundLayer& {
         return ground_layer_;
     }
@@ -110,6 +126,18 @@ private:
 
     mutable std::mutex terrain_mtx_;
     utils::vec_E<utils::Vec3f> last_terrain_map_;
+
+    // 按需 3D 调试可视化状态（默认全关；仅由上层按订阅者数量开启，关闭时零分配零拷贝）
+    static constexpr uint8_t kVizCaptureFiltered = 1U << 0U;
+    static constexpr uint8_t kVizCaptureDynamic3d = 1U << 1U;
+    std::atomic<uint8_t> viz_capture_mask_ {0};
+    std::vector<Eigen::Vector3f> scratch_filtered_cloud_;
+    std::vector<Eigen::Vector3f> scratch_dynamic_3d_;
+    mutable std::mutex viz_mtx_;
+    std::vector<Eigen::Vector3f> last_filtered_cloud_;
+    std::vector<Eigen::Vector3f> last_dynamic_3d_;
+    std::atomic<uint64_t> filtered_cloud_rev_ {0};
+    std::atomic<uint64_t> dynamic_3d_rev_ {0};
 };
 
 } // namespace ma_map

@@ -145,7 +145,41 @@ auto LocalPerceptionPipeline::setMode(MapMode mode) -> void {
     const uint8_t prev = mode_.exchange(next, std::memory_order_acq_rel);
     setForgetThresholdForMode(mode == MapMode::MAPPING);
     if (prev != next) {
-        dynamic_stvl_.reset();
+        resetDynamic();
+    }
+}
+
+auto LocalPerceptionPipeline::resetDynamic() -> void {
+    dynamic_stvl_.reset();
+    std::lock_guard<std::mutex> lock(viz_mtx_);
+    if (!last_dynamic_3d_.empty()) {
+        last_dynamic_3d_.clear();
+        dynamic_3d_rev_.fetch_add(1, std::memory_order_release);
+    }
+}
+
+auto LocalPerceptionPipeline::setVizCapture(bool filtered_cloud, bool dynamic_3d) -> void {
+    if (!use_stvl_prior_) {
+        return;
+    }
+    const uint8_t next =
+        static_cast<uint8_t>((filtered_cloud ? kVizCaptureFiltered : 0U) | (dynamic_3d ? kVizCaptureDynamic3d : 0U));
+    if (viz_capture_mask_.load(std::memory_order_relaxed) == next) {
+        return;
+    }
+    const uint8_t prev = viz_capture_mask_.exchange(next, std::memory_order_acq_rel);
+    const uint8_t disabled = static_cast<uint8_t>(prev & static_cast<uint8_t>(~next));
+    if (disabled == 0U) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(viz_mtx_);
+    if ((disabled & kVizCaptureFiltered) != 0U && !last_filtered_cloud_.empty()) {
+        last_filtered_cloud_.clear();
+        filtered_cloud_rev_.fetch_add(1, std::memory_order_release);
+    }
+    if ((disabled & kVizCaptureDynamic3d) != 0U && !last_dynamic_3d_.empty()) {
+        last_dynamic_3d_.clear();
+        dynamic_3d_rev_.fetch_add(1, std::memory_order_release);
     }
 }
 
@@ -242,6 +276,9 @@ auto LocalPerceptionPipeline::processPendingFrame(const StaticNavContext& static
 
         const SensorPose sp = sensor_model_.computePose(scratch_pose_.first, scratch_pose_.second);
         const MapMode cur_mode = static_cast<MapMode>(mode_.load(std::memory_order_acquire));
+        const uint8_t viz_mask = viz_capture_mask_.load(std::memory_order_acquire);
+        const bool want_filtered = (viz_mask & kVizCaptureFiltered) != 0U;
+        const bool want_dynamic_3d = (viz_mask & kVizCaptureDynamic3d) != 0U;
 
         std::optional<LocalTerrainFrame> frame;
         if (cur_mode == MapMode::MAPPING) {
@@ -250,16 +287,44 @@ auto LocalPerceptionPipeline::processPendingFrame(const StaticNavContext& static
                 sp,
                 scratch_pose_.second,
                 sensor_model_,
-                /*build_local_preview=*/true
+                /*build_local_preview=*/true,
+                /*preview_cloud=*/nullptr,
+                want_filtered ? &scratch_filtered_cloud_ : nullptr
             );
         } else {
-            frame = dynamic_stvl_
-                        .update(scratch_pts_, sp, scratch_pose_.second, sensor_model_, static_ctx, pending_stamp_sec);
+            frame = dynamic_stvl_.update(
+                scratch_pts_,
+                sp,
+                scratch_pose_.second,
+                sensor_model_,
+                static_ctx,
+                pending_stamp_sec,
+                want_dynamic_3d ? &scratch_dynamic_3d_ : nullptr,
+                want_filtered ? &scratch_filtered_cloud_ : nullptr
+            );
         }
 
         if (frame.has_value()) {
-            std::lock_guard<std::mutex> lock(terrain_mtx_);
-            last_terrain_map_ = frame->obstacle_cells;
+            {
+                std::lock_guard<std::mutex> lock(terrain_mtx_);
+                last_terrain_map_ = frame->obstacle_cells;
+            }
+            if (want_filtered || (cur_mode == MapMode::NAVIGATION && want_dynamic_3d)) {
+                std::lock_guard<std::mutex> lock(viz_mtx_);
+                const uint8_t cur_mask = viz_capture_mask_.load(std::memory_order_acquire);
+                if (want_filtered && (cur_mask & kVizCaptureFiltered) != 0U
+                    && (!scratch_filtered_cloud_.empty() || !last_filtered_cloud_.empty()))
+                {
+                    std::swap(last_filtered_cloud_, scratch_filtered_cloud_);
+                    filtered_cloud_rev_.fetch_add(1, std::memory_order_release);
+                }
+                if (cur_mode == MapMode::NAVIGATION && want_dynamic_3d && (cur_mask & kVizCaptureDynamic3d) != 0U
+                    && (!scratch_dynamic_3d_.empty() || !last_dynamic_3d_.empty()))
+                {
+                    std::swap(last_dynamic_3d_, scratch_dynamic_3d_);
+                    dynamic_3d_rev_.fetch_add(1, std::memory_order_release);
+                }
+            }
         }
         return frame;
     }
@@ -298,6 +363,31 @@ auto LocalPerceptionPipeline::processPendingFrame(const StaticNavContext& static
 auto LocalPerceptionPipeline::getLastTerrainMap() const -> utils::vec_E<utils::Vec3f> {
     std::lock_guard<std::mutex> lock(terrain_mtx_);
     return last_terrain_map_;
+}
+
+auto LocalPerceptionPipeline::copyFilteredCloud(std::vector<Eigen::Vector3f>& out) const -> uint64_t {
+    std::lock_guard<std::mutex> lock(viz_mtx_);
+    out = last_filtered_cloud_;
+    return filtered_cloud_rev_.load(std::memory_order_acquire);
+}
+
+auto LocalPerceptionPipeline::copyDynamic3dCloud(std::vector<Eigen::Vector3f>& out) const -> uint64_t {
+    std::lock_guard<std::mutex> lock(viz_mtx_);
+    out = last_dynamic_3d_;
+    return dynamic_3d_rev_.load(std::memory_order_acquire);
+}
+
+auto LocalPerceptionPipeline::extractStatic3dCloud(
+    const Eigen::Vector3d& box_min,
+    const Eigen::Vector3d& box_max,
+    std::vector<Eigen::Vector3f>& out,
+    size_t max_points
+) const -> uint64_t {
+    if (!use_stvl_prior_) {
+        out.clear();
+        return 0;
+    }
+    return online_mapper_.extractStaticVoxelCloud(box_min, box_max, out, max_points);
 }
 
 } // namespace ma_map

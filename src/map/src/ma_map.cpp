@@ -123,6 +123,43 @@ auto MaMap::get_terrain_map() const -> utils::vec_E<utils::Vec3f> {
     return impl_->perception.getLastTerrainMap();
 }
 
+auto MaMap::set_viz_capture(VizCaptureFlags flags) -> void {
+    impl_->perception.setVizCapture(flags.filtered_cloud, flags.dynamic_3d);
+}
+
+auto MaMap::filtered_cloud_revision() const -> uint64_t {
+    return impl_->perception.filteredCloudRevision();
+}
+
+auto MaMap::copy_filtered_cloud(std::vector<Eigen::Vector3f>& out) const -> uint64_t {
+    return impl_->perception.copyFilteredCloud(out);
+}
+
+auto MaMap::dynamic_3d_revision() const -> uint64_t {
+    return impl_->perception.dynamic3dRevision();
+}
+
+auto MaMap::copy_dynamic_3d_cloud(std::vector<Eigen::Vector3f>& out) const -> uint64_t {
+    return impl_->perception.copyDynamic3dCloud(out);
+}
+
+auto MaMap::static_3d_revision() const -> uint64_t {
+    return impl_->perception.static3dRevision();
+}
+
+auto MaMap::extract_static_3d_cloud(
+    const Eigen::Vector3d& box_min,
+    const Eigen::Vector3d& box_max,
+    std::vector<Eigen::Vector3f>& out,
+    size_t max_points
+) const -> uint64_t {
+    return impl_->perception.extractStatic3dCloud(box_min, box_max, out, max_points);
+}
+
+auto MaMap::get_static_terrain_prior(uint64_t* revision) const -> std::shared_ptr<const StaticTerrainPrior> {
+    return impl_->layered_map.getStaticTerrainPrior(revision);
+}
+
 auto MaMap::get_ground_layer() const -> const Terrain::GroundLayer& {
     return impl_->perception.getGroundLayer();
 }
