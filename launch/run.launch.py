@@ -2,7 +2,9 @@
 import os
 from launch import LaunchDescription
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, TextSubstitution
 from ament_index_python.packages import get_package_share_directory
 
@@ -19,7 +21,21 @@ def generate_launch_description():
         default_value=default_config,
         description='Path to planner YAML config file'
     )
-    
+
+    # 仿真/回放：跟随 /clock；真机保持 false 使用 steady_clock
+    use_sim_time_arg = DeclareLaunchArgument(
+        'use_sim_time',
+        default_value='false',
+        description='Use simulation (/clock) time instead of system/steady time'
+    )
+
+    # 无头仿真可传 rviz:=false，默认仍启动 RViz2，保持既有行为
+    rviz_arg = DeclareLaunchArgument(
+        'rviz',
+        default_value='true',
+        description='Launch RViz2 visualization'
+    )
+
     # 全局规划节点
     ma_nav_node = Node(
         package='ma_nav',
@@ -28,7 +44,8 @@ def generate_launch_description():
         output='screen',
         emulate_tty=True,
         parameters=[{
-                'planner_params_path': LaunchConfiguration('planner_params_path')
+                'planner_params_path': LaunchConfiguration('planner_params_path'),
+                'use_sim_time': ParameterValue(LaunchConfiguration('use_sim_time'), value_type=bool)
         }]
     )
     
@@ -39,11 +56,17 @@ def generate_launch_description():
         executable='rviz2',
         name='rviz2',
         arguments=['-d', rviz_config],
-        output='screen'
+        parameters=[{
+                'use_sim_time': ParameterValue(LaunchConfiguration('use_sim_time'), value_type=bool)
+        }],
+        output='screen',
+        condition=IfCondition(LaunchConfiguration('rviz'))
     )
     
     return LaunchDescription([
         params_file_arg,
+        use_sim_time_arg,
+        rviz_arg,
         ma_nav_node,
         rviz_node,  
     ])

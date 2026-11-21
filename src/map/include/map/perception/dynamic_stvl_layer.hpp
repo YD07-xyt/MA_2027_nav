@@ -3,10 +3,10 @@
 #include "map/layered/layered_map.hpp"
 #include "map/perception/local_terrain_frame.hpp"
 #include "map/perception/sensor_model.hpp"
+#include "utils/clock.hpp"
 
 #include <Eigen/Core>
 
-#include <chrono>
 #include <cstdint>
 #include <span>
 #include <unordered_map>
@@ -52,6 +52,9 @@ public:
     explicit DynamicStvlLayer(const Config& cfg);
 
     auto setConfig(const Config& cfg) -> void;
+    auto setClock(utils::Clock clock) -> void {
+        clock_ = clock;
+    }
     auto config() const -> const Config& {
         return cfg_;
     }
@@ -59,7 +62,7 @@ public:
     auto reset() -> void;
 
     // 处理一帧导航模式世界系点云：
-    // - now_sec >= 0 时使用调用方提供的仿真/回放时间 (s)；now_sec < 0 时自动读取 steady_clock。
+    // - now_sec >= 0 时使用调用方提供的仿真/回放时间 (s)；now_sec < 0 时自动读取注入的 clock_。
     // - 输出仅包含本帧已确认动态障碍的 LocalTerrainFrame（供 DynamicObstacleLayer 整帧覆盖）。
     auto update(
         std::span<const Eigen::Vector3d> pts_world,
@@ -122,6 +125,8 @@ private:
 
     Config cfg_;
     double inv_voxel_size_ = 20.0;
+    // 默认 steady_clock；仿真/回放由上层注入 /clock 或手动时钟。
+    utils::Clock clock_ = utils::Clock::steady();
 
     std::unordered_map<VoxelKey, DynamicVoxel, VoxelKeyHash> active_voxels_;
     std::vector<float> range_img_; // kAzBins * kElBins，0.0f 表示该角格无回波，>0 表示该角格最小测距 (m)
@@ -140,7 +145,7 @@ private:
     bool has_last_time_ = false;
     bool last_time_was_explicit_ = false;
     double last_explicit_sec_ = 0.0;
-    std::chrono::steady_clock::time_point last_wall_tp_ {};
+    double last_wall_sec_ = 0.0;
 };
 
 } // namespace ma_map

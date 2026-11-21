@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstddef>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <spdlog/spdlog.h>
@@ -35,6 +36,26 @@ GlobalPlanner2d::GlobalPlanner2d(rclcpp::Node::SharedPtr nh_, std::string params
     mpc_(config.mpc_params),
     nav_state(replan::FsmReplan::PathState::IDLE) {
     fsm_replanner.set_param(config.planner_config);
+
+    // 时间源：use_sim_time=true 时全程跟随 /clock（仿真/回放）；false 使用 steady_clock（真机）。
+    if (!nh->has_parameter("use_sim_time")) {
+        nh->declare_parameter<bool>("use_sim_time", false);
+    }
+    nh->get_parameter("use_sim_time", use_sim_time_);
+    if (use_sim_time_) {
+        sim_clock_sub_ = nh->create_subscription<rosgraph_msgs::msg::Clock>(
+            "/clock",
+            rclcpp::ClockQoS(),
+            [this](const rosgraph_msgs::msg::Clock::SharedPtr msg) {
+                sim_clock_source_.storeNs(rclcpp::Time(msg->clock).nanoseconds());
+            }
+        );
+        clock_ = sim_clock_source_.asClock();
+        logger::info(logger::ros2, "use_sim_time=true, clock follows /clock");
+    } else {
+        clock_ = utils::Clock::steady();
+    }
+    ma_map_->set_clock(clock_);
 
     map_cb_group_ = nh->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     planner_cb_group_ = nh->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -154,8 +175,8 @@ void GlobalPlanner2d::controller_callback() {
     Eigen::Vector2d pos(current_XYTheta->x(), current_XYTheta->y());
 
     // 急停：刹车距离不够，刹车段时长内直接发零速（不经过 MPC）
-    if (emergency_stop_until_.has_value()) {
-        if (std::chrono::steady_clock::now() < emergency_stop_until_.value()) {
+    if (emergency_stop_until_sec_.has_value()) {
+        if (clock_.nowSec() < emergency_stop_until_sec_.value()) {
             geometry_msgs::msg::Twist zero;
             cmd_vel_pub_->publish(zero);
             last_vx_world_cmd_ = 0.0;
@@ -164,16 +185,15 @@ void GlobalPlanner2d::controller_callback() {
             return;
         }
         // 急停结束：跳过刹车段，从样条上离机器人最近的点开始跟踪
-        emergency_stop_until_.reset();
+        emergency_stop_until_sec_.reset();
         t_track_ = ma_traj_interface_->nearest_time_from(pos, ma_traj_interface_->brake_duration());
     }
 
     // 刹车段内按时间推进游标（反向样条与刹车段位置重合，按位置搜索会卡在刹停点附近）；之后按位置更新
-    const auto now_tp = std::chrono::steady_clock::now();
-    const double dt_ctrl = last_control_time_.has_value()
-        ? std::clamp(std::chrono::duration<double>(now_tp - last_control_time_.value()).count(), 0.0, 0.05)
-        : 0.0;
-    last_control_time_ = now_tp;
+    const double now_sec = clock_.nowSec();
+    const double dt_ctrl =
+        last_control_time_sec_.has_value() ? std::clamp(now_sec - last_control_time_sec_.value(), 0.0, 0.05) : 0.0;
+    last_control_time_sec_ = now_sec;
     if (t_track_ < ma_traj_interface_->brake_duration()) {
         t_track_ += dt_ctrl;
     } else {
@@ -294,17 +314,17 @@ void GlobalPlanner2d::plan_omni() {
         logger::debug(logger::ros2, "no current_pose");
         return;
     }
-    const auto now = std::chrono::steady_clock::now();
-    if (!plan_start_time_.has_value()) {
-        plan_start_time_ = now;
+    const double now = clock_.nowSec();
+    if (!plan_start_time_sec_.has_value()) {
+        plan_start_time_sec_ = now;
     }
-    const auto deadline = plan_start_time_.value() + std::chrono::seconds(20);
+    const double deadline = plan_start_time_sec_.value() + 20.0;
     if (now >= deadline) {
         logger::warn(logger::ros2, "navigation task exceeded 20s -> nav:failed");
         nav_state = replan::FsmReplan::PathState::FAILED;
         nav_feedback_pub_->publish(pub_nav_feedback());
         goal_pose.reset();
-        plan_start_time_.reset();
+        plan_start_time_sec_.reset();
         return;
     }
 
@@ -317,20 +337,20 @@ void GlobalPlanner2d::plan_omni() {
 
         // 到达后收尾，避免重复触发
         goal_pose.reset();
-        plan_start_time_.reset();
+        plan_start_time_sec_.reset();
         return;
     }
 
     // 本次规划全程使用同一份地图快照（双缓冲），地图线程的更新不会改写它。
     const auto plan_map = ma_map_->get_grid_map();
     auto result = fsm_replanner.plan(goal_pose.value(), current_pose.value(), plan_map);
-    const auto finished_at = std::chrono::steady_clock::now();
+    const double finished_at = clock_.nowSec();
     if (finished_at >= deadline) {
         logger::warn(logger::ros2, "planning result arrived after 20s -> nav:failed");
         nav_state = replan::FsmReplan::PathState::FAILED;
         nav_feedback_pub_->publish(pub_nav_feedback());
         goal_pose.reset();
-        plan_start_time_.reset();
+        plan_start_time_sec_.reset();
         return;
     }
     if (!result) {
@@ -347,12 +367,12 @@ void GlobalPlanner2d::plan_omni() {
     }
 
     // 交接前再次检查，过期结果不能下发给控制器。
-    if (std::chrono::steady_clock::now() >= deadline) {
+    if (clock_.nowSec() >= deadline) {
         logger::warn(logger::ros2, "planning result expired before handoff -> nav:failed");
         nav_state = replan::FsmReplan::PathState::FAILED;
         nav_feedback_pub_->publish(pub_nav_feedback());
         goal_pose.reset();
-        plan_start_time_.reset();
+        plan_start_time_sec_.reset();
         return;
     }
 
@@ -404,10 +424,10 @@ void GlobalPlanner2d::plan_omni() {
         // 反向刹车距离不够：刹车段时长内急停发零速。
         if (ma_traj_interface_->brake_emergency()) {
             const auto brake_ms = static_cast<int64_t>(ma_traj_interface_->brake_duration() * 1000.0);
-            emergency_stop_until_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(brake_ms);
+            emergency_stop_until_sec_ = clock_.nowSec() + static_cast<double>(brake_ms) * 1e-3;
             logger::warn(logger::ros2, "brake distance not enough, emergency stop {} ms", brake_ms);
         } else {
-            emergency_stop_until_.reset();
+            emergency_stop_until_sec_.reset();
         }
 
         // 可视化。
@@ -508,32 +528,45 @@ void GlobalPlanner2d::odom_callback(const nav_msgs::msg::Odometry::SharedPtr& ms
         msg->pose.pose.orientation.z
     );
 
-    ma_map_->update_odom(pose);
+    const double stamp_sec = (msg->header.stamp.sec != 0 || msg->header.stamp.nanosec != 0)
+        ? rclcpp::Time(msg->header.stamp).seconds()
+        : std::numeric_limits<double>::quiet_NaN();
+    ma_map_->update_odom(pose, stamp_sec);
 };
 void GlobalPlanner2d::map_callback(const sensor_msgs::msg::PointCloud2::SharedPtr& msg) {
     warn_frame_mismatch_once(cloud_frame_warned_, config.map_topic_name, msg->header.frame_id, frame_id);
     rog_map::PointCloud pc;
     pcl::fromROSMsg(*msg, pc);
-    ma_map_->update_cloud(pc);
+    const double stamp_sec = (msg->header.stamp.sec != 0 || msg->header.stamp.nanosec != 0)
+        ? rclcpp::Time(msg->header.stamp).seconds()
+        : std::numeric_limits<double>::quiet_NaN();
+    ma_map_->update_cloud(pc, stamp_sec);
     ma_map_->update_map();
     const auto grid_map = ma_map_->get_grid_map();
     if (grid_map) {
         visualizer.visualize_occupied_map(*grid_map, frame_id);
     }
-    mapInitialized = true;
+    if (config.mapping_model || static_map_loaded_) {
+        mapInitialized = true;
+    } else if (!static_map_missing_warned_) {
+        // 导航模式下静态先验图加载失败：不得把地图标记为已初始化，否则目标点会被静默接受。
+        static_map_missing_warned_ = true;
+        logger::warn(logger::ros2, "Static global map not loaded, keep mapInitialized=false (check global_map_path)");
+    }
 }
 void GlobalPlanner2d::pub_callback() {
-    static auto last_pub = std::chrono::steady_clock::now();
     // Use viz_time_rate from map config as publish frequency (Hz)
     if (ma_map_) {
         double viz_rate = ma_map_->get_config().viz_time_rate;
         if (viz_rate > 0) {
-            auto now = std::chrono::steady_clock::now();
-            double elapsed = std::chrono::duration<double>(now - last_pub).count();
-            if (elapsed < 1.0 / viz_rate) {
-                return;
+            const double now_sec = clock_.nowSec();
+            if (last_pub_sec_ >= 0.0 && now_sec >= last_pub_sec_) {
+                const double elapsed = now_sec - last_pub_sec_;
+                if (elapsed < 1.0 / viz_rate) {
+                    return;
+                }
             }
-            last_pub = now;
+            last_pub_sec_ = now_sec;
         }
     }
     visualizer.map_viz_callback(*ma_map_,frame_id);
@@ -601,7 +634,7 @@ void GlobalPlanner2d::target_callback(const geometry_msgs::msg::PoseStamped::Sha
     old_goal_pose_ = goal;
     nav_state = replan::FsmReplan::PathState::RUNNING;
     //logger::info(logger::ros2, "set goal success");
-    plan_start_time_ = std::chrono::steady_clock::now();
+    plan_start_time_sec_ = clock_.nowSec();
 }
 
 void GlobalPlanner2d::publish_clicked_regions() {
@@ -677,9 +710,11 @@ void GlobalPlanner2d::clicked_point_callback(const geometry_msgs::msg::PointStam
 void GlobalPlanner2d::load_global_map(const std::string& map_path) {
     auto loaded = ma_map_->load_static_map(map_path);
     if (!loaded) {
+        static_map_loaded_ = false;
         logger::error(logger::ros2, "Failed to load global map {}: {}", map_path, loaded.error());
         return;
     }
+    static_map_loaded_ = true;
     mapInitialized = true;
     logger::info(
         logger::ros2,

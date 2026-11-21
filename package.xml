@@ -21,6 +21,7 @@
   <depend>tf2_ros</depend>
   <depend>behaviortree_cpp</depend>
   <depend>std_srvs</depend>
+  <depend>rosgraph_msgs</depend>
 
   <export>
     <build_type>ament_cmake</build_type>

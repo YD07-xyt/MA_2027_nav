@@ -293,7 +293,7 @@ public:
         perception_t_base_lidar = Eigen::Vector3d(t_bl_v[0], t_bl_v[1], t_bl_v[2]);
 
         std::vector<double> rpy_v;
-        loader.LoadParam(name_space + "/perception/sensor/rpy_deg", rpy_v, std::vector<double> {0.0, -20.0, 0.0});
+        loader.LoadParam(name_space + "/perception/sensor/rpy_deg", rpy_v, std::vector<double> {0.0, 0.0, 0.0});
         if (rpy_v.size() != 3 || !std::isfinite(rpy_v[0]) || !std::isfinite(rpy_v[1]) || !std::isfinite(rpy_v[2])) {
             throw std::invalid_argument("Invalid rog_map/perception/sensor/rpy_deg (expected 3 finite doubles)!");
         }
@@ -556,7 +556,7 @@ public:
     // ---------- perception (stvl_prior / legacy_rog) 参数 ----------
     std::string perception_backend {"stvl_prior"};
     Eigen::Vector3d perception_t_base_lidar {0.0, 0.0, 0.194};
-    Eigen::Vector3d perception_rpy_deg {0.0, -20.0, 0.0};
+    Eigen::Vector3d perception_rpy_deg {0.0, 0.0, 0.0};
     double perception_fov_min_elev_deg {-7.0};
     double perception_fov_max_elev_deg {52.0};
     double perception_fov_margin_deg {3.0};

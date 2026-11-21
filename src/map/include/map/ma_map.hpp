@@ -7,10 +7,12 @@
 #include "map/layered/layered_map.hpp"
 #include "map/layered/map_layers.hpp"
 #include "map/perception/ground_layer.hpp"
+#include "utils/clock.hpp"
 #include "utils/expected.hpp"
 
 #include <Eigen/Core>
 
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -35,9 +37,14 @@ public:
     auto mode() const -> MapMode;
     auto set_mapping_model(bool mapping_model) -> void;
 
-    // 感知输入与更新
-    auto update_odom(const rog_map::Pose& pose) -> void;
-    auto update_cloud(const rog_map::PointCloud& cloud) -> void;
+    // 注入时间源（ROS 仿真 /clock 或离线手动时钟）；默认使用 steady_clock。
+    auto set_clock(utils::Clock clock) -> void;
+
+    // 感知输入与更新。stamp_sec 为消息事件时间（s）；缺省 NaN 时按本地接收时间处理，
+    // 保持既有单参数调用方完全兼容。
+    auto update_odom(const rog_map::Pose& pose, double stamp_sec = std::numeric_limits<double>::quiet_NaN()) -> void;
+    auto
+    update_cloud(const rog_map::PointCloud& cloud, double stamp_sec = std::numeric_limits<double>::quiet_NaN()) -> void;
     auto update_map() -> void;
 
     // 确认地图覆盖世界坐标点 world_pt：

@@ -2,7 +2,6 @@
 
 #include "utils/logger.hpp"
 
-#include <chrono>
 #include <cmath>
 #include <utility>
 
@@ -84,8 +83,7 @@ LocalPerceptionPipeline::LocalPerceptionPipeline(const rog_map::Config& cfg):
     mcfg.static_clear_ratio = cfg_.perception_map_static_clear_ratio;
     mcfg.preview_radius = cfg_.perception_map_preview_radius;
     mcfg.footprint_radius = cfg_.ground_layer_en ? static_cast<double>(cfg_.ground_layer_footprint_radius) : 0.20;
-    mcfg.footprint_ground_offset =
-        cfg_.ground_layer_en ? static_cast<double>(cfg_.ground_layer_footprint_offset) : 0.0;
+    mcfg.footprint_ground_offset = cfg_.ground_layer_en ? static_cast<double>(cfg_.ground_layer_footprint_offset) : 0.0;
     mcfg.tilt_jump_deg = cfg_.perception_map_tilt_jump_deg;
     mcfg.tilt_hold_frames = cfg_.perception_map_tilt_hold_frames;
     mcfg.terrain.robot_height = cfg_.terrain_robot_height;
@@ -106,8 +104,7 @@ LocalPerceptionPipeline::LocalPerceptionPipeline(const rog_map::Config& cfg):
     dcfg.dynamic_max_height = cfg_.perception_nav_dynamic_max_height;
     dcfg.overhang_margin = cfg_.perception_nav_overhang_margin;
     dcfg.tunnel_clearance_z = cfg_.perception_nav_tunnel_clearance_z;
-    dcfg.fallback_ground_offset =
-        cfg_.ground_layer_en ? static_cast<double>(cfg_.ground_layer_footprint_offset) : 0.0;
+    dcfg.fallback_ground_offset = cfg_.ground_layer_en ? static_cast<double>(cfg_.ground_layer_footprint_offset) : 0.0;
     dcfg.ray_clear_margin = cfg_.perception_nav_ray_clear_margin;
     dcfg.miss_clear_frames = cfg_.perception_nav_miss_clear_frames;
     dcfg.decay_in_fov_sec = cfg_.perception_nav_decay_in_fov_sec;
@@ -133,8 +130,14 @@ LocalPerceptionPipeline::LocalPerceptionPipeline(const rog_map::Config& cfg):
         scfg.rpy_deg.z()
     );
 
-    last_empty_warn_t_ =
-        std::chrono::duration<double>(std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+    last_empty_warn_t_ = clock_.nowSec();
+}
+
+auto LocalPerceptionPipeline::setClock(utils::Clock clock) -> void {
+    clock_ = clock;
+    // 构造期默认 steady_clock 的告警基线在切换到仿真/手动时钟域后失效，重新取基线。
+    last_empty_warn_t_ = clock_.nowSec();
+    dynamic_stvl_.setClock(clock);
 }
 
 auto LocalPerceptionPipeline::setMode(MapMode mode) -> void {
@@ -152,18 +155,27 @@ auto LocalPerceptionPipeline::setForgetThresholdForMode(bool mapping_mode) -> vo
     rog_map_ptr_->setForgetThreshold(thresh);
 }
 
-auto LocalPerceptionPipeline::updateOdom(const rog_map::Pose& pose) -> void {
+auto LocalPerceptionPipeline::updateOdom(const rog_map::Pose& pose, double stamp_sec) -> void {
     rog_map_ptr_->updateRobotState(pose);
+    odom_stamp_is_event_ = std::isfinite(stamp_sec) && stamp_sec > 0.0;
+    odom_stamp_sec_ = odom_stamp_is_event_ ? stamp_sec : 0.0;
+    odom_rx_sec_ = clock_.nowSec();
 }
 
-auto LocalPerceptionPipeline::updateCloud(const rog_map::PointCloud& cloud) -> void {
+auto LocalPerceptionPipeline::updateCloud(const rog_map::PointCloud& cloud, double stamp_sec) -> void {
     if (!rog_map_ptr_->robot_state_.rcv) {
         logger::MaMap->warn("No odom received, skip cloud callback.");
         return;
     }
-    const double cbk_t =
-        std::chrono::duration<double>(std::chrono::high_resolution_clock::now().time_since_epoch()).count();
-    if (cbk_t - rog_map_ptr_->robot_state_.rcv_time > cfg_.odom_timeout) {
+
+    // 时钟域安全：事件时间（ROS header.stamp，真机为 Unix epoch）只与事件时间比较；
+    // 本地时钟（steady / 仿真 /clock）只与接收时刻比较，绝不相减。
+    const double now_sec = clock_.nowSec();
+    const bool cloud_is_event = std::isfinite(stamp_sec) && stamp_sec > 0.0;
+    const double age = (cloud_is_event && odom_stamp_is_event_) ? stamp_sec - odom_stamp_sec_ : now_sec - odom_rx_sec_;
+    // age > timeout：odom 过期；age < -timeout：仿真重置/大范围乱序，同样按过期丢弃，
+    // 避免把负年龄当成“永远新鲜”而持续使用错误姿态。
+    if (!std::isfinite(age) || age > cfg_.odom_timeout || age < -cfg_.odom_timeout) {
         logger::MaMap->warn("Odom timeout, skip cloud callback.");
         return;
     }
@@ -171,14 +183,16 @@ auto LocalPerceptionPipeline::updateCloud(const rog_map::PointCloud& cloud) -> v
     std::lock_guard<std::mutex> lock(input_mtx_);
     cloud_ = cloud;
     pc_pose_ = std::make_pair(rog_map_ptr_->robot_state_.p, rog_map_ptr_->robot_state_.q);
+    pending_cloud_stamp_sec_ = cloud_is_event ? stamp_sec : now_sec;
     ++unfinished_frame_cnt_;
     map_empty_ = false;
 }
 
-auto LocalPerceptionPipeline::processPendingFrame(const StaticNavContext& static_ctx)
-    -> std::optional<LocalTerrainFrame> {
+auto LocalPerceptionPipeline::processPendingFrame(const StaticNavContext& static_ctx
+) -> std::optional<LocalTerrainFrame> {
     int pending = 0;
     bool empty = true;
+    double pending_stamp_sec = 0.0;
     {
         std::lock_guard<std::mutex> lock(input_mtx_);
         empty = map_empty_;
@@ -186,13 +200,13 @@ auto LocalPerceptionPipeline::processPendingFrame(const StaticNavContext& static
         if (!empty && pending > 0) {
             std::swap(scratch_pc_, cloud_);
             scratch_pose_ = pc_pose_;
+            pending_stamp_sec = pending_cloud_stamp_sec_;
             unfinished_frame_cnt_ = 0;
         }
     }
 
     if (empty) {
-        const double cur_t =
-            std::chrono::duration<double>(std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+        const double cur_t = clock_.nowSec();
         if (cfg_.ros_callback_en && (cur_t - last_empty_warn_t_ > 1.0)) {
             logger::MaMap->warn("No point cloud input, check the topic name.");
             last_empty_warn_t_ = cur_t;
@@ -239,13 +253,8 @@ auto LocalPerceptionPipeline::processPendingFrame(const StaticNavContext& static
                 /*build_local_preview=*/true
             );
         } else {
-            frame = dynamic_stvl_.update(
-                scratch_pts_,
-                sp,
-                scratch_pose_.second,
-                sensor_model_,
-                static_ctx
-            );
+            frame = dynamic_stvl_
+                        .update(scratch_pts_, sp, scratch_pose_.second, sensor_model_, static_ctx, pending_stamp_sec);
         }
 
         if (frame.has_value()) {

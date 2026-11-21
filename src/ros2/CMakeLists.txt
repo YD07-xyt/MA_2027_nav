@@ -17,6 +17,7 @@ target_include_directories(${PROJECT_NAME} PUBLIC
   ${geometry_msgs_INCLUDE_DIRS}
   ${nav_msgs_INCLUDE_DIRS}
   ${visualization_msgs_INCLUDE_DIRS}
+  ${rosgraph_msgs_INCLUDE_DIRS}
   ${pcl_conversions_INCLUDE_DIRS}
   ${tf2_ros_INCLUDE_DIRS}
   ${tf2_INCLUDE_DIRS}
@@ -30,6 +31,7 @@ target_link_libraries(ros2 PUBLIC
     ${nav_msgs_LIBRARIES}
     ${sensor_msgs_LIBRARIES}
     ${visualization_msgs_LIBRARIES}
+    ${rosgraph_msgs_LIBRARIES}
     ${std_srvs_LIBRARIES}
     ${pcl_conversions_LIBRARIES}
     tf2::tf2

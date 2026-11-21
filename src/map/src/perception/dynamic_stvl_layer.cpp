@@ -72,6 +72,7 @@ auto DynamicStvlLayer::reset() -> void {
     has_last_time_ = false;
     last_time_was_explicit_ = false;
     last_explicit_sec_ = 0.0;
+    last_wall_sec_ = 0.0;
 }
 
 auto DynamicStvlLayer::computeEffectiveDt(double now_sec) -> float {
@@ -79,19 +80,34 @@ auto DynamicStvlLayer::computeEffectiveDt(double now_sec) -> float {
     if (now_sec >= 0.0 && std::isfinite(now_sec)) {
         if (has_last_time_ && last_time_was_explicit_) {
             const double diff = now_sec - last_explicit_sec_;
-            raw_dt = (diff > 0.0) ? static_cast<float>(diff) : cfg_.nominal_dt_sec;
+            if (diff < 0.0) {
+                // 仿真重置 / 时钟回退：本帧不推进衰减时间，并以新时间重建基线。
+                last_explicit_sec_ = now_sec;
+                last_time_was_explicit_ = true;
+                has_last_time_ = true;
+                return 0.0f;
+            }
+            raw_dt = static_cast<float>(diff);
         }
         last_explicit_sec_ = now_sec;
         last_time_was_explicit_ = true;
         has_last_time_ = true;
     } else {
-        const auto now_tp = std::chrono::steady_clock::now();
+        const double now_wall_sec = clock_.nowSec();
         if (has_last_time_ && !last_time_was_explicit_) {
-            raw_dt = std::chrono::duration<float>(now_tp - last_wall_tp_).count();
+            const double diff = now_wall_sec - last_wall_sec_;
+            last_wall_sec_ = now_wall_sec;
+            has_last_time_ = true;
+            last_time_was_explicit_ = false;
+            if (diff < 0.0) {
+                return 0.0f;
+            }
+            raw_dt = static_cast<float>(diff);
+        } else {
+            last_wall_sec_ = now_wall_sec;
+            last_time_was_explicit_ = false;
+            has_last_time_ = true;
         }
-        last_wall_tp_ = now_tp;
-        last_time_was_explicit_ = false;
-        has_last_time_ = true;
     }
     return std::clamp(raw_dt, cfg_.dt_min_sec, cfg_.dt_max_sec);
 }

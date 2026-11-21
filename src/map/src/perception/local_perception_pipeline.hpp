@@ -10,9 +10,11 @@
 #include "map/perception/online_terrain_mapper.hpp"
 #include "map/perception/sensor_model.hpp"
 #include "map/perception/terrain_analysis.hpp"
+#include "utils/clock.hpp"
 
 #include <atomic>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -37,8 +39,10 @@ public:
         dynamic_stvl_.reset();
     }
     auto setForgetThresholdForMode(bool mapping_mode) -> void;
-    auto updateOdom(const rog_map::Pose& pose) -> void;
-    auto updateCloud(const rog_map::PointCloud& cloud) -> void;
+    auto setClock(utils::Clock clock) -> void;
+    auto updateOdom(const rog_map::Pose& pose, double stamp_sec = std::numeric_limits<double>::quiet_NaN()) -> void;
+    auto
+    updateCloud(const rog_map::PointCloud& cloud, double stamp_sec = std::numeric_limits<double>::quiet_NaN()) -> void;
 
     // 若存在待处理点云帧，则按当前后端与模式执行 3D 感知处理，输出本帧 LocalTerrainFrame；
     // 无新帧时返回 std::nullopt。
@@ -72,6 +76,13 @@ private:
     bool use_stvl_prior_ = true;
     std::atomic<uint8_t> mode_ {static_cast<uint8_t>(MapMode::MAPPING)};
 
+    // 时间源：默认 steady_clock；use_sim_time 时由 ROS 适配层注入 /clock 原子时间源。
+    utils::Clock clock_ = utils::Clock::steady();
+    // 里程计新鲜度判断的时钟域安全状态：事件时间只与事件时间比较，接收时间只与本地时钟比较。
+    double odom_stamp_sec_ = 0.0;
+    bool odom_stamp_is_event_ = false;
+    double odom_rx_sec_ = 0.0;
+
     // 既有 ROGMap / GroundLayer / TerrainAnalyzer（legacy_rog 后端使用；stvl_prior 下仍安全构造以兼容旧查询接口）
     std::shared_ptr<rog_map::ROGMap> rog_map_ptr_;
     Terrain::TerrainAnalyzer terrain_analyzer_;
@@ -85,6 +96,8 @@ private:
     mutable std::mutex input_mtx_;
     rog_map::PointCloud cloud_;
     rog_map::Pose pc_pose_;
+    // 与 cloud_ 同锁保护：本帧事件时间（无有效 header.stamp 时为接收时刻）。
+    double pending_cloud_stamp_sec_ = 0.0;
     int unfinished_frame_cnt_ = 0;
     bool map_empty_ = true;
 

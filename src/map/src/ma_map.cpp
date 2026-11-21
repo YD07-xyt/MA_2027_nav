@@ -48,12 +48,16 @@ auto MaMap::set_mapping_model(bool mapping_model) -> void {
     set_mode(mapping_model ? MapMode::MAPPING : MapMode::NAVIGATION);
 }
 
-auto MaMap::update_odom(const rog_map::Pose& pose) -> void {
-    impl_->perception.updateOdom(pose);
+auto MaMap::set_clock(utils::Clock clock) -> void {
+    impl_->perception.setClock(clock);
 }
 
-auto MaMap::update_cloud(const rog_map::PointCloud& cloud) -> void {
-    impl_->perception.updateCloud(cloud);
+auto MaMap::update_odom(const rog_map::Pose& pose, double stamp_sec) -> void {
+    impl_->perception.updateOdom(pose, stamp_sec);
+}
+
+auto MaMap::update_cloud(const rog_map::PointCloud& cloud, double stamp_sec) -> void {
+    impl_->perception.updateCloud(cloud, stamp_sec);
 }
 
 auto MaMap::update_map() -> void {

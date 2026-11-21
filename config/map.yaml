@@ -85,7 +85,7 @@ rog_map:
         rise_votes: 3                  # 地面上升需连续几帧一致
         rise_max: 0.24                 # 高于地面超过此值的量测当悬空物（= robot_height）
         footprint_radius: 0.20         # 车走过的格按 base 高度记为地面(m)
-        footprint_ground_offset: 0.0   # base_odom 到脚底的高度(m)，未核实，先取 0
+        footprint_ground_offset: 0.06   # base_odom 到脚底的高度(m)
         seed_radius: 1.5               # 启动时车周盲区按 base 平面给低置信地面(m)
         # 姿态跳变门控：机体 z 轴相邻帧转角 > tilt_jump_deg(度) 时，本帧及其后 tilt_hold_frames 帧
         # 点云配准不可信（压过凸起/上下坡瞬间），不更新地面层，避免平地被记成低洼坑。0 关闭
@@ -126,7 +126,7 @@ rog_map:
     # 雷达相对 base_odom 的位置（机体系, m），射线从这里出发。点云已是世界系，雷达位置只能由此给出。
     # 0.194：rosbag 10_23 中 /lio/odom 与 /lio/base_odom 的高度差（tf_static 写的是 0.15，未核实以哪个为准）。
     # 设为 [0, 0, 0] 恢复旧行为（射线从 base 出发）。
-    sensor_offset: [0.0, 0.0, 0.194]
+    sensor_offset: [0.0, 0.0, 0.15]
 
     # 概率参数
     p_min: 0.12
@@ -150,9 +150,9 @@ rog_map:
       fov_min_elev_deg: -7.0           # Mid-360 雷达系垂直视场下限 (deg)
       fov_max_elev_deg: 52.0           # Mid-360 雷达系垂直视场上限 (deg)
       fov_margin_deg: 3.0              # 视场边界容差 (deg)
-      min_range: 0.20                  # 最小有效测距 (m)
+      min_range: 0.50                  # 最小有效测距 (m)
       max_range: 15.0                  # 最大视场与射线清除有效测距 (m)
-      self_filter_min: [-0.30, -0.30, -0.05] # 机体自滤盒下界 [x, y, z] (m, base_odom 系)
+      self_filter_min: [-0.30, -0.30, -0.08] # 机体自滤盒下界 [x, y, z] (m, base_odom 系)
       self_filter_max: [0.30, 0.30, 0.35]    # 机体自滤盒上界 [x, y, z] (m, base_odom 系)
     mapping:
       trust_range: 4.0                 # 建图允许写入静态占据命中的最大水平距离 (m)

@@ -7,12 +7,12 @@ ros2:
   clickedPoint_topic_name: "/clicked_point"   # rviz 点选话题，用于画区域等 全局坐标系
   odom_topic_name: "/lio/base_odom"           # 里程计话题，提供位置/速度/姿态 全局坐标系
   cmd_vel_name: "/cmd_vel_chassis" #"/cmd_vel" #"/cmd_vel_chassis" 
-  save_global_map_path:  "src/navigation/map"
+  save_global_map_path:  "map"
   save_map_srv_topic: "/save_global_map"
   map_params_path: "config/map.yaml"   # 地图参数
-  global_map_path: "src/navigation/map/global_maps.pgm" # 全局栅格地图
+  global_map_path: "map/global_map.pgm" # 全局栅格地图
   # 点击隧道区域保存/加载
-  tunnel_regions_path: "src/navigation/map/maps/tunnel_regions.yaml"
+  tunnel_regions_path: "map/tunnel_regions.yaml"
   save_tunnel_regions_srv_topic: "/save_tunnel_regions"
 
 # ==================== 地图模式 ====================
