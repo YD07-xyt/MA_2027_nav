@@ -336,8 +336,11 @@ auto StaticTerrainBuilder::build(const VoxelColumnGrid& grid) const -> BuildResu
 
     // 阶段 1.5A：将下方已被射线扫空且底面 5x5 局部水平一致的 HARD_OCC 悬空列（如较厚或分层的无地面隧道限高杆）
     // 降级为 MAYBE_OVERHANG 交给阶段 2 核验净空；底面倾斜（斜坡背面/斜拱）或孤立墙柱保持 HARD_OCC。
+    // 采用对称垂向带 + 少量离群点容忍（跳过实心墙柱格），避免单格墙沿噪点一票否决整条限高杆。
     if (!grid.is_solid_mesh && has_cleared && any_cleared_below) {
         std::vector<size_t> promote_indices;
+        std::vector<float> inliers;
+        inliers.reserve(25);
         for (int ix = 0; ix < nx; ++ix) {
             const size_t row = static_cast<size_t>(ix) * static_cast<size_t>(ny);
             for (int iy = 0; iy < ny; ++iy) {
@@ -349,36 +352,38 @@ auto StaticTerrainBuilder::build(const VoxelColumnGrid& grid) const -> BuildResu
                 if (!std::isfinite(lo)) {
                     continue;
                 }
-                float min_lo = lo;
-                float max_lo = lo;
-                int same_underside_cnt = 0;
-                bool flat_ok = true;
+                inliers.clear();
+                int outlier_cnt = 0;
                 const int x_lo = std::max(0, ix - 2);
                 const int x_hi = std::min(nx - 1, ix + 2);
                 const int y_lo = std::max(0, iy - 2);
                 const int y_hi = std::min(ny - 1, iy + 2);
-                for (int jx = x_lo; jx <= x_hi && flat_ok; ++jx) {
+                for (int jx = x_lo; jx <= x_hi; ++jx) {
                     const size_t jrow = static_cast<size_t>(jx) * static_cast<size_t>(ny);
                     for (int jy = y_lo; jy <= y_hi; ++jy) {
                         const size_t jidx = jrow + static_cast<size_t>(jy);
+                        if (col_kind[jidx] == ColKind::HARD_OCC && has_cleared_below[jidx] == 0) {
+                            continue;
+                        }
                         const float zz = lowest_occ_z[jidx];
-                        if (!std::isfinite(zz) || zz < lo - cfg_.max_surface_thickness) {
+                        if (!std::isfinite(zz) || std::abs(zz - lo) > cfg_.max_surface_thickness) {
                             continue;
                         }
                         const float d_xy = std::hypot(static_cast<float>(jx - ix), static_cast<float>(jy - iy)) * res;
                         if (std::abs(zz - lo) > d_xy * tan_max_slope + cfg_.step_tol) {
-                            flat_ok = false;
-                            break;
-                        }
-                        min_lo = std::min(min_lo, zz);
-                        max_lo = std::max(max_lo, zz);
-                        if (std::abs(zz - lo) <= 0.06f) {
-                            ++same_underside_cnt;
+                            ++outlier_cnt;
+                        } else {
+                            inliers.push_back(zz);
                         }
                     }
                 }
-                if (flat_ok && (max_lo - min_lo) <= 0.06f && same_underside_cnt >= 2) {
-                    promote_indices.push_back(idx);
+                if (inliers.size() >= 2 && outlier_cnt * 4 <= static_cast<int>(inliers.size())) {
+                    std::sort(inliers.begin(), inliers.end());
+                    const float span = (inliers.size() >= 5) ? (inliers[inliers.size() - 2] - inliers[1])
+                                                             : (inliers.back() - inliers.front());
+                    if (span <= 0.06f) {
+                        promote_indices.push_back(idx);
+                    }
                 }
             }
         }
@@ -615,8 +620,9 @@ auto StaticTerrainBuilder::build(const VoxelColumnGrid& grid) const -> BuildResu
     if (cfg_.overhang_ground_radius > 0) {
         const std::vector<ColKind> kind_snap = col_kind;
         const std::vector<float> ground_snap = raw_ground;
+        const int ray_search_max_r = std::max(cfg_.overhang_ground_radius, 16);
         std::vector<float> ring_vals;
-        ring_vals.reserve(static_cast<size_t>(8 * cfg_.overhang_ground_radius));
+        ring_vals.reserve(static_cast<size_t>(8 * ray_search_max_r));
         std::vector<uint8_t> ray_recovered;
         std::vector<size_t> bfs_q;
         if (!grid.is_solid_mesh && has_cleared && any_cleared_below) {
@@ -643,8 +649,9 @@ auto StaticTerrainBuilder::build(const VoxelColumnGrid& grid) const -> BuildResu
                     continue;
                 }
 
-                const int max_r = ray_confirmed_overhang ? cfg_.overhang_ground_radius : 2;
+                const int max_r = ray_confirmed_overhang ? ray_search_max_r : 2;
                 float ref_g = kNan;
+                int found_r = 0;
                 bool has_pos_x = false;
                 bool has_neg_x = false;
                 bool has_pos_y = false;
@@ -684,17 +691,32 @@ auto StaticTerrainBuilder::build(const VoxelColumnGrid& grid) const -> BuildResu
                     }
                     if (!ring_vals.empty()) {
                         ref_g = medianOf(ring_vals);
+                        found_r = r;
                         break;
                     }
                 }
 
                 if (std::isfinite(ref_g)) {
                     if (ray_confirmed_overhang) {
-                        // 进一步核验射线确实扫空了 [ref_g + 0.03, z_lo - 0.02] 这段真实净空，避免误将地下噪声当扫空
+                        // 进一步核验射线确实扫空了 [ref_g + 0.03, z_lo - 0.02] 这段真实净空，避免误将地下噪声当扫空；
+                        // 超出基础搜索半径时额外校验扫空带下沿贴近 ref_g（<= 0.15 m），防止高台矮杆错借台外低地。
                         merged_clr = grid.cleared_spans[idx];
                         mergeSpans(merged_clr, 0.01f);
                         const float real_clr = clearedCoverage(merged_clr, ref_g + 0.03f, z_lo - 0.02f);
-                        if (real_clr >= cfg_.min_cleared_overhang_span) {
+                        bool low_clr_ok = true;
+                        if (found_r > cfg_.overhang_ground_radius) {
+                            float low_clr = kNan;
+                            for (const auto& s: merged_clr) {
+                                if (s.z_hi > ref_g + 0.03f && s.z_lo < z_lo - 0.02f) {
+                                    const float clipped_lo = std::max(s.z_lo, ref_g + 0.03f);
+                                    low_clr = std::isfinite(low_clr) ? std::min(low_clr, clipped_lo) : clipped_lo;
+                                }
+                            }
+                            if (!std::isfinite(low_clr) || (low_clr - ref_g) > 0.15f) {
+                                low_clr_ok = false;
+                            }
+                        }
+                        if (real_clr >= cfg_.min_cleared_overhang_span && low_clr_ok) {
                             col_kind[idx] = ColKind::CANDIDATE_GROUND;
                             raw_ground[idx] = ref_g;
                             overhang_z[idx] = z_lo;
@@ -752,6 +774,85 @@ auto StaticTerrainBuilder::build(const VoxelColumnGrid& grid) const -> BuildResu
                             ray_recovered[v] = 1;
                             bfs_q.push_back(v);
                         }
+                    }
+                }
+            }
+        }
+
+        // 悬空顶沿延续（<= 2 格）：解决隧道出口/门楣最外 1~2 格因缺少远方反射物或射线密度低
+        // 未触发 has_cleared_below 而被保留为高处地面、进而在阶段 4.1 污染邻接真地面的问题。
+        // 仅从已确认悬空格沿同高顶面（|z_lo - ref_ov| <= 0.08 m）向非 HARD_OCC 格扩展，绝不碰竖墙/柱。
+        if (!grid.is_solid_mesh && has_cleared) {
+            std::vector<uint8_t> edge_dist;
+            std::vector<size_t> edge_q;
+            for (size_t idx = 0; idx < n_cells; ++idx) {
+                if (col_kind[idx] == ColKind::CANDIDATE_GROUND && std::isfinite(raw_ground[idx])
+                    && std::isfinite(overhang_z[idx]))
+                {
+                    if (edge_dist.empty()) {
+                        edge_dist.assign(n_cells, 255);
+                    }
+                    edge_dist[idx] = 0;
+                    edge_q.push_back(idx);
+                }
+            }
+            size_t eq_head = 0;
+            while (eq_head < edge_q.size()) {
+                const size_t u = edge_q[eq_head++];
+                const uint8_t du = edge_dist[u];
+                if (du >= 2) {
+                    continue;
+                }
+                const int ux = static_cast<int>(u / static_cast<size_t>(ny));
+                const int uy = static_cast<int>(u % static_cast<size_t>(ny));
+                const float ref_g = raw_ground[u];
+                const float ref_ov = overhang_z[u];
+                if (!std::isfinite(ref_g) || !std::isfinite(ref_ov)) {
+                    continue;
+                }
+                const int jx_lo = std::max(0, ux - 1);
+                const int jx_hi = std::min(nx - 1, ux + 1);
+                const int jy_lo = std::max(0, uy - 1);
+                const int jy_hi = std::min(ny - 1, uy + 1);
+                for (int jx = jx_lo; jx <= jx_hi; ++jx) {
+                    const size_t jrow = static_cast<size_t>(jx) * static_cast<size_t>(ny);
+                    for (int jy = jy_lo; jy <= jy_hi; ++jy) {
+                        if (jx == ux && jy == uy) {
+                            continue;
+                        }
+                        const size_t v = jrow + static_cast<size_t>(jy);
+                        if (edge_dist[v] != 255) {
+                            continue;
+                        }
+                        if (col_kind[v] != ColKind::CANDIDATE_GROUND && col_kind[v] != ColKind::MAYBE_OVERHANG) {
+                            continue;
+                        }
+                        if (std::isfinite(overhang_z[v])) {
+                            continue;
+                        }
+                        const float z_lo = lowest_occ_z[v];
+                        if (!std::isfinite(z_lo) || (z_lo - ref_g) < cfg_.min_overhang_clearance
+                            || std::abs(z_lo - ref_ov) > 0.08f)
+                        {
+                            continue;
+                        }
+                        // 第 2 步（du > 0）要求下方至少有 1 格真实射线净空，防止沿无净空实心结构盲目外扩
+                        if (du > 0) {
+                            float real_clr = 0.0f;
+                            if (!grid.cleared_spans[v].empty()) {
+                                merged_clr = grid.cleared_spans[v];
+                                mergeSpans(merged_clr, 0.01f);
+                                real_clr = clearedCoverage(merged_clr, ref_g + 0.03f, z_lo - 0.02f);
+                            }
+                            if (real_clr < res) {
+                                continue;
+                            }
+                        }
+                        col_kind[v] = ColKind::CANDIDATE_GROUND;
+                        raw_ground[v] = ref_g;
+                        overhang_z[v] = z_lo;
+                        edge_dist[v] = static_cast<uint8_t>(du + 1);
+                        edge_q.push_back(v);
                     }
                 }
             }

@@ -141,11 +141,35 @@ private:
     auto getOrCreateChunkLocked(const ChunkKey& key) -> Chunk*;
     auto findChunkLocked(const ChunkKey& key) const -> const Chunk*;
     auto findChunkMutableLocked(const ChunkKey& key) -> Chunk*;
+    auto isRawStaticOccupied(const VoxelCell& cell) const -> bool;
+    auto findVoxelLocked(int32_t vx, int32_t vy, int32_t vz) const -> const VoxelCell*;
+    auto
+    isWallBleedLocked(int32_t vx, int32_t vy, int32_t vz, const VoxelCell& cell, const ChunkKey& ck, const Chunk& chunk)
+        const -> bool;
+    auto isStaticOccupiedLocked(
+        int32_t vx,
+        int32_t vy,
+        int32_t vz,
+        const VoxelCell& cell,
+        const ChunkKey& ck,
+        const Chunk& chunk
+    ) const -> bool;
+    auto columnHasStaticOccupiedLocked(int32_t vx, int32_t vy) const -> bool;
 
-    auto castClearRayLocked(const Eigen::Vector3d& origin, const Eigen::Vector3d& target, uint32_t frame_seq) -> void;
+    auto castClearRayLocked(
+        const Eigen::Vector3d& origin,
+        const Eigen::Vector3d& target,
+        uint32_t frame_seq,
+        std::vector<uint64_t>* erased_cols
+    ) -> void;
 
-    auto extractColumnGridLocked(int32_t min_vx, int32_t max_vx, int32_t min_vy, int32_t max_vy) const
-        -> StaticTerrainBuilder::VoxelColumnGrid;
+    auto extractColumnGridLocked(
+        int32_t min_vx,
+        int32_t max_vx,
+        int32_t min_vy,
+        int32_t max_vy,
+        std::vector<uint8_t>* erased_cols = nullptr
+    ) const -> StaticTerrainBuilder::VoxelColumnGrid;
 
     Config cfg_;
     double inv_res_ = 20.0;
@@ -157,6 +181,7 @@ private:
     std::unordered_map<uint64_t, int32_t> tile_max_cz_;
     std::unordered_map<uint64_t, float> footprint_ground_;
     std::vector<Eigen::Vector3d> clear_targets_scratch_; // 每帧复用，避免 3D DDA 目标列表重复分配
+    std::vector<uint64_t> erased_cols_scratch_; // 本帧因射线扫空失去静态占据的 (vx, vy) 列表，供跨预览边界 2D 同步
     uint32_t frame_seq_ = 0;
     bool has_prev_pose_ = false;
     Eigen::Quaterniond prev_q_base_w_ = Eigen::Quaterniond::Identity();

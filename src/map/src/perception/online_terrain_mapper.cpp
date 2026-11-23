@@ -11,6 +11,14 @@ namespace ma_map {
 namespace {
 
     constexpr int32_t kChunkSize = 16;
+    constexpr int kWallBleedMinClears = 3;
+    constexpr float kWallBleedClearRatio = 0.8f;
+    constexpr int kWallBleedMinNeighborHits = 10;
+    constexpr float kWallBleedNeighborClearRatio = 0.25f;
+    constexpr int32_t kWallBleedMinNeighborVertSpanMm = 65; // 邻格垂向延续 >= 6.5 cm 才认定为竖墙，保护斜坡/平地边界
+    constexpr int kPreviewEmitHalo = 6; // 预览边界内缩 halo（格），与 overhang_ground_radius=6 对齐
+    constexpr int32_t kZMinQuantileStepDownMm = 9; // ~10% 分位下移步长 (mm)
+    constexpr int32_t kZMinQuantileStepUpMm = 1; // ~10% 分位上移步长 (mm)
 
     inline auto floorDiv16(int32_t v) -> int32_t {
         return (v >= 0) ? (v / kChunkSize) : -((-v + kChunkSize - 1) / kChunkSize);
@@ -71,6 +79,7 @@ auto OnlineTerrainMapper::reset() -> void {
     tile_max_cz_.clear();
     footprint_ground_.clear();
     clear_targets_scratch_.clear();
+    erased_cols_scratch_.clear();
     frame_seq_ = 0;
     has_prev_pose_ = false;
     prev_q_base_w_ = Eigen::Quaterniond::Identity();
@@ -110,10 +119,128 @@ auto OnlineTerrainMapper::findChunkMutableLocked(const ChunkKey& key) -> Chunk* 
     return (it != chunks_.end()) ? it->second.get() : nullptr;
 }
 
+auto OnlineTerrainMapper::isRawStaticOccupied(const VoxelCell& cell) const -> bool {
+    return static_cast<int>(cell.hits) >= cfg_.static_min_hits
+        && static_cast<float>(cell.clears) <= cfg_.static_clear_ratio * static_cast<float>(cell.hits)
+        && cell.z_min_mm <= cell.z_max_mm;
+}
+
+auto OnlineTerrainMapper::findVoxelLocked(int32_t vx, int32_t vy, int32_t vz) const -> const VoxelCell* {
+    const ChunkKey ck {floorDiv16(vx), floorDiv16(vy), floorDiv16(vz)};
+    const Chunk* ch = findChunkLocked(ck);
+    if (ch == nullptr) {
+        return nullptr;
+    }
+    return &ch->cells[localVoxelIndex(mod16(vx), mod16(vy), mod16(vz))];
+}
+
+auto OnlineTerrainMapper::isWallBleedLocked(
+    int32_t vx,
+    int32_t vy,
+    int32_t vz,
+    const VoxelCell& cell,
+    const ChunkKey& ck,
+    const Chunk& chunk
+) const -> bool {
+    if (static_cast<int>(cell.clears) < kWallBleedMinClears
+        || static_cast<float>(cell.clears) < kWallBleedClearRatio * static_cast<float>(cell.hits))
+    {
+        return false;
+    }
+
+    const int min_nb_hits = std::max(kWallBleedMinNeighborHits, (3 * static_cast<int>(cell.hits) + 1) / 2);
+    const int32_t base_x = ck.cx * kChunkSize;
+    const int32_t base_y = ck.cy * kChunkSize;
+    const int32_t base_z = ck.cz * kChunkSize;
+
+    auto fetchCell = [&](int32_t nx, int32_t ny, int32_t nz) -> const VoxelCell* {
+        const int32_t nlx = nx - base_x;
+        const int32_t nly = ny - base_y;
+        const int32_t nlz = nz - base_z;
+        if (nlx >= 0 && nlx < kChunkSize && nly >= 0 && nly < kChunkSize && nlz >= 0 && nlz < kChunkSize) {
+            return &chunk.cells[localVoxelIndex(nlx, nly, nlz)];
+        }
+        return findVoxelLocked(nx, ny, nz);
+    };
+
+    constexpr int32_t kDirs[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+    for (const auto& d: kDirs) {
+        const int32_t nvx = vx + d[0];
+        const int32_t nvy = vy + d[1];
+        const VoxelCell* nb = fetchCell(nvx, nvy, vz);
+        if (nb == nullptr || static_cast<int>(nb->hits) < min_nb_hits
+            || static_cast<float>(nb->clears) > kWallBleedNeighborClearRatio * static_cast<float>(nb->hits)
+            || nb->z_min_mm > nb->z_max_mm)
+        {
+            continue;
+        }
+        // 要求邻格沿竖直方向延续至少 6.5 cm，确认真实竖墙而非跨体素 Z 边界的平地/斜坡
+        const VoxelCell* nb_up = fetchCell(nvx, nvy, vz + 1);
+        if (nb_up != nullptr && isRawStaticOccupied(*nb_up)
+            && (static_cast<int32_t>(nb_up->z_max_mm) - static_cast<int32_t>(nb->z_min_mm))
+                >= kWallBleedMinNeighborVertSpanMm)
+        {
+            return true;
+        }
+        const VoxelCell* nb_dn = fetchCell(nvx, nvy, vz - 1);
+        if (nb_dn != nullptr && isRawStaticOccupied(*nb_dn)
+            && (static_cast<int32_t>(nb->z_max_mm) - static_cast<int32_t>(nb_dn->z_min_mm))
+                >= kWallBleedMinNeighborVertSpanMm)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+auto OnlineTerrainMapper::isStaticOccupiedLocked(
+    int32_t vx,
+    int32_t vy,
+    int32_t vz,
+    const VoxelCell& cell,
+    const ChunkKey& ck,
+    const Chunk& chunk
+) const -> bool {
+    if (!isRawStaticOccupied(cell)) {
+        return false;
+    }
+    return !isWallBleedLocked(vx, vy, vz, cell, ck, chunk);
+}
+
+auto OnlineTerrainMapper::columnHasStaticOccupiedLocked(int32_t vx, int32_t vy) const -> bool {
+    const int32_t cx = floorDiv16(vx);
+    const int32_t cy = floorDiv16(vy);
+    const auto max_it = tile_max_cz_.find(packXY(cx, cy));
+    if (max_it == tile_max_cz_.end()) {
+        return false;
+    }
+    const double min_z_bound = std::min(cfg_.min_z, static_cast<double>(cfg_.terrain.min_ground_height));
+    const int32_t min_cz = floorDiv16(static_cast<int32_t>(std::floor(min_z_bound * inv_res_))) - 1;
+    const int32_t max_cz = max_it->second;
+    const int32_t lx = mod16(vx);
+    const int32_t ly = mod16(vy);
+    for (int32_t cz = min_cz; cz <= max_cz; ++cz) {
+        const ChunkKey ck {cx, cy, cz};
+        const Chunk* ch = findChunkLocked(ck);
+        if (ch == nullptr) {
+            continue;
+        }
+        const int32_t base_z = cz * kChunkSize;
+        for (int32_t lz = 0; lz < kChunkSize; ++lz) {
+            const VoxelCell& cell = ch->cells[localVoxelIndex(lx, ly, lz)];
+            if (isStaticOccupiedLocked(vx, vy, base_z + lz, cell, ck, *ch)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 auto OnlineTerrainMapper::castClearRayLocked(
     const Eigen::Vector3d& origin,
     const Eigen::Vector3d& target,
-    uint32_t frame_seq
+    uint32_t frame_seq,
+    std::vector<uint64_t>* erased_cols
 ) -> void {
     if (!origin.allFinite() || !target.allFinite() || !std::isfinite(cfg_.clear_range)
         || !std::isfinite(cfg_.clear_stop_margin) || !std::isfinite(cfg_.resolution))
@@ -214,10 +341,34 @@ auto OnlineTerrainMapper::castClearRayLocked(
                     }
                 }
                 if (allow_clear) {
+                    const uint16_t prev_clears = cell.clears;
                     if (cell.clears < std::numeric_limits<uint16_t>::max()) {
                         ++cell.clears;
                     }
                     cell.last_clear_frame = frame_seq;
+                    if (erased_cols != nullptr && static_cast<int>(cell.hits) >= cfg_.static_min_hits
+                        && cell.z_min_mm <= cell.z_max_mm)
+                    {
+                        const float max_clr = cfg_.static_clear_ratio * static_cast<float>(cell.hits);
+                        const bool crossed_ratio =
+                            (static_cast<float>(prev_clears) <= max_clr) && (static_cast<float>(cell.clears) > max_clr);
+                        bool crossed_wall_bleed = false;
+                        if (!crossed_ratio && static_cast<float>(cell.clears) <= max_clr) {
+                            const float wb_thr = kWallBleedClearRatio * static_cast<float>(cell.hits);
+                            const bool was_wb_cand = (static_cast<int>(prev_clears) >= kWallBleedMinClears)
+                                && (static_cast<float>(prev_clears) >= wb_thr);
+                            const bool now_wb_cand = (static_cast<int>(cell.clears) >= kWallBleedMinClears)
+                                && (static_cast<float>(cell.clears) >= wb_thr);
+                            if (!was_wb_cand && now_wb_cand
+                                && isWallBleedLocked(vx, vy, vz, cell, cached_ck, *cached_chunk))
+                            {
+                                crossed_wall_bleed = true;
+                            }
+                        }
+                        if (crossed_ratio || crossed_wall_bleed) {
+                            erased_cols->push_back(packXY(vx, vy));
+                        }
+                    }
                 }
             }
         }
@@ -238,8 +389,16 @@ auto OnlineTerrainMapper::castClearRayLocked(
     }
 }
 
-auto OnlineTerrainMapper::extractColumnGridLocked(int32_t min_vx, int32_t max_vx, int32_t min_vy, int32_t max_vy) const
-    -> StaticTerrainBuilder::VoxelColumnGrid {
+auto OnlineTerrainMapper::extractColumnGridLocked(
+    int32_t min_vx,
+    int32_t max_vx,
+    int32_t min_vy,
+    int32_t max_vy,
+    std::vector<uint8_t>* erased_cols
+) const -> StaticTerrainBuilder::VoxelColumnGrid {
+    if (erased_cols != nullptr) {
+        erased_cols->clear();
+    }
     if (max_vx < min_vx || max_vy < min_vy) {
         return {};
     }
@@ -257,17 +416,14 @@ auto OnlineTerrainMapper::extractColumnGridLocked(int32_t min_vx, int32_t max_vx
     }
 
     auto grid = StaticTerrainBuilder::VoxelColumnGrid::create(geom, /*solid_mesh=*/false, /*ray_clearing=*/true);
+    if (erased_cols != nullptr) {
+        erased_cols->assign(static_cast<size_t>(nx) * static_cast<size_t>(ny), 0);
+    }
     const float res_f = static_cast<float>(cfg_.resolution);
 
-    for (const auto& kv: chunks_) {
-        const ChunkKey& ck = kv.first;
+    auto processChunk = [&](const ChunkKey& ck, const Chunk& chunk) {
         const int32_t base_x = ck.cx * kChunkSize;
         const int32_t base_y = ck.cy * kChunkSize;
-        // 先做 chunk 级 AABB 拒绝，完全跳过 preview bbox 外的稀疏块（不做任何逐格计算）。
-        if (base_x + kChunkSize - 1 < min_vx || base_x > max_vx || base_y + kChunkSize - 1 < min_vy || base_y > max_vy)
-        {
-            continue;
-        }
         const int32_t base_z = ck.cz * kChunkSize;
 
         const int32_t x_lo = std::max(base_x, min_vx);
@@ -275,7 +431,6 @@ auto OnlineTerrainMapper::extractColumnGridLocked(int32_t min_vx, int32_t max_vx
         const int32_t y_lo = std::max(base_y, min_vy);
         const int32_t y_hi = std::min(base_y + kChunkSize - 1, max_vy);
 
-        const Chunk& chunk = *kv.second;
         for (int32_t vx = x_lo; vx <= x_hi; ++vx) {
             const int32_t lx = vx - base_x;
             const size_t row_off = static_cast<size_t>(vx - min_vx) * static_cast<size_t>(ny);
@@ -287,32 +442,88 @@ auto OnlineTerrainMapper::extractColumnGridLocked(int32_t min_vx, int32_t max_vx
                     if (cell.hits == 0 && cell.clears == 0) {
                         continue;
                     }
-                    const bool is_static_occ = (static_cast<int>(cell.hits) >= cfg_.static_min_hits)
-                        && (static_cast<float>(cell.clears) <= cfg_.static_clear_ratio * static_cast<float>(cell.hits))
-                        && (cell.z_min_mm <= cell.z_max_mm);
-                    if (is_static_occ) {
+                    if (isStaticOccupiedLocked(vx, vy, base_z + lz, cell, ck, chunk)) {
                         grid.occ_spans[col_idx].push_back(StaticTerrainBuilder::ZSpan {
                             static_cast<float>(cell.z_min_mm) * 0.001f,
                             static_cast<float>(cell.z_max_mm) * 0.001f,
                         });
-                    } else if (static_cast<int>(cell.clears) >= cfg_.ray_clear_min_clears) {
-                        const float vz_lo = static_cast<float>(base_z + lz) * res_f;
-                        grid.cleared_spans[col_idx].push_back(StaticTerrainBuilder::ZSpan {vz_lo, vz_lo + res_f});
+                    } else {
+                        if (erased_cols != nullptr && static_cast<int>(cell.hits) >= cfg_.static_min_hits) {
+                            (*erased_cols)[col_idx] = 1;
+                        }
+                        if (static_cast<int>(cell.clears) >= cfg_.ray_clear_min_clears) {
+                            const float vz_lo = static_cast<float>(base_z + lz) * res_f;
+                            grid.cleared_spans[col_idx].push_back(StaticTerrainBuilder::ZSpan {vz_lo, vz_lo + res_f});
+                        }
                     }
                 }
             }
         }
+    };
+
+    const int32_t min_cx = floorDiv16(min_vx);
+    const int32_t max_cx = floorDiv16(max_vx);
+    const int32_t min_cy = floorDiv16(min_vy);
+    const int32_t max_cy = floorDiv16(max_vy);
+    const int64_t tile_span = static_cast<int64_t>(max_cx - min_cx + 1) * static_cast<int64_t>(max_cy - min_cy + 1);
+    const double min_z_bound = std::min(cfg_.min_z, static_cast<double>(cfg_.terrain.min_ground_height));
+    const int32_t min_cz = floorDiv16(static_cast<int32_t>(std::floor(min_z_bound * inv_res_))) - 1;
+
+    // 极小局部补丁走 tile_max_cz_ 定向查询，避免在大地图中为单个补丁遍历全量 chunks_
+    if (tile_span <= 4 && chunks_.size() > 32) {
+        for (int32_t cx = min_cx; cx <= max_cx; ++cx) {
+            for (int32_t cy = min_cy; cy <= max_cy; ++cy) {
+                const auto max_it = tile_max_cz_.find(packXY(cx, cy));
+                if (max_it == tile_max_cz_.end()) {
+                    continue;
+                }
+                const int32_t max_cz = max_it->second;
+                for (int32_t cz = min_cz; cz <= max_cz; ++cz) {
+                    const ChunkKey ck {cx, cy, cz};
+                    const Chunk* ch = findChunkLocked(ck);
+                    if (ch != nullptr) {
+                        processChunk(ck, *ch);
+                    }
+                }
+            }
+        }
+    } else {
+        for (const auto& kv: chunks_) {
+            const ChunkKey& ck = kv.first;
+            const int32_t base_x = ck.cx * kChunkSize;
+            const int32_t base_y = ck.cy * kChunkSize;
+            // 先做 chunk 级 AABB 拒绝，完全跳过 preview bbox 外的稀疏块（不做任何逐格计算）。
+            if (base_x + kChunkSize - 1 < min_vx || base_x > max_vx || base_y + kChunkSize - 1 < min_vy
+                || base_y > max_vy)
+            {
+                continue;
+            }
+            processChunk(ck, *kv.second);
+        }
     }
 
-    for (const auto& kv: footprint_ground_) {
-        const int32_t vx = unpackX(kv.first);
-        const int32_t vy = unpackY(kv.first);
-        if (vx < min_vx || vx > max_vx || vy < min_vy || vy > max_vy) {
-            continue;
+    const size_t total_cols = static_cast<size_t>(nx) * static_cast<size_t>(ny);
+    if (total_cols <= 256 && footprint_ground_.size() > total_cols) {
+        for (int32_t vx = min_vx; vx <= max_vx; ++vx) {
+            const size_t row_off = static_cast<size_t>(vx - min_vx) * static_cast<size_t>(ny);
+            for (int32_t vy = min_vy; vy <= max_vy; ++vy) {
+                const auto it = footprint_ground_.find(packXY(vx, vy));
+                if (it != footprint_ground_.end()) {
+                    grid.footprint_ground_z[row_off + static_cast<size_t>(vy - min_vy)] = it->second;
+                }
+            }
         }
-        const size_t col_idx =
-            static_cast<size_t>(vx - min_vx) * static_cast<size_t>(ny) + static_cast<size_t>(vy - min_vy);
-        grid.footprint_ground_z[col_idx] = kv.second;
+    } else {
+        for (const auto& kv: footprint_ground_) {
+            const int32_t vx = unpackX(kv.first);
+            const int32_t vy = unpackY(kv.first);
+            if (vx < min_vx || vx > max_vx || vy < min_vy || vy > max_vy) {
+                continue;
+            }
+            const size_t col_idx =
+                static_cast<size_t>(vx - min_vx) * static_cast<size_t>(ny) + static_cast<size_t>(vy - min_vy);
+            grid.footprint_ground_z[col_idx] = kv.second;
+        }
     }
 
     return grid;
@@ -338,6 +549,17 @@ auto OnlineTerrainMapper::integrateFrame(
 
     StaticTerrainBuilder::VoxelColumnGrid local_grid;
     bool run_preview = false;
+    struct OutsidePatch {
+        StaticTerrainBuilder::VoxelColumnGrid grid;
+        int32_t vx = 0;
+        int32_t vy = 0;
+        int center_ix = 0;
+        int center_iy = 0;
+    };
+    std::vector<uint8_t> local_erased_cols;
+    std::vector<std::pair<int32_t, int32_t>> outside_cleared_cols;
+    std::vector<OutsidePatch> outside_patches;
+    int emit_halo = 0;
 
     {
         std::lock_guard<std::mutex> lock(mtx_);
@@ -476,7 +698,21 @@ auto OnlineTerrainMapper::integrateFrame(
                 cell.z_min_mm = z_mm;
                 cell.z_max_mm = z_mm;
             } else {
-                cell.z_min_mm = std::min(cell.z_min_mm, z_mm);
+                // 非对称分位追踪（~10% 分位下界）：防止偶发向下漂移/墙沿漏点永久拉低体素 z_min_mm，
+                // 同时保留精确 z_max_mm（确保台阶/高台顶面高度零偏差）。
+                if (z_mm < cell.z_min_mm) {
+                    const int32_t next_min = std::max<int32_t>(
+                        static_cast<int32_t>(z_mm),
+                        static_cast<int32_t>(cell.z_min_mm) - kZMinQuantileStepDownMm
+                    );
+                    cell.z_min_mm = static_cast<int16_t>(next_min);
+                } else if (z_mm > cell.z_min_mm) {
+                    const int32_t next_min = std::min<int32_t>(
+                        static_cast<int32_t>(z_mm),
+                        static_cast<int32_t>(cell.z_min_mm) + kZMinQuantileStepUpMm
+                    );
+                    cell.z_min_mm = static_cast<int16_t>(next_min);
+                }
                 cell.z_max_mm = std::max(cell.z_max_mm, z_mm);
             }
             if (cell.last_hit_frame != cur_frame) {
@@ -488,8 +724,13 @@ auto OnlineTerrainMapper::integrateFrame(
         }
 
         // 4. 3D DDA 射线扫空（仅遍历已分配 chunk，清除穿过信任区的动态过客并积累悬空下沿净空证据）
+        const bool track_erased = build_local_preview && cfg_.preview_radius > 0.0;
+        if (track_erased) {
+            erased_cols_scratch_.clear();
+        }
+        std::vector<uint64_t>* erased_sink = track_erased ? &erased_cols_scratch_ : nullptr;
         for (const auto& target: clear_targets) {
-            castClearRayLocked(pose.p_lidar_w, target, cur_frame);
+            castClearRayLocked(pose.p_lidar_w, target, cur_frame, erased_sink);
         }
 
         revision_.fetch_add(1, std::memory_order_release);
@@ -504,8 +745,55 @@ auto OnlineTerrainMapper::integrateFrame(
                 static_cast<int32_t>(std::floor((pose.p_base_w.y() - cfg_.preview_radius) * inv_res_));
             const int32_t max_vy =
                 static_cast<int32_t>(std::floor((pose.p_base_w.y() + cfg_.preview_radius) * inv_res_));
-            local_grid = extractColumnGridLocked(min_vx, max_vx, min_vy, max_vy);
+            local_grid = extractColumnGridLocked(min_vx, max_vx, min_vy, max_vy, &local_erased_cols);
             run_preview = local_grid.geometry.isValid();
+            if (run_preview) {
+                const int nx = local_grid.geometry.voxel_num.x();
+                const int ny = local_grid.geometry.voxel_num.y();
+                const double margin_m = cfg_.preview_radius - cfg_.trust_range;
+                if (margin_m > 0.0 && nx > 2 && ny > 2) {
+                    const int max_halo_by_margin =
+                        std::max(0, static_cast<int>(std::floor(margin_m * inv_res_ + 1e-6)));
+                    const int max_halo_by_size = std::min((nx - 1) / 2, (ny - 1) / 2);
+                    emit_halo = std::min({kPreviewEmitHalo, max_halo_by_margin, max_halo_by_size});
+                }
+
+                // 将本帧被射线擦除且落在发射窗口之外（含 halo 外缘与 preview_radius..clear_range）的列同步到 2D
+                if (!erased_cols_scratch_.empty()) {
+                    std::sort(erased_cols_scratch_.begin(), erased_cols_scratch_.end());
+                    erased_cols_scratch_.erase(
+                        std::unique(erased_cols_scratch_.begin(), erased_cols_scratch_.end()),
+                        erased_cols_scratch_.end()
+                    );
+                    const int32_t emit_min_vx = min_vx + emit_halo;
+                    const int32_t emit_max_vx = max_vx - emit_halo;
+                    const int32_t emit_min_vy = min_vy + emit_halo;
+                    const int32_t emit_max_vy = max_vy - emit_halo;
+                    constexpr size_t kMaxOutsidePatchesPerFrame = 32;
+                    const int32_t patch_r = std::max(kPreviewEmitHalo, cfg_.terrain.overhang_ground_radius);
+                    for (const uint64_t key: erased_cols_scratch_) {
+                        const int32_t evx = unpackX(key);
+                        const int32_t evy = unpackY(key);
+                        if (evx >= emit_min_vx && evx <= emit_max_vx && evy >= emit_min_vy && evy <= emit_max_vy) {
+                            continue;
+                        }
+                        if (!columnHasStaticOccupiedLocked(evx, evy)) {
+                            outside_cleared_cols.emplace_back(evx, evy);
+                        } else if (outside_patches.size() < kMaxOutsidePatchesPerFrame) {
+                            OutsidePatch patch;
+                            patch.vx = evx;
+                            patch.vy = evy;
+                            patch.grid =
+                                extractColumnGridLocked(evx - patch_r, evx + patch_r, evy - patch_r, evy + patch_r);
+                            if (patch.grid.geometry.isValid()) {
+                                patch.center_ix = static_cast<int>(patch_r);
+                                patch.center_iy = static_cast<int>(patch_r);
+                                outside_patches.push_back(std::move(patch));
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -519,22 +807,38 @@ auto OnlineTerrainMapper::integrateFrame(
     frame.robot_pos = Eigen::Vector2d(pose.p_base_w.x(), pose.p_base_w.y());
     frame.robot_footprint_radius = cfg_.footprint_radius;
     frame.has_robot_pos = true;
+    frame.authoritative_free = true;
 
     const int nx = built.geometry.voxel_num.x();
     const int ny = built.geometry.voxel_num.y();
     frame.obstacle_cells.reserve(static_cast<size_t>(built.occupied_count));
     frame.free_cells.reserve(static_cast<size_t>(built.free_count));
+    if (!outside_cleared_cols.empty()) {
+        frame.cleared_cells.reserve(outside_cleared_cols.size() + 32);
+    }
     if (preview_cloud != nullptr) {
         preview_cloud->clear();
         preview_cloud->reserve(static_cast<size_t>(built.occupied_count));
     }
 
-    for (int ix = 0; ix < nx; ++ix) {
+    const int ix_lo = emit_halo;
+    const int ix_hi = nx - emit_halo;
+    const int iy_lo = emit_halo;
+    const int iy_hi = ny - emit_halo;
+    for (int ix = ix_lo; ix < ix_hi; ++ix) {
         const size_t row_off = static_cast<size_t>(ix) * static_cast<size_t>(ny);
-        for (int iy = 0; iy < ny; ++iy) {
+        for (int iy = iy_lo; iy < iy_hi; ++iy) {
             const size_t idx = row_off + static_cast<size_t>(iy);
             const CellState st = built.cells[idx];
             if (st == CellState::UNKNOWN) {
+                if (idx < local_erased_cols.size() && local_erased_cols[idx] != 0) {
+                    const Eigen::Vector2d wp = built.geometry.indexToPos(Eigen::Vector2i(ix, iy));
+                    frame.cleared_cells.emplace_back(
+                        static_cast<float>(wp.x()),
+                        static_cast<float>(wp.y()),
+                        static_cast<float>(pose.p_base_w.z())
+                    );
+                }
                 continue;
             }
             const Eigen::Vector2d wp = built.geometry.indexToPos(Eigen::Vector2i(ix, iy));
@@ -552,6 +856,34 @@ auto OnlineTerrainMapper::integrateFrame(
             } else {
                 frame.free_cells.emplace_back(wp.x(), wp.y(), z_vis);
             }
+        }
+    }
+
+    for (const auto& [evx, evy]: outside_cleared_cols) {
+        const float wx = static_cast<float>((static_cast<double>(evx) + 0.5) * cfg_.resolution);
+        const float wy = static_cast<float>((static_cast<double>(evy) + 0.5) * cfg_.resolution);
+        frame.cleared_cells.emplace_back(wx, wy, static_cast<float>(pose.p_base_w.z()));
+    }
+
+    for (const auto& patch: outside_patches) {
+        const StaticTerrainBuilder::BuildResult pb = builder_.build(patch.grid);
+        if (!pb.geometry.isValid()) {
+            continue;
+        }
+        const size_t cidx = static_cast<size_t>(patch.center_ix) * static_cast<size_t>(pb.geometry.voxel_num.y())
+            + static_cast<size_t>(patch.center_iy);
+        if (cidx >= pb.cells.size()) {
+            continue;
+        }
+        const CellState st = pb.cells[cidx];
+        const float wx = static_cast<float>((static_cast<double>(patch.vx) + 0.5) * cfg_.resolution);
+        const float wy = static_cast<float>((static_cast<double>(patch.vy) + 0.5) * cfg_.resolution);
+        if (st == CellState::FREE) {
+            const float gz = pb.terrain_prior.ground_z[cidx];
+            const float wz = std::isfinite(gz) ? gz : static_cast<float>(pose.p_base_w.z());
+            frame.free_cells.emplace_back(wx, wy, wz);
+        } else if (st == CellState::UNKNOWN) {
+            frame.cleared_cells.emplace_back(wx, wy, static_cast<float>(pose.p_base_w.z()));
         }
     }
 
@@ -612,13 +944,7 @@ auto OnlineTerrainMapper::extractStaticVoxelCloud(
                 for (int32_t vz = z_lo; vz <= z_hi; ++vz) {
                     const int32_t lz = vz - base_z;
                     const VoxelCell& cell = chunk.cells[localVoxelIndex(lx, ly, lz)];
-                    if (static_cast<int>(cell.hits) < cfg_.static_min_hits) {
-                        continue;
-                    }
-                    if (static_cast<float>(cell.clears) > cfg_.static_clear_ratio * static_cast<float>(cell.hits)) {
-                        continue;
-                    }
-                    if (cell.z_min_mm > cell.z_max_mm) {
+                    if (!isStaticOccupiedLocked(vx, vy, vz, cell, ck, chunk)) {
                         continue;
                     }
                     const float wz = 0.0005f
@@ -649,17 +975,14 @@ auto OnlineTerrainMapper::buildGlobalStaticMap() const -> std::optional<StaticTe
             const ChunkKey& ck = kv.first;
             const int32_t base_x = ck.cx * kChunkSize;
             const int32_t base_y = ck.cy * kChunkSize;
+            const int32_t base_z = ck.cz * kChunkSize;
             const Chunk& chunk = *kv.second;
             for (int32_t lx = 0; lx < kChunkSize; ++lx) {
                 for (int32_t ly = 0; ly < kChunkSize; ++ly) {
                     bool col_static = false;
                     for (int32_t lz = 0; lz < kChunkSize; ++lz) {
                         const VoxelCell& cell = chunk.cells[localVoxelIndex(lx, ly, lz)];
-                        if (static_cast<int>(cell.hits) >= cfg_.static_min_hits
-                            && static_cast<float>(cell.clears)
-                                <= cfg_.static_clear_ratio * static_cast<float>(cell.hits)
-                            && cell.z_min_mm <= cell.z_max_mm)
-                        {
+                        if (isStaticOccupiedLocked(base_x + lx, base_y + ly, base_z + lz, cell, ck, chunk)) {
                             col_static = true;
                             break;
                         }

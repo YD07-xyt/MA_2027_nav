@@ -954,6 +954,31 @@ auto run_sanity_checks(BenchEnv& env) -> bool {
         s1->posToIndex(Eigen::Vector2d(0.45, 0.45), id_obs1);
         ok &= check(!s1->isOccupied(id_obs1), "LayeredMap 2 consecutive free frames clear persistent obstacle");
 
+        // authoritative_free=true 单帧清障；cleared_cells 仅把旧 OCCUPIED 退回 UNKNOWN（不覆写 FREE/同帧障碍）
+        ma_map::LocalTerrainFrame fr_auth_set;
+        fr_auth_set.terrain_resolution = 0.1;
+        fr_auth_set.obstacle_cells.emplace_back(0.55f, 0.45f, 0.0f);
+        fr_auth_set.obstacle_cells.emplace_back(0.65f, 0.45f, 0.0f);
+        fr_auth_set.free_cells.emplace_back(0.75f, 0.45f, 0.0f);
+        lm.updateFromPerception(fr_auth_set);
+
+        ma_map::LocalTerrainFrame fr_auth_clr;
+        fr_auth_clr.terrain_resolution = 0.1;
+        fr_auth_clr.authoritative_free = true;
+        fr_auth_clr.free_cells.emplace_back(0.55f, 0.45f, 0.0f);
+        fr_auth_clr.cleared_cells.emplace_back(0.65f, 0.45f, 0.0f);
+        fr_auth_clr.cleared_cells.emplace_back(0.75f, 0.45f, 0.0f);
+        lm.updateFromPerception(fr_auth_clr);
+        s1 = lm.getSnapshot();
+        Eigen::Vector2i id_af, id_cc, id_keep_free;
+        s1->posToIndex(Eigen::Vector2d(0.55, 0.45), id_af);
+        s1->posToIndex(Eigen::Vector2d(0.65, 0.45), id_cc);
+        s1->posToIndex(Eigen::Vector2d(0.75, 0.45), id_keep_free);
+        ok &= check(
+            !s1->isOccupied(id_af) && !s1->isOccupied(id_cc) && !s1->isOccupied(id_keep_free),
+            "LayeredMap authoritative_free clears OCC in 1 frame and cleared_cells resets stale OCC"
+        );
+
         // 感知触发动态扩图（超出 [-1, 1] -> 按 1.0m 块扩展），保留旧障碍与语义多边形
         ma_map::LocalTerrainFrame fr_exp;
         fr_exp.terrain_resolution = 0.1;
@@ -1400,6 +1425,88 @@ auto run_sanity_checks(BenchEnv& env) -> bool {
                     && rp.cells[hp_narrow_bar] == ma_map::CellState::OCCUPIED,
                 "StaticTerrainBuilder preserves raised-platform curb, interior pillar, and narrow 0.16m bar OCCUPIED"
             );
+
+            // 8c-4. R3/R4/R5 回归：远距限高杆 + 墙边离群噪点 + 隧道出口顶沿延续，同时守住高台矮杆/斜拱/0.30m 落差底线
+            {
+                const auto g4 =
+                    grid_map::GridGeometry::fromOriginAndSize(Eigen::Vector2d(0.0, 0.0), Eigen::Vector2i(36, 20), 0.05);
+                auto sc4 = ma_map::StaticTerrainBuilder::VoxelColumnGrid::create(g4, false, true);
+                // 地面在 ix in [0..6] (z=-0.22)，中间 [7..17] 无地面（距离 10 格 > overhang_ground_radius=6）
+                for (int ix = 0; ix <= 6; ++ix) {
+                    for (int iy = 2; iy <= 17; ++iy) {
+                        sc4.occ_spans[static_cast<size_t>(ix * 20 + iy)].push_back({-0.23f, -0.21f});
+                    }
+                }
+                // 隧道两侧竖墙 iy=2 和 iy=17
+                for (int ix = 14; ix <= 20; ++ix) {
+                    sc4.occ_spans[static_cast<size_t>(ix * 20 + 2)].push_back({-0.22f, 0.55f});
+                    sc4.occ_spans[static_cast<size_t>(ix * 20 + 17)].push_back({-0.22f, 0.55f});
+                }
+                // 远距厚限高杆 ix in [16..18], iy in [3..16] (z in [0.08, 0.28], 厚度 0.20 > 0.11 进阶段 1.5A)，
+                // 下方净空 [-0.18, 0.05] 被扫空；且在 (17, 3) 放入单格向下漂移离群噪点 (0.01..0.28)
+                for (int ix = 16; ix <= 18; ++ix) {
+                    for (int iy = 3; iy <= 16; ++iy) {
+                        const size_t idx = static_cast<size_t>(ix * 20 + iy);
+                        const float zlo = (ix == 17 && iy == 3) ? 0.01f : 0.08f;
+                        sc4.occ_spans[idx].push_back({zlo, 0.28f});
+                        sc4.cleared_spans[idx].push_back({-0.18f, 0.05f});
+                    }
+                }
+                // 出口最外 1 格顶沿 ix=19（无下方射线扫空），紧邻出口外真地面 ix=20..24 (z=-0.22)
+                for (int iy = 3; iy <= 16; ++iy) {
+                    sc4.occ_spans[static_cast<size_t>(19 * 20 + iy)].push_back({0.08f, 0.13f});
+                }
+                for (int ix = 20; ix <= 24; ++ix) {
+                    for (int iy = 2; iy <= 17; ++iy) {
+                        sc4.occ_spans[static_cast<size_t>(ix * 20 + iy)].push_back({-0.23f, -0.21f});
+                    }
+                }
+                // 0.30m 台阶/落差在 ix in [28..35] (z=+0.08)，边缘 ix=28 必须保持 OCCUPIED
+                for (int ix = 28; ix <= 35; ++ix) {
+                    for (int iy = 2; iy <= 17; ++iy) {
+                        sc4.occ_spans[static_cast<size_t>(ix * 20 + iy)].push_back({0.07f, 0.09f});
+                    }
+                }
+                for (int ix = 25; ix <= 27; ++ix) {
+                    for (int iy = 2; iy <= 17; ++iy) {
+                        sc4.occ_spans[static_cast<size_t>(ix * 20 + iy)].push_back({-0.23f, -0.21f});
+                    }
+                }
+                const auto r4 = builder.build(sc4);
+                ok &= check(
+                    r4.cells[static_cast<size_t>(17 * 20 + 10)] == ma_map::CellState::FREE
+                        && r4.cells[static_cast<size_t>(17 * 20 + 4)] == ma_map::CellState::FREE
+                        && r4.cells[static_cast<size_t>(19 * 20 + 10)] == ma_map::CellState::FREE
+                        && r4.cells[static_cast<size_t>(20 * 20 + 10)] == ma_map::CellState::FREE,
+                    "StaticTerrainBuilder clears distant noisy thick bar and 1-cell unrayed tunnel exit lip"
+                );
+                ok &= check(
+                    r4.cells[static_cast<size_t>(17 * 20 + 2)] == ma_map::CellState::OCCUPIED
+                        && r4.cells[static_cast<size_t>(17 * 20 + 17)] == ma_map::CellState::OCCUPIED
+                        && r4.cells[static_cast<size_t>(28 * 20 + 10)] == ma_map::CellState::OCCUPIED,
+                    "StaticTerrainBuilder preserves tunnel side walls and 0.30m drop-off high edge OCCUPIED"
+                );
+
+                // 负面安全测试：高台(z=0.20) 上方的 0.16m 矮杆(z=0.36) 不得错借台外低地(z=0.0, 距离 8 格) 被误清
+                auto sc_plat_low = ma_map::StaticTerrainBuilder::VoxelColumnGrid::create(g4, false, true);
+                for (int ix = 0; ix <= 4; ++ix) {
+                    for (int iy = 0; iy < 20; ++iy) {
+                        sc_plat_low.occ_spans[static_cast<size_t>(ix * 20 + iy)].push_back({-0.01f, 0.01f});
+                    }
+                }
+                for (int ix = 12; ix <= 15; ++ix) {
+                    for (int iy = 4; iy <= 15; ++iy) {
+                        const size_t idx = static_cast<size_t>(ix * 20 + iy);
+                        sc_plat_low.occ_spans[idx].push_back({0.36f, 0.42f});
+                        sc_plat_low.cleared_spans[idx].push_back({0.22f, 0.34f});
+                    }
+                }
+                const auto r_pl = builder.build(sc_plat_low);
+                ok &= check(
+                    r_pl.cells[static_cast<size_t>(13 * 20 + 10)] == ma_map::CellState::OCCUPIED,
+                    "StaticTerrainBuilder keeps 0.16m low bar on elevated platform OCCUPIED despite distant lower floor"
+                );
+            }
         }
 
         // 8d. OnlineTerrainMapper: 零先验建图 + 信任半径截断远距噪点 + 3D 射线清除动态过客 + 坐标严格对齐
@@ -1570,6 +1677,159 @@ auto run_sanity_checks(BenchEnv& env) -> bool {
                     ov_ok,
                     "OnlineTerrainMapper allocates lower clear chunk and filters groundless cross-chunk thick overhang"
                 );
+            }
+
+            // 8d-3. R1/R2 回归：墙沿虚影过滤 + z_min_mm 分位抗向下离群点 + 超预览半径射线清障 2D 同步
+            {
+                ma_map::OnlineTerrainMapper::Config mcfg3 = mcfg;
+                mcfg3.preview_radius = 2.0;
+                mcfg3.trust_range = 2.0;
+                mcfg3.clear_range = 6.0;
+                mcfg3.max_clear_rays_per_frame = 4000;
+                ma_map::OnlineTerrainMapper r12_mapper(mcfg3);
+
+                ma_map::LayeredMap::Config lm_sync_cfg;
+                lm_sync_cfg.x_left = 1.0;
+                lm_sync_cfg.x_right = 6.0;
+                lm_sync_cfg.y_left = 2.0;
+                lm_sync_cfg.y_right = 2.0;
+                lm_sync_cfg.resolution = 0.05;
+                ma_map::LayeredMap sync_lm(lm_sync_cfg);
+                sync_lm.setMode(ma_map::MapMode::MAPPING);
+
+                const ma_map::SensorPose sp0 = sm.computePose(Eigen::Vector3d(0.0, 0.0, 0.0), q_base);
+                // 步骤 1：在 x=1.525 写入 2 帧动态障碍 + 地面，并用局部预览同步进 2D LayeredMap
+                std::vector<Eigen::Vector3d> init_pts;
+                for (double x = 0.525; x <= 1.925; x += 0.05) {
+                    for (double y = -0.525; y <= 0.525; y += 0.05) {
+                        init_pts.emplace_back(x, y, 0.0);
+                    }
+                }
+                for (double z = 0.205; z <= 0.405; z += 0.05) {
+                    init_pts.emplace_back(1.525, 0.025, z);
+                }
+                for (int f = 0; f < 2; ++f) {
+                    const auto fr = r12_mapper.integrateFrame(init_pts, sp0, q_base, sm, true);
+                    if (fr.has_value()) {
+                        sync_lm.updateFromPerception(*fr);
+                    }
+                }
+                auto snap_before = sync_lm.getSnapshot();
+                Eigen::Vector2i id_dyn_sync;
+                snap_before->posToIndex(Eigen::Vector2d(1.525, 0.025), id_dyn_sync);
+                const bool dyn_written_2d = snap_before->isOccupied(id_dyn_sync);
+
+                // 步骤 2：机器人后退到 x=-1.5（使 x=1.525 距车 3.025m > preview_radius=2.0m 但在 clear_range=6.0m 内），
+                // 发射穿过 (1.525, 0.025, 0.205..0.405) 命中 x=4.0 远墙的射线 6 帧，验证 2D 旧障碍被同步清除
+                const ma_map::SensorPose sp_far = sm.computePose(Eigen::Vector3d(-1.5, 0.0, 0.0), q_base);
+                std::vector<Eigen::Vector3d> far_clear_pts;
+                for (double z = 0.20; z <= 0.62; z += 0.02) {
+                    far_clear_pts.emplace_back(4.0, 0.025, z);
+                }
+                for (int f = 0; f < 6; ++f) {
+                    const auto fr = r12_mapper.integrateFrame(far_clear_pts, sp_far, q_base, sm, true);
+                    if (fr.has_value()) {
+                        sync_lm.updateFromPerception(*fr);
+                    }
+                }
+                auto snap_after = sync_lm.getSnapshot();
+                snap_after->posToIndex(Eigen::Vector2d(1.525, 0.025), id_dyn_sync);
+                const auto r12_global = r12_mapper.buildGlobalStaticMap();
+                bool global_cleared = false;
+                if (r12_global && r12_global->geometry.isValid()) {
+                    const auto gi = r12_global->geometry.posToIndex(Eigen::Vector2d(1.525, 0.025));
+                    if (r12_global->geometry.isInside(gi)) {
+                        global_cleared =
+                            (r12_global->cells[static_cast<size_t>(r12_global->geometry.toAddress(gi))]
+                             == ma_map::CellState::FREE);
+                    }
+                }
+                ok &= check(
+                    dyn_written_2d,
+                    "OnlineTerrainMapper local preview writes blocking obstacle to 2D LayeredMap"
+                );
+                ok &= check(global_cleared, "OnlineTerrainMapper 3D ray clears obstacle beyond preview_radius");
+                ok &= check(
+                    !snap_after->isOccupied(id_dyn_sync),
+                    "OnlineTerrainMapper syncs outside-preview ray-erased obstacle into 2D LayeredMap"
+                );
+
+                // 步骤 3：R2b 验证单个向下漂移离群点 (0.050m) 不会永久锁死高处体素 z_min_mm，经后续 0.085m 命中可恢复
+                ma_map::OnlineTerrainMapper q_mapper(mcfg);
+                std::vector<Eigen::Vector3d> base_floor;
+                for (double x = 0.525; x <= 2.525; x += 0.05) {
+                    for (double y = -0.525; y <= 0.525; y += 0.05) {
+                        base_floor.emplace_back(x, y, -0.15);
+                    }
+                }
+                // 第 1 帧在悬空杆处落入 1 个 0.052m 向下离群点（相对 z=-0.15 仅 0.202m < 0.225m）
+                auto f_outlier = base_floor;
+                f_outlier.emplace_back(1.525, 0.025, 0.052);
+                (void)q_mapper.integrateFrame(f_outlier, sp0, q_base, sm, false);
+                // 随后 40 帧在 0.088m（相对 z=-0.15 净空 0.238m >= 0.225m）稳定命中
+                auto f_bar = base_floor;
+                f_bar.emplace_back(1.525, 0.025, 0.088);
+                for (int f = 0; f < 40; ++f) {
+                    (void)q_mapper.integrateFrame(f_bar, sp0, q_base, sm, false);
+                }
+                const auto q_built = q_mapper.buildGlobalStaticMap();
+                bool q_ok = false;
+                if (q_built && q_built->geometry.isValid()) {
+                    const auto qi = q_built->geometry.posToIndex(Eigen::Vector2d(1.525, 0.025));
+                    if (q_built->geometry.isInside(qi)) {
+                        const size_t qa = static_cast<size_t>(q_built->geometry.toAddress(qi));
+                        q_ok = (q_built->cells[qa] == ma_map::CellState::FREE)
+                            && std::isfinite(q_built->terrain_prior.overhang_min_z[qa])
+                            && q_built->terrain_prior.overhang_min_z[qa] >= 0.080f;
+                    }
+                }
+                ok &= check(
+                    q_ok,
+                    "OnlineTerrainMapper z_min_mm asymmetric quantile recovers from single downward outlier"
+                );
+
+                // 步骤 4：R2a 墙沿单格虚影过滤（hits=4, clears=5 仍在 static_clear_ratio=2.0 内，紧邻稠密竖墙时应滤除，真墙保留）
+                ma_map::OnlineTerrainMapper wb_mapper(mcfg);
+                std::vector<Eigen::Vector3d> wb_base;
+                for (double x = 0.525; x <= 2.975; x += 0.05) {
+                    for (double y = -0.325; y <= 0.325; y += 0.05) {
+                        wb_base.emplace_back(x, y, 0.0);
+                    }
+                }
+                // 沿 y=0.225 的稠密竖墙（x in [1.025, 2.525], z in [0.025, 0.525]）
+                for (double x = 1.025; x <= 2.525; x += 0.05) {
+                    for (double z = 0.025; z <= 0.525; z += 0.05) {
+                        wb_base.emplace_back(x, 0.225, z);
+                    }
+                }
+                // 先在紧邻墙面 1 格处 (1.525, 0.175, 0.225) 写入 4 帧墙沿虚影
+                const ma_map::SensorPose sp_wb = sm.computePose(Eigen::Vector3d(0.0, 0.175, 0.0), q_base);
+                auto wb_with_ghost = wb_base;
+                wb_with_ghost.emplace_back(1.525, 0.175, 0.225);
+                for (int f = 0; f < 4; ++f) {
+                    (void)wb_mapper.integrateFrame(wb_with_ghost, sp_wb, q_base, sm, false);
+                }
+                // 再由穿过 (1.525, 0.175, 0.225) 命中远端 x=3.050 的射线穿透 5 帧，同时继续累积真墙至 12 帧
+                auto wb_with_ray = wb_base;
+                wb_with_ray.emplace_back(3.050, 0.175, 0.256);
+                for (int f = 0; f < 5; ++f) {
+                    (void)wb_mapper.integrateFrame(wb_with_ray, sp_wb, q_base, sm, false);
+                }
+                for (int f = 0; f < 3; ++f) {
+                    (void)wb_mapper.integrateFrame(wb_base, sp_wb, q_base, sm, false);
+                }
+                const auto wb_built = wb_mapper.buildGlobalStaticMap();
+                bool wb_ok = false;
+                if (wb_built && wb_built->geometry.isValid()) {
+                    const auto gi = wb_built->geometry.posToIndex(Eigen::Vector2d(1.525, 0.175));
+                    const auto wi = wb_built->geometry.posToIndex(Eigen::Vector2d(1.525, 0.225));
+                    if (wb_built->geometry.isInside(gi) && wb_built->geometry.isInside(wi)) {
+                        const auto gst = wb_built->cells[static_cast<size_t>(wb_built->geometry.toAddress(gi))];
+                        const auto wst = wb_built->cells[static_cast<size_t>(wb_built->geometry.toAddress(wi))];
+                        wb_ok = (gst == ma_map::CellState::FREE) && (wst == ma_map::CellState::OCCUPIED);
+                    }
+                }
+                ok &= check(wb_ok, "OnlineTerrainMapper filters wall-bleed fringe voxel while preserving dense wall");
             }
         }
 

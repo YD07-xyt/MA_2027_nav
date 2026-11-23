@@ -297,7 +297,8 @@ auto PersistentMapLayer::update(const LocalTerrainFrame& frame) -> void {
 
     // 2. 空闲证据：
     //    - UNKNOWN  -> 立即标记 FREE（已探索）
-    //    - OCCUPIED -> 连续 kFreeFramesToClear 帧空闲证据才清为 FREE（防细杆/网格单帧漏检）
+    //    - OCCUPIED -> authoritative_free 时单帧清为 FREE（3D 静态建图器已完成跨帧累计）；
+    //                  否则连续 kFreeFramesToClear 帧空闲证据才清为 FREE（防细杆/网格单帧漏检）
     //    - FREE     -> 保持 FREE
     forEachTerrainCell(geom_, frame.free_cells, frame.terrain_resolution, [&](int x, int y) {
         const size_t idx = static_cast<size_t>(geom_.toAddress(x, y));
@@ -313,6 +314,13 @@ auto PersistentMapLayer::update(const LocalTerrainFrame& frame) -> void {
         if (free_last_frame_[idx] == -frame_id_ || free_last_frame_[idx] == frame_id_) {
             return;
         }
+        if (frame.authoritative_free) {
+            cells_[idx] = CellState::FREE;
+            occ_[idx] = 0;
+            free_streak_[idx] = 0;
+            free_last_frame_[idx] = frame_id_;
+            return;
+        }
         free_streak_[idx] = (free_last_frame_[idx] == frame_id_ - 1) ? (free_streak_[idx] + 1) : 1;
         free_last_frame_[idx] = frame_id_;
         if (free_streak_[idx] >= kFreeFramesToClear) {
@@ -321,6 +329,20 @@ auto PersistentMapLayer::update(const LocalTerrainFrame& frame) -> void {
             free_streak_[idx] = 0;
         }
     });
+
+    // 2.5. 3D 静态擦除同步：当某列已无任何有效静态占据且本帧未被 obstacle_cells 命中时，
+    //      将旧 OCCUPIED 退回 UNKNOWN（不覆盖 FREE，避免抹除已探索地面）。
+    if (!frame.cleared_cells.empty()) {
+        forEachTerrainCell(geom_, frame.cleared_cells, frame.terrain_resolution, [&](int x, int y) {
+            const size_t idx = static_cast<size_t>(geom_.toAddress(x, y));
+            if (cells_[idx] == CellState::OCCUPIED && free_last_frame_[idx] != -frame_id_) {
+                cells_[idx] = CellState::UNKNOWN;
+                occ_[idx] = 0;
+                free_streak_[idx] = 0;
+                free_last_frame_[idx] = frame_id_;
+            }
+        });
+    }
 
     // 3. 机器人足迹覆盖：仅把车底盲区 UNKNOWN 标为 FREE，绝不擦除已确认 OCCUPIED。
     if (frame.has_robot_pos && frame.robot_footprint_radius > 0.0 && frame.robot_pos.allFinite()) {
