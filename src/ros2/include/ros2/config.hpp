@@ -5,6 +5,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include <cmath>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -121,6 +122,23 @@ inline Eigen::Matrix<double, 4, 1> load_vector4d(const YAML::Node& node) {
     }
     for (int i = 0; i < 4; ++i) {
         vec(i) = node[i].as<double>();
+    }
+    return vec;
+}
+
+// 6 维工具（位姿 [x,y,z,roll,pitch,yaw]）；缺失时为零，存在但格式非法时报错。
+inline Eigen::Matrix<double, 6, 1> load_vector6d(const YAML::Node& node, const char* key) {
+    Eigen::Matrix<double, 6, 1> vec = Eigen::Matrix<double, 6, 1>::Zero();
+    if (!node.IsDefined()) return vec;
+    if (!node.IsSequence() || node.size() != 6) {
+        throw std::invalid_argument(std::string("ros2.") + key + " must be a sequence of 6 numbers");
+    }
+    for (int i = 0; i < 6; ++i) {
+        const double v = node[i].as<double>();
+        if (!std::isfinite(v)) {
+            throw std::invalid_argument(std::string("ros2.") + key + " contains a non-finite value");
+        }
+        vec(i) = v;
     }
     return vec;
 }
@@ -299,6 +317,10 @@ struct Config {
     std::string target_topic_name;
     std::string clickedPoint_topic_name;
     std::string odom_topic_name;
+    // 建图位姿话题：须与点云同一状态/同一时间戳；为空则沿用 odom_topic_name。
+    std::string map_odom_topic_name;
+    // /lio/odom 机体（IMU）在 base 系下的位姿 [x,y,z,roll,pitch,yaw]，m/deg。
+    Eigen::Matrix<double, 6, 1> map_odom_imu_in_base = Eigen::Matrix<double, 6, 1>::Zero();
     std::string cmd_vel_name;
     std::string save_global_map_path;
     std::string save_map_srv_topic;
@@ -325,6 +347,10 @@ struct Config {
             target_topic_name = config["ros2"]["target_topic_name"].as<std::string>();
             clickedPoint_topic_name = config["ros2"]["clickedPoint_topic_name"].as<std::string>();
             odom_topic_name = config["ros2"]["odom_topic_name"].as<std::string>();
+            if (config["ros2"]["map_odom_topic_name"]) {
+                map_odom_topic_name = config["ros2"]["map_odom_topic_name"].as<std::string>();
+            }
+            map_odom_imu_in_base = load_vector6d(config["ros2"]["map_odom_imu_in_base"], "map_odom_imu_in_base");
             cmd_vel_name = config["ros2"]["cmd_vel_name"].as<std::string>();
             map_params_path = config["ros2"]["map_params_path"].as<std::string>();
             global_map_path = config["ros2"]["global_map_path"].as<std::string>();

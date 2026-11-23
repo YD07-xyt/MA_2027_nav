@@ -6,6 +6,7 @@
 #include "utils/logger.hpp"
 #include "utils/plotter.hpp"
 #include "utils/type_utils.hpp"
+#include <Eigen/Geometry>
 #include <Eigen/src/Core/Matrix.h>
 #include <algorithm>
 #include <chrono>
@@ -65,7 +66,7 @@ GlobalPlanner2d::GlobalPlanner2d(rclcpp::Node::SharedPtr nh_, std::string params
     rclcpp::SubscriptionOptions opts_map;
     opts_map.callback_group = map_cb_group_;
     rclcpp::SubscriptionOptions opts_odom;
-    opts_odom.callback_group = map_cb_group_; // 里程计也更新地图，放入地图组避免同时写
+    opts_odom.callback_group = map_cb_group_; // 里程计/建图位姿也更新地图，放入地图组避免同时写
     rclcpp::SubscriptionOptions opts_target;
     opts_target.callback_group = control_cb_group_; // 目标点很轻量，放控制组
 
@@ -82,6 +83,22 @@ GlobalPlanner2d::GlobalPlanner2d(rclcpp::Node::SharedPtr nh_, std::string params
         rclcpp::QoS(10),
         [this](const nav_msgs::msg::Odometry::SharedPtr msg) { GlobalPlanner2d::odom_callback(msg); },
         opts_odom
+    );
+
+    // 建图位姿可选走独立话题（如 /lio/odom：与 cloud 同一后验状态/时间戳）；控制仍用 odom_topic_name。
+    if (!config.map_odom_topic_name.empty()) {
+        map_odom_sub_ = nh->create_subscription<nav_msgs::msg::Odometry>(
+            config.map_odom_topic_name,
+            rclcpp::QoS(10),
+            [this](const nav_msgs::msg::Odometry::SharedPtr msg) { GlobalPlanner2d::map_odom_callback(msg); },
+            opts_odom
+        );
+    }
+    logger::info(
+        logger::ros2,
+        "map odom topic: {} (control odom topic: {})",
+        config.map_odom_topic_name.empty() ? config.odom_topic_name : config.map_odom_topic_name,
+        config.odom_topic_name
     );
 
     target_sub_ = nh->create_subscription<geometry_msgs::msg::PoseStamped>(
@@ -527,6 +544,19 @@ static void warn_frame_mismatch_once(
     );
 }
 
+// /lio/odom 为 world->IMU 的后验状态；建图用的 base 位姿需去掉 IMU 相对 base 的外参：
+// T_w_base = T_w_imu * inverse(T_base_imu)，参数 [x,y,z,roll,pitch,yaw] 单位 m/deg。
+static auto build_T_base_imu(const Eigen::Matrix<double, 6, 1>& p) -> Eigen::Isometry3d {
+    static constexpr double kDegToRad = M_PI / 180.0;
+    Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
+    T.linear() = (Eigen::AngleAxisd(p(5) * kDegToRad, Eigen::Vector3d::UnitZ())
+                  * Eigen::AngleAxisd(p(4) * kDegToRad, Eigen::Vector3d::UnitY())
+                  * Eigen::AngleAxisd(p(3) * kDegToRad, Eigen::Vector3d::UnitX()))
+                     .toRotationMatrix();
+    T.translation() = p.head<3>();
+    return T;
+}
+
 void GlobalPlanner2d::odom_callback(const nav_msgs::msg::Odometry::SharedPtr& msg) {
     warn_frame_mismatch_once(odom_frame_warned_, config.odom_topic_name, msg->header.frame_id, frame_id);
     const auto& quat = msg->pose.pose.orientation;
@@ -548,14 +578,36 @@ void GlobalPlanner2d::odom_callback(const nav_msgs::msg::Odometry::SharedPtr& ms
     const Eigen::Vector3d xytheta(msg->pose.pose.position.x, msg->pose.pose.position.y, yaw);
     set_current_state(pose_state, xytheta);
 
+    // 建图位姿走独立话题时，控制状态仍由本回调更新，地图改由 map_odom_callback 更新。
+    if (config.map_odom_topic_name.empty()) {
+        rog_map::Pose pose;
+        pose.first = Eigen::Vector3d(msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z);
+        pose.second = Eigen::Quaterniond(
+            msg->pose.pose.orientation.w,
+            msg->pose.pose.orientation.x,
+            msg->pose.pose.orientation.y,
+            msg->pose.pose.orientation.z
+        );
+
+        const double stamp_sec = (msg->header.stamp.sec != 0 || msg->header.stamp.nanosec != 0)
+            ? rclcpp::Time(msg->header.stamp).seconds()
+            : std::numeric_limits<double>::quiet_NaN();
+        ma_map_->update_odom(pose, stamp_sec);
+    }
+};
+
+void GlobalPlanner2d::map_odom_callback(const nav_msgs::msg::Odometry::SharedPtr& msg) {
+    warn_frame_mismatch_once(map_odom_frame_warned_, config.map_odom_topic_name, msg->header.frame_id, frame_id);
+    const auto& p = msg->pose.pose.position;
+    const auto& quat = msg->pose.pose.orientation;
+    Eigen::Isometry3d T_w_imu = Eigen::Isometry3d::Identity();
+    T_w_imu.translation() = Eigen::Vector3d(p.x, p.y, p.z);
+    T_w_imu.linear() = Eigen::Quaterniond(quat.w, quat.x, quat.y, quat.z).normalized().toRotationMatrix();
+    const Eigen::Isometry3d T_w_base = T_w_imu * build_T_base_imu(config.map_odom_imu_in_base).inverse();
+
     rog_map::Pose pose;
-    pose.first = Eigen::Vector3d(msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z);
-    pose.second = Eigen::Quaterniond(
-        msg->pose.pose.orientation.w,
-        msg->pose.pose.orientation.x,
-        msg->pose.pose.orientation.y,
-        msg->pose.pose.orientation.z
-    );
+    pose.first = T_w_base.translation();
+    pose.second = Eigen::Quaterniond(T_w_base.linear());
 
     const double stamp_sec = (msg->header.stamp.sec != 0 || msg->header.stamp.nanosec != 0)
         ? rclcpp::Time(msg->header.stamp).seconds()

@@ -6,11 +6,14 @@ ros2:
   target_topic_name: "/goal_pose"             # 目标点话题，rviz 下发目标 全局坐标系
   clickedPoint_topic_name: "/clicked_point"   # rviz 点选话题，用于画区域等 全局坐标系
   odom_topic_name: "/lio/base_odom"           # 里程计话题，提供位置/速度/姿态 全局坐标系
+  map_odom_topic_name: "/lio/odom"            # 建图位姿话题，须与点云同一状态/同一时间戳；为空则沿用 odom_topic_name
+  # /lio/odom 机体（IMU）在 base 系下的位姿 [x,y,z,roll,pitch,yaw]，m/deg，须与 Super-LIO lio.extrinsic.odom_robo 一致
+  map_odom_imu_in_base: [0.011, 0.02329, 0.10588, 0.0, 0.0, 0.0]
   cmd_vel_name: "/cmd_vel_chassis" #"/cmd_vel" #"/cmd_vel_chassis" 
   save_global_map_path:  "map"
   save_map_srv_topic: "/save_global_map"
   map_params_path: "config/map.yaml"   # 地图参数
-  global_map_path: "map/global_map.pgm" # 全局栅格地图
+  global_map_path: "map/rmuc2027.pgm" # 全局栅格地图
   # 点击隧道区域保存/加载
   tunnel_regions_path: "map/tunnel_regions.yaml"
   save_tunnel_regions_srv_topic: "/save_tunnel_regions"
@@ -24,7 +27,7 @@ map:
 planner_config:
     # ---------- 上游路径规划 / 梯形速度规划参数 ----------
   path_planning_params:
-    safe_threshold: 0.35       # JPS/A* 与后处理的安全距离阈值 (m)
+    safe_threshold: 0.3       # JPS/A* 与后处理的安全距离阈值 (m)
     max_vel: 3.0               # 梯形速度规划最大速度 (m/s)
     max_acc: 3.0               # 梯形速度规划最大加速度 (m/s²) 
     time_resolution: 0.4       # 均匀时间重采样间隔 (s)；
@@ -47,7 +50,7 @@ planner_config:
     # ---------- MA Spline 轨迹优化参数 ----------
   ma_spline_opt_params:
     #mode: "OMNI_XY"
-    safe_distance: 0.35
+    safe_distance: 0.3
     v_max: 3.0
     a_max: 3.0
     integral_num_steps: 8

@@ -800,16 +800,16 @@ auto run_sanity_checks(BenchEnv& env) -> bool {
             "GridMap all-occupied short-circuit finite negative"
         );
 
-        // 7b. MapIO: 既有 global_map.pgm 兼容加载 + 三态裁剪/针孔清理/往返精度（仅写系统临时目录并自动清理）
-        const std::string legacy_map_path = kRootDir + "map/global_map.pgm";
+        // 7b. MapIO: 现行 map/rmuc2027.pgm 兼容加载 + 三态裁剪/针孔清理/往返精度（仅写系统临时目录并自动清理）
+        const std::string legacy_map_path = kRootDir + "map/rmuc2027.pgm";
         if (std::filesystem::exists(legacy_map_path)) {
             const auto legacy = ma_map::MapIO::load(legacy_map_path);
             ok &= check(
-                legacy.has_value() && legacy->geometry.voxel_num == Eigen::Vector2i(560, 320)
+                legacy.has_value() && legacy->geometry.voxel_num == Eigen::Vector2i(470, 320)
                     && std::abs(legacy->geometry.resolution - 0.05) < 1e-9
-                    && (legacy->geometry.origin - Eigen::Vector2d(-6.0, -8.0)).norm() < 1e-9
+                    && (legacy->geometry.origin - Eigen::Vector2d(-3.1, -9.6)).norm() < 1e-9
                     && legacy->occupied_count > 0 && legacy->free_count > 0,
-                "MapIO loads legacy map/global_map.pgm with exact geometry"
+                "MapIO loads map/rmuc2027.pgm with exact geometry"
             );
         }
 

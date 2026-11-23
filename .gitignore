@@ -20,3 +20,5 @@ docs/ai_refactor_records
 __pycache__/
 *.pyc
 tmp
+
+.opencode

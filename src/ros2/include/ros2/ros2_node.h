@@ -67,6 +67,7 @@ private:
     // 输入消息 frame_id 与配置不一致时只告警一次
     bool cloud_frame_warned_ = false;
     bool odom_frame_warned_ = false;
+    bool map_odom_frame_warned_ = false;
     bool target_frame_warned_ = false;
 private:
     rclcpp::CallbackGroup::SharedPtr map_cb_group_;
@@ -93,6 +94,8 @@ private:
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr target_sub_;
     rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr clickedPoint_sub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+    // 可选：建图专用位姿（与点云同状态/同时间戳），控制仍用 odom_sub_。
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr map_odom_sub_;
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr clicked_region_pub_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr fold_pub_; 
@@ -196,6 +199,8 @@ public:
     }
     void map_callback(const sensor_msgs::msg::PointCloud2::SharedPtr& msg);
     void odom_callback(const nav_msgs::msg::Odometry::SharedPtr& msg);
+    // 建图位姿回调：把 world->IMU 的后验位姿转换到 base 后送入地图。
+    void map_odom_callback(const nav_msgs::msg::Odometry::SharedPtr& msg);
     void target_callback(const geometry_msgs::msg::PoseStamped::SharedPtr& msg);
     void clicked_point_callback(const geometry_msgs::msg::PointStamped::SharedPtr& msg);
     void planner_callback();
