@@ -33,13 +33,13 @@ planner_config:
     use_jps: true                 # 前端图搜索算法：true=JPS，false=A*
     search_timeout_ms: 5000       # 单次前端栅格搜索超时时间 (ms)，须 > 0
     jps_start_snap_radius: 1.5    # JPS 起点格不可通行时环形找最近自由格的最大半径 (m)，须 >= 0（0 表示仅查起点格自身不向外吸附）
-    safe_threshold: 0.3       # JPS/A* 搜索、折线剪枝碰撞检测、起终点/刹停点外推与刹车射线检测的安全距离阈值 (m，ESDF < 此值判碰撞)；也用于推导重规划硬净空 max(0.05, 0.2*safe_threshold)
+    safe_threshold: 0.3       # JPS/A* 搜索、折线剪枝碰撞检测、起终点/刹停点外推与刹车射线检测的安全距离阈值 (m，ESDF < 此值判碰撞)
     max_vel: 3.0              # 后处理前向/后向速度传播的最大速度上限 (m/s)
     max_acc: 3.0              # 后处理前向加速/后向减速传播的最大加速度上限 (m/s²)
     time_resolution: 0.4      # 均匀时间重采样目标单段时长 (s)，用于决定段数 round(total_time / time_resolution)；越小 timed_trajectory 点越密，最终夹紧到 [min_traj_num, max_traj_num]
     min_traj_num: 5           # 均匀时间重采样的最少时间分段数（对应至少 min_traj_num+1 个航点），防止短轨迹采样点太少
     max_traj_num: 16          # 均匀时间重采样的最多时间分段数，限制后端样条优化变量维度与耗时
-    dense_sample_resolution: 0.05   # 高密度路径细分间距 (m)，同时作为 FsmReplan 折线碰撞监控的采样步长（内部下限 0.02 m）
+    dense_sample_resolution: 0.05   # 高密度路径细分间距 (m)，同时作为 FsmReplan 执行轨迹碰撞监控的空间细分步长上限（内部下限 0.05 m）
     rotation_penalty_weight: 1.0    # 转弯惩罚权重 (m/rad)：等效距离 ds_equiv = ds_linear + rotation_penalty_weight * |Δθ|，越大转弯处分配时间越充裕
 
   # ---------- MA Spline 轨迹优化参数 ----------
@@ -99,8 +99,7 @@ planner_config:
     
     replan_lateral_dev: 0.5           # 横向偏差阈值 (m)：机器人偏离当前参考路径（含刹车段）超过 0.5m 就重规划
     goal_reached_radius: 0.3          # 到达判定半径 (m)：距目标 2D 欧氏距离小于 0.3m 直接认为到达（ROS2 节点与 FsmReplan 均使用）
-    
-    #hard_clearance: 0.2              # [当前无用] 已注释：代码未加载，当前 FsmReplan 硬编码为 max(0.05, safe_threshold * 0.2)
+    hard_clearance: 0.2               # 监控态前向执行轨迹（刹车段+样条）碰撞检测硬净空 (m)，须 > 0；建议 >= footprint_radius(0.20) 且 < safe_threshold(0.30) 以留出规划-监控滞回带宽
     
     projection_search_resolution: 0.02   # 热启动时在上一条轨迹上搜索最近投影点的时间步长 (s，内部下限 1e-3)，越小越精确但计算量越大
     # 反向重规划（速度与新路径首段夹角 > 90° 且速率 > 0.2 m/s）：先沿当前速度方向匀减速刹停，再从刹停点反向规划

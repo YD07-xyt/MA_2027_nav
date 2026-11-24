@@ -57,6 +57,7 @@ GlobalPlanner2d::GlobalPlanner2d(rclcpp::Node::SharedPtr nh_, std::string params
         clock_ = utils::Clock::steady();
     }
     ma_map_->set_clock(clock_);
+    fsm_replanner.set_clock(clock_);
 
     map_cb_group_ = nh->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     planner_cb_group_ = nh->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);

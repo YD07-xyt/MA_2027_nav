@@ -250,6 +250,7 @@ auto load_planner_config(const YAML::Node& root) -> replan::FsmReplan::PlannerCo
         if (rp["goal_deviation"]) r.goal_deviation = load_vector3d(rp["goal_deviation"]);
         if (rp["replan_lateral_dev"]) r.replan_lateral_dev = rp["replan_lateral_dev"].as<double>();
         if (rp["goal_reached_radius"]) r.goal_reached_radius = rp["goal_reached_radius"].as<double>();
+        if (rp["hard_clearance"]) r.hard_clearance = rp["hard_clearance"].as<double>();
         if (rp["projection_search_resolution"]) {
             r.projection_search_resolution = rp["projection_search_resolution"].as<double>();
         }
@@ -2689,6 +2690,78 @@ auto run_sanity_checks(BenchEnv& env) -> bool {
                 ok &= check(
                     d_deb1.fold_cmd && !d_deb2.fold_cmd && d_deb2.cmd_changed,
                     "FoldGuard unfolds after unfold_confirm_time outside T_out"
+                );
+            }
+        }
+
+        // 9l. FsmReplan：前向执行轨迹碰撞监控（不误检身后、物理硬净空生效）与 utils::Clock 刹车段计时
+        {
+            auto mon_gm = std::make_shared<grid_map::GridMap>();
+            mon_gm->init(6.0, 6.0, 2.0, 2.0, 0.05, grid_map::OutOfBoundsPolicy::OCCUPIED);
+            grid_map::RowMatrixXi mon_occ = grid_map::RowMatrixXi::Zero(240, 80);
+            ok &= check(mon_gm->overwriteMapAndUpdateEsdf(mon_occ), "FsmReplan monitor test GridMap init");
+
+            replan::FsmReplan mon_fsm(env.planner_cfg);
+            utils::ManualClock mon_clk;
+            mon_clk.setSec(10.0);
+            mon_fsm.set_clock(mon_clk.asClock());
+
+            const auto st_start = make_robot_state(Eigen::Vector2d(-4.0, 0.0));
+            const auto st_mid = make_robot_state(Eigen::Vector2d(0.0, 0.0));
+            const auto st_goal = make_robot_state(Eigen::Vector2d(4.0, 0.0));
+
+            const auto r_init = mon_fsm.plan(st_goal, st_start, mon_gm);
+            ok &= check(
+                r_init.has_value() && r_init->is_new_trajectory && r_init->ma_spline_traj.success,
+                "FsmReplan monitor test initial trajectory planned"
+            );
+
+            // 身后已走过路段 (-2.0, 0.0) 出现障碍：不得误触发重规划
+            auto mon_gm_behind = std::make_shared<grid_map::GridMap>();
+            mon_gm_behind->init(6.0, 6.0, 2.0, 2.0, 0.05, grid_map::OutOfBoundsPolicy::OCCUPIED);
+            grid_map::RowMatrixXi occ_behind = grid_map::RowMatrixXi::Zero(240, 80);
+            for (int ix = 79; ix <= 81; ++ix) {
+                for (int iy = 39; iy <= 41; ++iy) {
+                    occ_behind(ix, iy) = 1;
+                }
+            }
+            ok &= check(mon_gm_behind->overwriteMapAndUpdateEsdf(occ_behind), "FsmReplan behind obstacle map init");
+            const auto r_behind = mon_fsm.plan(st_goal, st_mid, mon_gm_behind);
+            ok &= check(
+                r_behind.has_value() && !r_behind->is_new_trajectory,
+                "FsmReplan ignores obstacle on already-traversed behind segment"
+            );
+
+            // 前方路段 (2.025, 0.125) 出现净空 0.125m 障碍（0.06 < 0.125 < hard_clearance=0.20）：必须触发重规划
+            auto mon_gm_ahead = std::make_shared<grid_map::GridMap>();
+            mon_gm_ahead->init(6.0, 6.0, 2.0, 2.0, 0.05, grid_map::OutOfBoundsPolicy::OCCUPIED);
+            grid_map::RowMatrixXi occ_ahead = grid_map::RowMatrixXi::Zero(240, 80);
+            occ_ahead(160, 42) = 1;
+            ok &= check(mon_gm_ahead->overwriteMapAndUpdateEsdf(occ_ahead), "FsmReplan ahead obstacle map init");
+            const auto r_ahead = mon_fsm.plan(st_goal, st_mid, mon_gm_ahead);
+            ok &= check(
+                r_ahead.has_value() && r_ahead->is_new_trajectory && r_ahead->ma_spline_traj.success,
+                "FsmReplan replans when forward spline violates physical hard_clearance"
+            );
+
+            // 反向刹车段计时跟随注入的 utils::ManualClock
+            replan::FsmReplan brake_fsm(env.planner_cfg);
+            mon_clk.setSec(20.0);
+            brake_fsm.set_clock(mon_clk.asClock());
+            const auto r_fwd = brake_fsm.plan(st_goal, st_start, mon_gm);
+            const auto r_rev = brake_fsm.plan(st_start, st_mid, mon_gm);
+            const bool has_brake = r_fwd.has_value() && r_rev.has_value() && r_rev->is_new_trajectory
+                && r_rev->ma_spline_traj.brake.duration > 1e-3;
+            ok &= check(has_brake, "FsmReplan generates reverse brake segment for clock test");
+            if (has_brake) {
+                const double half_brake = 0.5 * r_rev->ma_spline_traj.brake.duration;
+                mon_clk.advanceSec(half_brake);
+                Eigen::Vector2d bp, bv, ba;
+                ma_spline_opt::sample_xy(r_rev->ma_spline_traj, half_brake, bp, bv, ba);
+                const auto r_brake_mon = brake_fsm.plan(st_start, make_robot_state(bp), mon_gm);
+                ok &= check(
+                    r_brake_mon.has_value() && !r_brake_mon->is_new_trajectory,
+                    "FsmReplan tracks brake segment elapsed time via injected utils::Clock"
                 );
             }
         }

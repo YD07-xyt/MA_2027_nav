@@ -3,6 +3,7 @@
 #include "traj_optimize/ma_spline_opt/optimizer_config.h"
 
 #include "path_planning/post_processing.h"
+#include "utils/clock.hpp"
 #include "utils/expected.hpp"
 #include "utils/type_utils.hpp"
 #include <Eigen/Core>
@@ -17,8 +18,8 @@ public:
         double replan_lateral_dev; // 横向偏差阈值（m），机器人偏离参考路径超过则重规划
         double goal_reached_radius; // 起点≈终点判定半径（m）：机器人距目标小于该值时直接退出不规划，
         // 避免退化路径（A* 单点）与无意义的周期重规划
-        //double hard_clearance; // 优化结果硬净空（m）：轨迹采样点净空低于该值直接拒收。
-        // 应 ≤ 通道允许的最小净空（≈通道半宽）；太小失去安全网，太大窄缝永远过不去
+        // 监控态前向执行轨迹碰撞检测硬净空（m），须 > 0（运行期夹紧至 <= safe_threshold）
+        double hard_clearance = 0.20;
         double projection_search_resolution; ///< 投影点搜索时间分辨率 (s)，越小越精确但计算量越大
         // 反向重规划刹车段：常规减速度；空间不够时最多提到 brake_acc_max，仍不够则急停（发零速）
         double brake_acc = 6.0; ///< 常规刹车减速度 (m/s²)
@@ -39,6 +40,8 @@ public:
     FsmReplan& operator=(const FsmReplan&) = delete;
     // 构造或 set_param 后方可调用 plan；重复设置会更新规划器配置。
     auto set_param(const PlannerConfig& planner_config) -> void;
+    // 注入时钟源（仿真/回放跟随 /clock，离线测试可注入 ManualClock；默认 steady_clock）。
+    auto set_clock(utils::Clock clock) -> void;
 
     //init 2
     explicit FsmReplan(const PlannerConfig& planner_config);
