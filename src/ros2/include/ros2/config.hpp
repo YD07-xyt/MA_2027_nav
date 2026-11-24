@@ -1,4 +1,5 @@
 #pragma once
+#include "controller/fold_guard.hpp"
 #include "controller/mpc.h"
 #include "replan/fsm_replanner.h"
 #include "utils/logger.hpp"
@@ -275,13 +276,43 @@ inline void load_path_post_processing_params(
     if (node["max_acc"]) param.max_acc = node["max_acc"].as<double>();
     if (node["time_resolution"]) param.time_resolution = node["time_resolution"].as<double>();
     if (node["min_traj_num"]) param.min_traj_num = node["min_traj_num"].as<int>();
+}
 
-    // ---------- 云台折叠参数 ----------
-    if (node["fold_time"]) param.fold_time = node["fold_time"].as<double>();
-    if (node["unfold_time"]) param.unfold_time = node["unfold_time"].as<double>();
-    if (node["fold_margin"]) param.fold_margin = node["fold_margin"].as<double>();
-    if (node["fold_prep_speed"]) param.fold_prep_speed = node["fold_prep_speed"].as<double>();
-    if (node["fold_prep_margin"]) param.fold_prep_margin = node["fold_prep_margin"].as<double>();
+// ============================================================
+// 加载闭环云台折叠参数 (FoldParams)
+// ============================================================
+
+inline void load_fold_params(const YAML::Node& node, control::FoldParams& param) {
+    if (!node) return;
+    auto load_non_neg = [&](const char* key, double& dst) {
+        if (!node[key]) return;
+        const double v = node[key].as<double>();
+        if (!std::isfinite(v) || v < 0.0) {
+            throw std::invalid_argument(std::string("planner_config.fold_params.") + key + " must be finite and >= 0");
+        }
+        dst = v;
+    };
+    auto load_pos = [&](const char* key, double& dst) {
+        if (!node[key]) return;
+        const double v = node[key].as<double>();
+        if (!std::isfinite(v) || v <= 0.0) {
+            throw std::invalid_argument(std::string("planner_config.fold_params.") + key + " must be finite and > 0");
+        }
+        dst = v;
+    };
+
+    load_non_neg("fold_time", param.fold_time);
+    load_non_neg("unfold_time", param.unfold_time);
+    load_non_neg("fold_margin", param.fold_margin);
+    load_non_neg("gimbal_radius", param.gimbal_radius);
+    load_non_neg("unfold_hysteresis", param.unfold_hysteresis);
+    load_non_neg("unfold_confirm_time", param.unfold_confirm_time);
+    load_pos("feedback_timeout", param.feedback_timeout);
+    load_non_neg("fold_timeout_margin", param.fold_timeout_margin);
+    load_pos("gate_brake_acc", param.gate_brake_acc);
+    load_non_neg("gate_stop_buffer", param.gate_stop_buffer);
+    load_pos("lookahead_dt", param.lookahead_dt);
+    load_pos("cmd_pub_rate", param.cmd_pub_rate);
 }
 
 // ============================================================
@@ -336,6 +367,8 @@ struct Config {
     // /lio/odom 机体（IMU）在 base 系下的位姿 [x,y,z,roll,pitch,yaw]，m/deg。
     Eigen::Matrix<double, 6, 1> map_odom_imu_in_base = Eigen::Matrix<double, 6, 1>::Zero();
     std::string cmd_vel_name;
+    std::string fold_cmd_topic_name = "/ma_nav/fold";
+    std::string fold_feedback_topic_name = "/ma_nav/fold_state";
     std::string save_global_map_path;
     std::string save_map_srv_topic;
     int num_threads;
@@ -349,6 +382,7 @@ struct Config {
     std::string global_map_path;
 
     replan::FsmReplan::PlannerConfig planner_config;
+    control::FoldParams fold_params;
     control::MpcParam mpc_params;
 
     explicit Config(std::string params_path) {
@@ -366,6 +400,18 @@ struct Config {
             }
             map_odom_imu_in_base = load_vector6d(config["ros2"]["map_odom_imu_in_base"], "map_odom_imu_in_base");
             cmd_vel_name = config["ros2"]["cmd_vel_name"].as<std::string>();
+            if (config["ros2"]["fold_cmd_topic_name"]) {
+                fold_cmd_topic_name = config["ros2"]["fold_cmd_topic_name"].as<std::string>();
+                if (fold_cmd_topic_name.empty()) {
+                    throw std::invalid_argument("ros2.fold_cmd_topic_name must not be empty");
+                }
+            }
+            if (config["ros2"]["fold_feedback_topic_name"]) {
+                fold_feedback_topic_name = config["ros2"]["fold_feedback_topic_name"].as<std::string>();
+                if (fold_feedback_topic_name.empty()) {
+                    throw std::invalid_argument("ros2.fold_feedback_topic_name must not be empty");
+                }
+            }
             map_params_path = config["ros2"]["map_params_path"].as<std::string>();
             global_map_path = config["ros2"]["global_map_path"].as<std::string>();
             save_global_map_path = config["ros2"]["save_global_map_path"].as<std::string>();
@@ -381,6 +427,9 @@ struct Config {
 
         if (config["planner_config"]) {
             load_planner_config(config["planner_config"], planner_config);
+            if (config["planner_config"]["fold_params"]) {
+                load_fold_params(config["planner_config"]["fold_params"], fold_params);
+            }
         }
 
         if (config["mpc_param"]) {

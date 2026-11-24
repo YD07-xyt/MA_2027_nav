@@ -168,11 +168,6 @@ auto load_post_params(const YAML::Node& n) -> PostProc::PathPostProcessingParams
     ri("max_traj_num", p.max_traj_num);
     rd("dense_sample_resolution", p.dense_sample_resolution);
     rd("rotation_penalty_weight", p.rotation_penalty_weight);
-    rd("fold_time", p.fold_time);
-    rd("unfold_time", p.unfold_time);
-    rd("fold_margin", p.fold_margin);
-    rd("fold_prep_speed", p.fold_prep_speed);
-    rd("fold_prep_margin", p.fold_prep_margin);
     return p;
 }
 
@@ -269,7 +264,7 @@ auto post_process(const grid_map::GridMap& gm, const PostProc::PathPostProcessin
     traj.raw_path = raw;
     traj.optimized_path = post.optimize_path(gm, traj.raw_path);
     traj.path_states = post.sample_path_states(traj.optimized_path);
-    post.assign_trajectory_timing(gm, traj);
+    post.assign_trajectory_timing(traj);
     post.fill_additional_trajectory_info(traj, q.start, q.goal, 0.0, 0.0);
     return traj;
 }

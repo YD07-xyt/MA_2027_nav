@@ -48,7 +48,7 @@ public:
         traj.path_states = post_processing_.sample_path_states(traj.optimized_path);
 
         // 4. Time allocation (trapezoidal velocity profile)
-        post_processing_.assign_trajectory_timing(grid_map, traj);
+        post_processing_.assign_trajectory_timing(traj);
 
         // 5. Fill additional information
         post_processing_.fill_additional_trajectory_info(traj, start, goal, start_yaw, goal_yaw);

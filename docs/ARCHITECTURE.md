@@ -33,7 +33,7 @@ path_planning → 3d_occ_map + utils
 | 规划 | planner callback group，33 ms timer |
 | 控制与可视化 | control callback group，各 10 ms timer |
 | 速度 | GlobalPlanner2d 发布到 YAML 的 `ros2.cmd_vel_name` |
-| 折叠/导航反馈 | GlobalPlanner2d 发布 `/ma_nav/fold`、`/ma_nav/nav_feedback` |
+| 折叠闭环与导航反馈 | GlobalPlanner2d 发布 `ros2.fold_cmd_topic_name`（默认 `/ma_nav/fold`）、`/ma_nav/nav_feedback`；在 control callback group 订阅 `ros2.fold_feedback_topic_name`（默认 `/ma_nav/fold_state`，`std_msgs/Bool`）驱动 `control::FoldGuard` 闭环门禁 |
 | 地图/隧道保存 | 配置命名的 Trigger 服务，输出路径来自 YAML |
 
 回调组划分不证明跨组数据安全；地图快照、目标/轨迹等共享状态的锁与生命周期按实际成员读写核查。现有 topic、frame、QoS、频率和比赛状态优先级变更均按根规范确认。

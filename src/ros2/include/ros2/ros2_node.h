@@ -7,6 +7,7 @@
 //map
 
 //controller
+#include "controller/fold_guard.hpp"
 #include "controller/mpc.h"
 //nav
 #include "controller/traj_interface.hpp"
@@ -45,6 +46,7 @@
 #include "ros2/misc/visualizer.hpp"
 //std
 #include <atomic>
+#include <cstdint>
 #include <optional>
 #include <cstddef>
 #include <chrono>
@@ -88,6 +90,8 @@ private:
     // 任务状态 goal_pose/nav_state/plan_start_time_sec_ 由 control 组（target_callback）
     // 与 planner 组（plan_omni）共享，同样只做短临界区保护。
     mutable std::mutex nav_task_mtx_;
+    // 轨迹交接：planner 组写入不可变轨迹快照，control 组独占消费并更新 MPC / t_track_ / 急停状态。
+    mutable std::mutex traj_handoff_mtx_;
 
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr map_sub_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr target_sub_;
@@ -95,9 +99,10 @@ private:
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
     // 可选：建图专用位姿（与点云同状态/同时间戳），控制仍用 odom_sub_。
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr map_odom_sub_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr fold_feedback_sub_;
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr clicked_region_pub_;
-    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr fold_pub_; 
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr fold_pub_;
     rclcpp::Publisher<std_msgs::msg::Int16>::SharedPtr nav_feedback_pub_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr save_map_srv_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr save_tunnel_regions_srv_;
@@ -131,32 +136,8 @@ private:
     replan::FsmReplan::PathState nav_state;
     auto pub_nav_feedback() -> std_msgs::msg::Int16;
     //FSM fsm_;
-    struct FoldEvent {
-        bool fold = true;
-        double time = 0.0;
-    };
-    struct TunnelInterval {
-        double entry_time = 0.0;
-        double exit_time = 0.0;
-    };
-    std::vector<FoldEvent> fold_events_;
-    size_t next_fold_event_idx_ = 0;
-    // 当前下发的云台状态：true=折叠，false=抬升
-    // planner 组与 control 组都会读写，用原子量避免数据竞争（折叠事件表本身仍按既有流程使用）。
-    std::atomic<bool> current_fold_state_ = false;
-    std::vector<TunnelInterval> detect_tunnel_intervals(
-        const ma_spline_opt::MAsplineOutput& ma_traj,
-        const grid_map::GridMap& map,
-        double sample_dt = 0.02
-    );
-    std::vector<FoldEvent> generate_fold_events(
-        const ma_spline_opt::MAsplineOutput& ma_traj,
-        const grid_map::GridMap& map,
-        double fold_time,
-        double unfold_time,
-        double margin,
-        double sample_dt = 0.002
-    );
+    void fold_feedback_callback(const std_msgs::msg::Bool::SharedPtr& msg);
+    void publish_fold_cmd_if_due(const control::FoldDecision& decision, double now_sec);
 
     // 跨回调组状态快照接口：持锁只做拷贝，调用方在锁外使用快照。
     auto get_current_pose() const -> std::optional<utils::RobotState>;
@@ -168,8 +149,14 @@ private:
 
 private:
     control::Mpc<control::MaSplineTrajectoryInterface> mpc_;
+    control::FoldGuard fold_guard_;
+    std::shared_ptr<control::MaSplineTrajectoryInterface> pending_traj_;
+    uint64_t pending_traj_gen_ = 0;
+    uint64_t active_traj_gen_ = 0;
     std::shared_ptr<control::MaSplineTrajectoryInterface> ma_traj_interface_;
     double t_track_ = 0.0;
+    std::optional<double> last_fold_cmd_pub_sec_;
+    double last_fold_warn_sec_ = -1e9;
     // 保存上一帧 MPC 的 world 速度指令，作为下一帧 x0 的速度状态
     double last_vx_world_cmd_ = 0.0;
     double last_vy_world_cmd_ = 0.0;

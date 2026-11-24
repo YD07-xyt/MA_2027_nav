@@ -16,6 +16,7 @@
  *     --benchmark_out_format=json 与 scripts/compare_bench.py 进行改前/改后对比。
  */
 
+#include "controller/fold_guard.hpp"
 #include "controller/mpc.h"
 #include "controller/traj_interface.hpp"
 #include "cv2map.hpp"
@@ -230,11 +231,6 @@ auto load_planner_config(const YAML::Node& root) -> replan::FsmReplan::PlannerCo
         if (pp["max_traj_num"]) p.max_traj_num = pp["max_traj_num"].as<int>();
         if (pp["dense_sample_resolution"]) p.dense_sample_resolution = pp["dense_sample_resolution"].as<double>();
         if (pp["rotation_penalty_weight"]) p.rotation_penalty_weight = pp["rotation_penalty_weight"].as<double>();
-        if (pp["fold_time"]) p.fold_time = pp["fold_time"].as<double>();
-        if (pp["unfold_time"]) p.unfold_time = pp["unfold_time"].as<double>();
-        if (pp["fold_margin"]) p.fold_margin = pp["fold_margin"].as<double>();
-        if (pp["fold_prep_speed"]) p.fold_prep_speed = pp["fold_prep_speed"].as<double>();
-        if (pp["fold_prep_margin"]) p.fold_prep_margin = pp["fold_prep_margin"].as<double>();
     }
     if (const YAML::Node opt = pc["ma_spline_opt_params"]) {
         auto& o = cfg.ma_spline_opt_params;
@@ -2587,6 +2583,114 @@ auto run_sanity_checks(BenchEnv& env) -> bool {
                 !second_map->get_robot_position().has_value(),
                 "MaMap get_robot_position rejects non-finite odom position"
             );
+        }
+
+        // 9k. control::FoldGuard：闭环云台折叠状态机、2D 隧道距离场、洞口虚拟门禁与出洞滞回/去抖
+        {
+            auto fg_map = std::make_shared<grid_map::GridMap>();
+            fg_map->init(6.0, 6.0, 2.0, 2.0, 0.05, grid_map::OutOfBoundsPolicy::OCCUPIED);
+            grid_map::RowMatrixXi fg_occ = grid_map::RowMatrixXi::Zero(240, 80);
+            ok &= check(fg_map->overwriteMapAndUpdateEsdf(fg_occ), "FoldGuard test GridMap init");
+            const std::vector<Eigen::Vector2d> fg_tunnel = {
+                Eigen::Vector2d(1.0, -1.0),
+                Eigen::Vector2d(2.5, -1.0),
+                Eigen::Vector2d(2.5, 1.0),
+                Eigen::Vector2d(1.0, 1.0),
+            };
+            ok &= check(
+                fg_map->semantics_polygon_region(fg_tunnel, grid_map::GridMap::Semantics::TUNNEL),
+                "FoldGuard test tunnel polygon rasterized"
+            );
+
+            replan::FsmReplan fg_fsm(env.planner_cfg);
+            const auto fg_plan = fg_fsm.plan(
+                make_robot_state(Eigen::Vector2d(5.0, 0.0)),
+                make_robot_state(Eigen::Vector2d(-5.0, 0.0)),
+                fg_map
+            );
+            ok &= check(
+                fg_plan.has_value() && fg_plan->ma_spline_traj.success
+                    && fg_plan->ma_spline_traj.trajectory.isInitialized(),
+                "FoldGuard test trajectory through tunnel planned"
+            );
+            if (fg_plan.has_value() && fg_plan->ma_spline_traj.success) {
+                control::MaSplineTrajectoryInterface fg_traj(fg_plan->ma_spline_traj);
+                control::FoldParams fp {};
+                fp.fold_time = 1.0;
+                fp.unfold_time = 1.0;
+                fp.fold_margin = 0.5;
+                fp.gimbal_radius = 0.3;
+                fp.unfold_hysteresis = 0.2;
+                fp.unfold_confirm_time = 0.4;
+                fp.feedback_timeout = 0.3;
+                fp.fold_timeout_margin = 0.5;
+                fp.gate_brake_acc = 3.0;
+                fp.gate_stop_buffer = 0.15;
+                control::FoldGuard guard(fp);
+
+                // 远离隧道：不触发折叠
+                const auto d_far = guard.update(fg_map.get(), &fg_traj, 0.0, Eigen::Vector2d(-5.0, 0.0), 10.0);
+                ok &= check(!d_far.fold_cmd && d_far.feedback_stale, "FoldGuard stays unfolded far from tunnel");
+
+                // 逼近隧道入口（T_in 左边界 x≈0.70）：未确认折叠时触发 fold_cmd 并激活门禁制动包络
+                const double t_approach = fg_traj.nearest_time(Eigen::Vector2d(-0.6, 0.0));
+                const auto d_approach =
+                    guard.update(fg_map.get(), &fg_traj, t_approach, Eigen::Vector2d(-0.6, 0.0), 10.1);
+                ok &= check(
+                    d_approach.fold_cmd && d_approach.cmd_changed && d_approach.gate_active
+                        && std::isfinite(d_approach.max_speed) && d_approach.max_speed > 0.0,
+                    "FoldGuard triggers fold_cmd and finite braking envelope approaching tunnel"
+                );
+
+                // 抵达门禁停车缓冲边界内（距 T_in 仅 0.10m < gate_stop_buffer=0.15m）：硬截停至零速
+                const double t_stop = fg_traj.nearest_time(Eigen::Vector2d(0.60, 0.0));
+                const auto d_stop = guard.update(fg_map.get(), &fg_traj, t_stop, Eigen::Vector2d(0.60, 0.0), 10.2);
+                Eigen::Vector2d v_cmd(2.0, 0.0);
+                const bool clamped_zero = control::FoldGuard::apply_velocity_gate(v_cmd, d_stop);
+                ok &= check(
+                    d_stop.gate_active && d_stop.max_speed <= 1e-6 && clamped_zero && v_cmd.norm() <= 1e-9,
+                    "FoldGuard hard-stops velocity outside T_in stop buffer when unconfirmed"
+                );
+
+                // 超过 fold_time + fold_timeout_margin 仍未到位：置 fold_timeout 并维持锁定
+                const auto d_timeout = guard.update(fg_map.get(), &fg_traj, t_stop, Eigen::Vector2d(0.60, 0.0), 12.0);
+                ok &= check(
+                    d_timeout.fold_timeout && d_timeout.gate_active && d_timeout.max_speed <= 1e-6,
+                    "FoldGuard reports fold_timeout and keeps gate locked"
+                );
+
+                // 收到新鲜确认反馈（DOWN）：门禁立即放行
+                guard.on_feedback(true, 12.1);
+                const auto d_go = guard.update(fg_map.get(), &fg_traj, t_stop, Eigen::Vector2d(0.60, 0.0), 12.15);
+                ok &= check(
+                    d_go.confirmed_folded && !d_go.feedback_stale && !d_go.fold_timeout && !d_go.gate_active,
+                    "FoldGuard unlocks gate immediately upon fresh DOWN feedback"
+                );
+
+                // 洞内反馈超时：立即锁定零速并维持 fold_cmd=true
+                const double t_inside = fg_traj.nearest_time(Eigen::Vector2d(1.75, 0.0));
+                const auto d_lost = guard.update(fg_map.get(), &fg_traj, t_inside, Eigen::Vector2d(1.75, 0.0), 12.6);
+                ok &= check(
+                    d_lost.fold_cmd && d_lost.feedback_stale && d_lost.gate_active && d_lost.max_speed <= 1e-6,
+                    "FoldGuard locks zero speed if feedback goes stale inside tunnel"
+                );
+
+                // 出洞但在 T_out 滞回带内（x=2.85 <= 2.5+0.5=3.0）：禁止抬升
+                guard.on_feedback(true, 12.7);
+                const double t_hyst = fg_traj.nearest_time(Eigen::Vector2d(2.85, 0.0));
+                const auto d_hyst = guard.update(fg_map.get(), &fg_traj, t_hyst, Eigen::Vector2d(2.85, 0.0), 12.75);
+                ok &= check(d_hyst.fold_cmd, "FoldGuard holds folded inside T_out hysteresis zone");
+
+                // 离开 T_out 且前瞻无隧道：去抖期内维持折叠，满 unfold_confirm_time 后抬升
+                const double t_clear = fg_traj.nearest_time(Eigen::Vector2d(4.0, 0.0));
+                const auto d_deb1 = guard.update(fg_map.get(), &fg_traj, t_clear, Eigen::Vector2d(4.0, 0.0), 13.0);
+                guard.on_feedback(true, 13.4);
+                const auto d_deb2 = guard.update(fg_map.get(), &fg_traj, t_clear, Eigen::Vector2d(4.0, 0.0), 13.45);
+                ok &= check(
+                    d_deb1.fold_cmd && !d_deb2.fold_cmd && d_deb2.cmd_changed,
+                    "FoldGuard unfolds after unfold_confirm_time outside T_out"
+                );
+            }
         }
     }
 

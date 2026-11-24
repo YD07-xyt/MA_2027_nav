@@ -11,6 +11,8 @@ ros2:
   # 仅在 map_odom_topic_name 非空时生效，用于将 world->IMU 变换为 world->base（缺失默认全 0；非 6 维或含 NaN/Inf 会抛异常）
   map_odom_imu_in_base: [0.011, 0.02329, 0.10588, 0.0, 0.0, 0.0]
   cmd_vel_name: "/cmd_vel_chassis" #"/cmd_vel" #"/cmd_vel_chassis"  # 底盘速度输出话题 (geometry_msgs/Twist)，body 系 linear.x/y (m/s)，angular.z 恒为 0
+  fold_cmd_topic_name: "/ma_nav/fold"             # 云台折叠电平输出话题 (std_msgs/Bool)，true=折叠锁定，false=允许展开（翻转即发 + 周期心跳）
+  fold_feedback_topic_name: "/ma_nav/fold_state"  # 下位机云台物理折叠反馈话题 (std_msgs/Bool)，true=已确认折叠到位(DOWN)，false=未到位/运动中/故障
   save_global_map_path:  "map"                # 探索地图保存目录路径，调用 save_map_srv_topic 后传给 MaMap 保存 .pgm + .yaml
   save_map_srv_topic: "/save_global_map"      # 保存探索地图的 ROS2 服务名 (std_srvs/srv/Trigger)
   map_params_path: "src/navigation/config/map.yaml"   # 地图配置文件路径，传给 MaMap 构造加载
@@ -39,13 +41,6 @@ planner_config:
     max_traj_num: 16          # 均匀时间重采样的最多时间分段数，限制后端样条优化变量维度与耗时
     dense_sample_resolution: 0.05   # 高密度路径细分间距 (m)，同时作为 FsmReplan 折线碰撞监控的采样步长（内部下限 0.02 m）
     rotation_penalty_weight: 1.0    # 转弯惩罚权重 (m/rad)：等效距离 ds_equiv = ds_linear + rotation_penalty_weight * |Δθ|，越大转弯处分配时间越充裕
-
-    # ---------- 云台折叠参数（部分由 ROS2 节点层消费） ----------
-    fold_time: 1.0          # 云台折叠所需时间 (s)：后处理用于计算隧道入口前低速准备距离，ROS2 节点用于提前触发折叠与合并相邻隧道
-    unfold_time: 1.0        # 云台展开所需时间 (s)：后处理算法内部未使用，仅由 ROS2 节点用于计算相邻隧道合并间隔 (fold_time + unfold_time + 2*fold_margin)
-    fold_margin: 0.5        # 折叠/展开安全时间裕量 (s)：后处理算法内部未使用，仅由 ROS2 节点用于提前折叠、延后展开与合并相邻隧道
-    fold_prep_speed: 0.05   # 隧道入口前准备段限速上限 (m/s)，后处理在入口前 prep_dist = fold_prep_speed * fold_time + fold_prep_margin 范围内限速
-    fold_prep_margin: 0.3   # 隧道入口前准备段的额外安全距离裕量 (m)
 
   # ---------- MA Spline 轨迹优化参数 ----------
   ma_spline_opt_params:
@@ -112,6 +107,21 @@ planner_config:
     brake_acc: 6.0         # 常规反向刹车减速度 (m/s²)
     brake_acc_max: 10.0    # 刹车距离不够时最多提到该值 (m/s²)，仍不够则急停发零速；注释建议 ≤ 底盘能力且 ≤ MPC u_max（注意当前 MPC u_max 为 3.0）
     start_oob_recover_dist: 0.3  # 导航模式下起点轻微越界允许沿虚拟墙向内恢复的最大距离 (m)
+
+  # ---------- 闭环云台折叠与洞口虚拟门禁参数 ----------
+  fold_params:
+    fold_time: 1.0              # 云台物理折叠耗时 (s)，须 >= 0；用于提前触发折叠、合并相邻隧道与折叠超时判定
+    unfold_time: 1.0            # 云台物理展开耗时 (s)，须 >= 0；用于相邻隧道合并窗口 fold_time + unfold_time + 2*fold_margin
+    fold_margin: 0.5            # 折叠/展开安全时间裕量 (s)，须 >= 0
+    gimbal_radius: 0.3          # 禁入区 T_in 外扩半径 = 云台包络半径 + 定位误差 (m)，须 >= 0
+    unfold_hysteresis: 0.2      # 出洞滞回外扩量 (m)，须 >= 0；T_out = gimbal_radius + unfold_hysteresis，须离开 T_out 才允许计时抬升
+    unfold_confirm_time: 0.4    # 离开 T_out 且前瞻窗口内无隧道后的持续确认去抖时间 (s)，须 >= 0；抑制重规划抖动误抬升
+    feedback_timeout: 0.3       # 下位机折叠反馈超时阈值 (s)，须 > 0；超时视为未确认折叠到位并锁定洞口门禁
+    fold_timeout_margin: 1.0    # 折叠超时告警裕量 (s)，须 >= 0；持续请求折叠超过 fold_time + fold_timeout_margin 仍未到位时告警
+    gate_brake_acc: 3.0         # 虚拟门禁制动速度包络减速度 (m/s²)，须 > 0；未确认折叠到位时按 v_gate = sqrt(2*a*max(0, s-buf)) 限速
+    gate_stop_buffer: 0.15      # 门禁停靠时距禁入区 T_in 边界的停车缓冲距离 (m)，须 >= 0
+    lookahead_dt: 0.05          # 沿当前轨迹（刹车段+样条段）前瞻隧道入口的采样步长 (s)，须 > 0
+    cmd_pub_rate: 20.0          # /ma_nav/fold 电平心跳发布频率 (Hz)，须 > 0；状态翻转时立即发布，稳态按该频率补发
 
 
 # ==================== 线性 MPC 参数 ====================

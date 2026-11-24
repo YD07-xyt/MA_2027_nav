@@ -33,8 +33,9 @@ GlobalPlanner2d::GlobalPlanner2d(rclcpp::Node::SharedPtr nh_, std::string params
     visualizer(nh_),
     //fsm_(config.fsm_config),
     ma_map_(std::make_shared<ma_map::MaMap>(config.map_params_path)),
+    nav_state(replan::FsmReplan::PathState::IDLE),
     mpc_(config.mpc_params),
-    nav_state(replan::FsmReplan::PathState::IDLE) {
+    fold_guard_(config.fold_params) {
     fsm_replanner.set_param(config.planner_config);
 
     // 时间源：use_sim_time=true 时全程跟随 /clock（仿真/回放）；false 使用 steady_clock（真机）。
@@ -107,6 +108,13 @@ GlobalPlanner2d::GlobalPlanner2d(rclcpp::Node::SharedPtr nh_, std::string params
         opts_target
     );
 
+    fold_feedback_sub_ = nh->create_subscription<std_msgs::msg::Bool>(
+        config.fold_feedback_topic_name,
+        rclcpp::QoS(10),
+        [this](const std_msgs::msg::Bool::SharedPtr msg) { fold_feedback_callback(msg); },
+        opts_target
+    );
+
     // 4. 定时器（同样绑定回调组）
     planner_timer_ = nh->create_wall_timer(
         std::chrono::milliseconds(33),
@@ -135,8 +143,14 @@ GlobalPlanner2d::GlobalPlanner2d(rclcpp::Node::SharedPtr nh_, std::string params
     );
     cmd_vel_pub_ = nh->create_publisher<geometry_msgs::msg::Twist>(config.cmd_vel_name, 10);
     clicked_region_pub_ = nh->create_publisher<visualization_msgs::msg::MarkerArray>("/ma_nav/clicked_regions", 10);
-    fold_pub_ = nh->create_publisher<std_msgs::msg::Bool>("/ma_nav/fold", 10);
+    fold_pub_ = nh->create_publisher<std_msgs::msg::Bool>(config.fold_cmd_topic_name, 10);
     nav_feedback_pub_ = nh->create_publisher<std_msgs::msg::Int16>("/ma_nav/nav_feedback", 10);
+    logger::info(
+        logger::ros2,
+        "fold topics: cmd={}, feedback={}",
+        config.fold_cmd_topic_name,
+        config.fold_feedback_topic_name
+    );
 
     // 保存/加载全局地图的 ROS2 服务
     save_map_srv_ = nh->create_service<std_srvs::srv::Trigger>(
@@ -212,45 +226,131 @@ void GlobalPlanner2d::finish_nav_task(replan::FsmReplan::PathState state) {
     nav_feedback_pub_->publish(pub_nav_feedback());
 }
 
+void GlobalPlanner2d::fold_feedback_callback(const std_msgs::msg::Bool::SharedPtr& msg) {
+    fold_guard_.on_feedback(msg->data, clock_.nowSec());
+}
+
+void GlobalPlanner2d::publish_fold_cmd_if_due(const control::FoldDecision& decision, double now_sec) {
+    const double period = 1.0 / std::max(config.fold_params.cmd_pub_rate, 1e-3);
+    const bool heartbeat_due = !last_fold_cmd_pub_sec_.has_value() || now_sec < last_fold_cmd_pub_sec_.value()
+        || (now_sec - last_fold_cmd_pub_sec_.value()) >= period;
+    if (decision.cmd_changed || heartbeat_due) {
+        std_msgs::msg::Bool fold_msg;
+        fold_msg.data = decision.fold_cmd;
+        fold_pub_->publish(fold_msg);
+        last_fold_cmd_pub_sec_ = now_sec;
+        if (decision.cmd_changed) {
+            logger::info(
+                logger::ros2,
+                "云台折叠指令切换: {} (confirmed_folded={}, feedback_stale={}, gate_active={})",
+                decision.fold_cmd ? "FOLD" : "UNFOLD",
+                decision.confirmed_folded,
+                decision.feedback_stale,
+                decision.gate_active
+            );
+        }
+    }
+}
+
 void GlobalPlanner2d::controller_callback() {
     const auto current_xytheta = get_current_xytheta();
     const auto current_pose_snapshot = get_current_pose();
     if (!current_xytheta.has_value()) return;
     if (!current_pose_snapshot.has_value()) return;
 
-    if (!ma_traj_interface_ || !ma_traj_interface_->valid()) {
-        return;
-    }
-
-    Eigen::Vector2d pos(current_xytheta->x(), current_xytheta->y());
-
-    // 急停：刹车距离不够，刹车段时长内直接发零速（不经过 MPC）
-    if (emergency_stop_until_sec_.has_value()) {
-        if (clock_.nowSec() < emergency_stop_until_sec_.value()) {
-            geometry_msgs::msg::Twist zero;
-            cmd_vel_pub_->publish(zero);
-            last_vx_world_cmd_ = 0.0;
-            last_vy_world_cmd_ = 0.0;
-            has_last_mpc_cmd_ = true;
-            return;
-        }
-        // 急停结束：跳过刹车段，从样条上离机器人最近的点开始跟踪
-        emergency_stop_until_sec_.reset();
-        t_track_ = ma_traj_interface_->nearest_time_from(pos, ma_traj_interface_->brake_duration());
-    }
-
-    // 刹车段内按时间推进游标（反向样条与刹车段位置重合，按位置搜索会卡在刹停点附近）；之后按位置更新
     const double now_sec = clock_.nowSec();
+    const Eigen::Vector2d pos(current_xytheta->x(), current_xytheta->y());
+
+    // 1. 消费 planner 组下发的最新不可变轨迹快照（control 组独占更新 mpc_/t_track_/急停状态）
+    std::shared_ptr<control::MaSplineTrajectoryInterface> incoming_traj;
+    uint64_t incoming_gen = 0;
+    {
+        std::lock_guard<std::mutex> lock(traj_handoff_mtx_);
+        if (pending_traj_gen_ != active_traj_gen_) {
+            incoming_traj = pending_traj_;
+            incoming_gen = pending_traj_gen_;
+        }
+    }
+    if (incoming_gen != 0 && incoming_traj && incoming_traj->valid()) {
+        ma_traj_interface_ = std::move(incoming_traj);
+        active_traj_gen_ = incoming_gen;
+        mpc_.set_trajectory(ma_traj_interface_);
+        t_track_ = ma_traj_interface_->nearest_time(pos);
+        if (ma_traj_interface_->brake_emergency()) {
+            const auto brake_ms = static_cast<int64_t>(ma_traj_interface_->brake_duration() * 1000.0);
+            emergency_stop_until_sec_ = now_sec + static_cast<double>(brake_ms) * 1e-3;
+            logger::warn(logger::ros2, "brake distance not enough, emergency stop {} ms", brake_ms);
+        } else {
+            emergency_stop_until_sec_.reset();
+        }
+    }
+
+    const bool has_valid_traj = ma_traj_interface_ && ma_traj_interface_->valid();
+
+    // 2. 更新急停状态与轨迹跟踪游标（保证 FoldGuard 读取到与本周期一致的 t_track_）
+    bool in_emergency_stop = false;
+    if (has_valid_traj && emergency_stop_until_sec_.has_value()) {
+        if (now_sec < emergency_stop_until_sec_.value()) {
+            in_emergency_stop = true;
+        } else {
+            // 急停结束：跳过刹车段，从样条上离机器人最近的点开始跟踪
+            emergency_stop_until_sec_.reset();
+            t_track_ = ma_traj_interface_->nearest_time_from(pos, ma_traj_interface_->brake_duration());
+        }
+    }
+
     const double dt_ctrl =
         last_control_time_sec_.has_value() ? std::clamp(now_sec - last_control_time_sec_.value(), 0.0, 0.05) : 0.0;
     last_control_time_sec_ = now_sec;
-    if (t_track_ < ma_traj_interface_->brake_duration()) {
-        t_track_ += dt_ctrl;
-    } else {
-        t_track_ = ma_traj_interface_->update_track_time(pos, t_track_);
+    if (has_valid_traj && !in_emergency_stop) {
+        // 刹车段内按时间推进游标（反向样条与刹车段位置重合，按位置搜索会卡在刹停点附近）；之后按位置更新
+        if (t_track_ < ma_traj_interface_->brake_duration()) {
+            t_track_ += dt_ctrl;
+        } else {
+            t_track_ = ma_traj_interface_->update_track_time(pos, t_track_);
+        }
     }
 
-    double t_now = t_track_;
+    // 3. 闭环云台折叠状态机与虚拟门禁（无轨迹/急停期间照常运行，保障电平心跳、出洞抬升与洞口锁定）
+    const auto fold_map = ma_map_->get_grid_map();
+    const auto fold_decision =
+        fold_guard_.update(fold_map.get(), has_valid_traj ? ma_traj_interface_.get() : nullptr, t_track_, pos, now_sec);
+    publish_fold_cmd_if_due(fold_decision, now_sec);
+
+    const auto warn_fold_gate_throttled = [&]() {
+        if (now_sec < last_fold_warn_sec_ || (now_sec - last_fold_warn_sec_) >= 1.0) {
+            last_fold_warn_sec_ = now_sec;
+            logger::warn(
+                logger::ros2,
+                "云台门禁限速/停靠等待: feedback_stale={}, fold_timeout={}, max_speed={:.2f} m/s",
+                fold_decision.feedback_stale,
+                fold_decision.fold_timeout,
+                fold_decision.max_speed
+            );
+        }
+    };
+    if (fold_decision.fold_timeout || (fold_decision.gate_active && fold_decision.feedback_stale)) {
+        warn_fold_gate_throttled();
+    }
+
+    if (!has_valid_traj) {
+        return;
+    }
+
+    // 急停或门禁硬截停（身处禁入区未到位 / 已抵达停车缓冲边界）：直接发零速（不经过 MPC）
+    if (in_emergency_stop || (fold_decision.gate_active && fold_decision.max_speed <= 1e-6)) {
+        if (!in_emergency_stop) {
+            warn_fold_gate_throttled();
+        }
+        geometry_msgs::msg::Twist zero;
+        cmd_vel_pub_->publish(zero);
+        last_vx_world_cmd_ = 0.0;
+        last_vy_world_cmd_ = 0.0;
+        has_last_mpc_cmd_ = true;
+        return;
+    }
+
+    const double t_now = t_track_;
 
     // yaw 只用于速度坐标变换
     const double yaw = current_xytheta->z();
@@ -292,47 +392,24 @@ void GlobalPlanner2d::controller_callback() {
         return;
     }
 
-    // 求解成功，更新上一帧 MPC 指令
-    if (predicted_states.size() >= 2) {
-        last_vx_world_cmd_ = predicted_states[1](2);
-        last_vy_world_cmd_ = predicted_states[1](3);
-        has_last_mpc_cmd_ = true;
-    }
-
     // 用预测的下一时刻状态作为速度指令
     if (predicted_states.size() < 2) {
         return;
     }
 
-    while (next_fold_event_idx_ < fold_events_.size() && t_track_ >= fold_events_[next_fold_event_idx_].time) {
-        const bool fold = fold_events_[next_fold_event_idx_].fold;
-
-        //publish_fold_cmd(fold);
-        current_fold_state_ = fold;
-
-        if (fold) {
-            std_msgs::msg::Bool fold_msg;
-            fold_msg.data = true;
-            fold_pub_->publish(fold_msg);
-            logger::info(logger::ros2, "进入隧道，发送折叠指令, t_track={:.3f}", t_track_);
-        } else {
-            std_msgs::msg::Bool fold_msg;
-            fold_msg.data = false;
-            fold_pub_->publish(fold_msg);
-            logger::info(logger::ros2, "离开隧道，发送抬升指令, t_track={:.3f}", t_track_);
-        }
-
-        ++next_fold_event_idx_;
+    // 4 状态索引: 0=x, 1=y, 2=vx, 3=vy；施加洞口虚拟门禁制动速度包络并回写给下一帧 MPC x0
+    Eigen::Vector2d vel_world(predicted_states[1](2), predicted_states[1](3));
+    if (control::FoldGuard::apply_velocity_gate(vel_world, fold_decision)) {
+        warn_fold_gate_throttled();
     }
-
-    // 4 状态索引: 0=x, 1=y, 2=vx, 3=vy
-    const double vx_world_cmd = predicted_states[1](2);
-    const double vy_world_cmd = predicted_states[1](3);
+    last_vx_world_cmd_ = vel_world.x();
+    last_vy_world_cmd_ = vel_world.y();
+    has_last_mpc_cmd_ = true;
 
     // world -> body 输出
     geometry_msgs::msg::Twist twist;
-    twist.linear.x = c * vx_world_cmd + s * vy_world_cmd;
-    twist.linear.y = -s * vx_world_cmd + c * vy_world_cmd;
+    twist.linear.x = c * vel_world.x() + s * vel_world.y();
+    twist.linear.y = -s * vel_world.x() + c * vel_world.y();
     twist.angular.z = 0.0; // 不控制 yaw
 
     // 异常保护
@@ -427,77 +504,19 @@ void GlobalPlanner2d::plan_omni() {
         route.emplace_back(point.x(), point.y(), 0.0);
     }
 
-    // 新轨迹下发：把 MPC 跟踪游标定位到新轨迹上离机器人最近的点。
+    // 新轨迹下发：通过不可变快照原子交接给 control 组，由控制回调独占更新 MPC、游标与急停状态。
     if (path_result.is_new_trajectory && path_result.ma_spline_traj.success
         && path_result.ma_spline_traj.trajectory.isInitialized())
     {
-        ma_traj_interface_ = std::make_shared<control::MaSplineTrajectoryInterface>(path_result.ma_spline_traj);
-
-        mpc_.set_trajectory(ma_traj_interface_);
-
-        fold_events_ = generate_fold_events(
-            path_result.ma_spline_traj,
-            *plan_map,
-            config.planner_config.path_planning_params.fold_time,
-            config.planner_config.path_planning_params.unfold_time,
-            config.planner_config.path_planning_params.fold_margin
-        );
-
-        next_fold_event_idx_ = 0;
-
-        // 跳过新轨迹上已经过去的折叠事件。
-        bool desired_fold_state = current_fold_state_;
-
-        while (next_fold_event_idx_ < fold_events_.size() && fold_events_[next_fold_event_idx_].time <= t_track_) {
-            desired_fold_state = fold_events_[next_fold_event_idx_].fold;
-            ++next_fold_event_idx_;
+        auto new_traj = std::make_shared<control::MaSplineTrajectoryInterface>(path_result.ma_spline_traj);
+        {
+            std::lock_guard<std::mutex> lock(traj_handoff_mtx_);
+            pending_traj_ = std::move(new_traj);
+            ++pending_traj_gen_;
         }
 
-        if (desired_fold_state != current_fold_state_) {
-            //publish_fold_cmd(desired_fold_state);
-            current_fold_state_ = desired_fold_state;
-        }
-        const auto current_xytheta = get_current_xytheta();
-        if (current_xytheta.has_value()) {
-            Eigen::Vector2d pos(current_xytheta->x(), current_xytheta->y());
-            t_track_ = ma_traj_interface_->nearest_time(pos);
-        } else {
-            t_track_ = 0.0;
-        }
-
-        // 反向刹车距离不够：刹车段时长内急停发零速。
-        if (ma_traj_interface_->brake_emergency()) {
-            const auto brake_ms = static_cast<int64_t>(ma_traj_interface_->brake_duration() * 1000.0);
-            emergency_stop_until_sec_ = clock_.nowSec() + static_cast<double>(brake_ms) * 1e-3;
-            logger::warn(logger::ros2, "brake distance not enough, emergency stop {} ms", brake_ms);
-        } else {
-            emergency_stop_until_sec_.reset();
-        }
-
-        // 可视化。
-        std::vector<Eigen::Vector3d> fold_pts, unfold_pts;
-
-        if (path_result.ma_spline_traj.success && path_result.ma_spline_traj.trajectory.isInitialized()) {
-            for (const auto& event: fold_events_) {
-                const double local_t = std::clamp(
-                    event.time - path_result.ma_spline_traj.brake.duration,
-                    0.0,
-                    path_result.ma_spline_traj.trajectory.getDuration()
-                );
-
-                const double t = path_result.ma_spline_traj.trajectory.getStartTime() + local_t;
-
-                const Eigen::Vector3d p = path_result.ma_spline_traj.trajectory.getTrajectory().evaluate(t, 0);
-
-                if (event.fold) {
-                    fold_pts.push_back(p);
-                } else {
-                    unfold_pts.push_back(p);
-                }
-            }
-        }
-
-        visualizer.visualizeTunnelAndFold(path_result.ma_spline_traj, route, *plan_map, fold_pts, unfold_pts, frame_id);
+        // 可视化（保留隧道段高亮，不再输出旧静态折叠事件点）
+        visualizer.visualizeTunnelAndFold(path_result.ma_spline_traj, route, *plan_map, {}, {}, frame_id);
     }
     auto msg = pub_nav_feedback();
 
@@ -964,123 +983,5 @@ void GlobalPlanner2d::load_clicked_regions(const std::string& yaml_path) {
     publish_clicked_regions();
 
     logger::info(logger::ros2, "Loaded {} tunnel regions from {}", clicked_region_polygons_.size(), yaml_path);
-}
-
-std::vector<GlobalPlanner2d::TunnelInterval> GlobalPlanner2d::detect_tunnel_intervals(
-    const ma_spline_opt::MAsplineOutput& ma_traj,
-    const grid_map::GridMap& map,
-    double sample_dt
-) {
-    std::vector<TunnelInterval> intervals;
-
-    if (!ma_traj.success || !ma_traj.trajectory.isInitialized()) {
-        return intervals;
-    }
-
-    const double duration = ma_traj.trajectory.getDuration();
-    const double start_time = ma_traj.trajectory.getStartTime();
-    const auto& spline = ma_traj.trajectory.getTrajectory();
-
-    bool inside = false;
-    double entry_time = 0.0;
-
-    for (double local_t = 0.0; local_t <= duration + 1e-6; local_t += sample_dt) {
-        const double t = start_time + local_t;
-        const Eigen::Vector2d pos = spline.evaluate(t, 0).head<2>();
-
-        const bool in_tunnel = map.is_tunnel(pos);
-
-        if (!inside && in_tunnel) {
-            inside = true;
-            entry_time = local_t;
-        }
-
-        if (inside && !in_tunnel) {
-            inside = false;
-            intervals.push_back({entry_time, local_t});
-        }
-    }
-
-    if (inside) {
-        intervals.push_back({entry_time, duration});
-    }
-    // for(auto i:intervals){
-    //     logger::info(
-    //         logger::ros2,
-    //         "tunnel interval: entry={:.3f}, exit={:.3f}, duration={:.3f}",
-    //         i.entry_time,
-    //         i.exit_time,
-    //         i.exit_time - i.entry_time
-    //     );
-    // }
-
-    return intervals;
-}
-std::vector<GlobalPlanner2d::FoldEvent> GlobalPlanner2d::generate_fold_events(
-    const ma_spline_opt::MAsplineOutput& ma_traj,
-    const grid_map::GridMap& map,
-    double fold_time,
-    double unfold_time,
-    double margin,
-    double sample_dt
-) {
-    std::vector<FoldEvent> events;
-
-    // 1. 先检测隧道区间
-    auto intervals = detect_tunnel_intervals(ma_traj, map, sample_dt);
-
-    if (intervals.empty()) {
-        return events;
-    }
-
-    // 2. 合并过近的隧道区间
-    //    如果两个隧道之间不足以安全完成“抬升 -> 再重新折叠”，
-    //    就视为同一个连续折叠段，避免中间错误抬升。
-    const double merge_gap = fold_time + unfold_time + 2.0 * margin;
-
-    std::vector<TunnelInterval> merged_intervals;
-    for (const auto& interval: intervals) {
-        if (!merged_intervals.empty() && interval.entry_time - merged_intervals.back().exit_time < merge_gap) {
-            // 合并到前一个区间，出口取更晚的那个
-            merged_intervals.back().exit_time = std::max(merged_intervals.back().exit_time, interval.exit_time);
-        } else {
-            merged_intervals.push_back(interval);
-        }
-    }
-
-    // 3. 基于合并后的区间生成原始事件
-    std::vector<FoldEvent> raw_events;
-
-    for (const auto& interval: merged_intervals) {
-        double t_fold_start = interval.entry_time - fold_time - margin;
-        double t_unfold_start = interval.exit_time + margin;
-
-        // 如果还没出发就需要折叠，就强制从 0 开始
-        t_fold_start = std::max(0.0, t_fold_start);
-
-        raw_events.push_back({true, t_fold_start});
-        raw_events.push_back({false, t_unfold_start});
-    }
-
-    // 4. 排序，并按状态压缩，避免无意义的连续折叠/展开
-    std::sort(raw_events.begin(), raw_events.end(), [](const FoldEvent& a, const FoldEvent& b) {
-        return a.time < b.time;
-    });
-
-    bool current_folded = false;
-
-    for (const auto& event: raw_events) {
-        if (event.fold != current_folded) {
-            events.push_back(event);
-            current_folded = event.fold;
-        }
-    }
-
-    // 事件时间按样条计算；跟踪游标 t_track_ 包含前面的刹车段，统一加上刹车段时长
-    for (auto& event: events) {
-        event.time += ma_traj.brake.duration;
-    }
-
-    return events;
 }
 } // namespace planner

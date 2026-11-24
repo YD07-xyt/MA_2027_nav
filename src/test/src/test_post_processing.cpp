@@ -127,11 +127,6 @@ auto load_params(const std::string& path) -> PostProc::PathPostProcessingParams 
     ri("max_traj_num", p.max_traj_num);
     rd("dense_sample_resolution", p.dense_sample_resolution);
     rd("rotation_penalty_weight", p.rotation_penalty_weight);
-    rd("fold_time", p.fold_time);
-    rd("unfold_time", p.unfold_time);
-    rd("fold_margin", p.fold_margin);
-    rd("fold_prep_speed", p.fold_prep_speed);
-    rd("fold_prep_margin", p.fold_prep_margin);
     p.start_vel = 0.0; // 静止起步、终点停车
     p.end_vel = 0.0;
     return p;
@@ -193,7 +188,7 @@ auto run_pipeline(
     if (stage_ms) (*stage_ms)[1] = ms_since(t0);
 
     t0 = std::chrono::steady_clock::now();
-    post.assign_trajectory_timing(gm, traj);
+    post.assign_trajectory_timing(traj);
     if (stage_ms) (*stage_ms)[2] = ms_since(t0);
 
     t0 = std::chrono::steady_clock::now();

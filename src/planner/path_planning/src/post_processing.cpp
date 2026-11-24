@@ -119,7 +119,7 @@ auto PathPostProcessing::normalize_angle(double ref_angle, double& angle) const 
         angle -= 2 * M_PI;
 }
 
-auto PathPostProcessing::assign_trajectory_timing(const grid_map::GridMap& map, Trajectory& traj) -> void {
+auto PathPostProcessing::assign_trajectory_timing(Trajectory& traj) -> void {
     /**1. 高密度采样
         -> 保留路径细节，避免拐角信息丢失
 
@@ -212,15 +212,6 @@ auto PathPostProcessing::assign_trajectory_timing(const grid_map::GridMap& map, 
     vmax.front() = params_.start_vel;
     vmax.back() = params_.end_vel;
 
-    // ============================================================
-    // 折叠降速
-    // ============================================================
-    std::vector<TunnelInterval> tunnel_intervals = detect_tunnel_intervals(map, dense);
-
-    apply_fold_speed_limits(vmax, dense, tunnel_intervals);
-    ///==================================================
-
-    ///==================================================////
     // 前向：受加速能力限制
     for (int i = 1; i < M; ++i) {
         const double ds = dense[i].equiv_dist - dense[i - 1].equiv_dist;
@@ -381,75 +372,5 @@ auto PathPostProcessing::evaluate_length(
                 - 0.5 * max_acc * (t - tmp_t) * (t - tmp_t);
         }
     }
-}
-//对每个隧道入口，在入口前一段距离内限速：
-auto PathPostProcessing::apply_fold_speed_limits(
-    std::vector<double>& vmax,
-    const std::vector<DenseSample>& dense,
-    const std::vector<TunnelInterval>& tunnels
-) const -> void {
-    if (tunnels.empty() || dense.empty()) {
-        return;
-    }
-
-    // 入口前需要多长距离保持低速，才能保证有 fold_time 的折叠时间
-    const double prep_dist = params_.fold_prep_speed * params_.fold_time + params_.fold_prep_margin;
-
-    for (const auto& tunnel: tunnels) {
-        if (tunnel.entry_idx <= 0) {
-            continue;
-        }
-
-        const double entry_s = tunnel.entry_s;
-        const double min_s = entry_s - prep_dist;
-
-        // 从入口前一个点开始，向前反向遍历
-        for (int i = tunnel.entry_idx - 1; i >= 0; --i) {
-            if (dense[i].equiv_dist <= min_s) {
-                break; // 已经超出准备距离，再往前不需要限速
-            }
-            vmax[i] = std::min(vmax[i], params_.fold_prep_speed);
-        }
-    }
-}
-//用状态机扫描：
-auto PathPostProcessing::detect_tunnel_intervals(const grid_map::GridMap& map, const std::vector<DenseSample>& dense)
-    const -> std::vector<TunnelInterval> {
-    std::vector<TunnelInterval> intervals;
-
-    if (dense.empty()) {
-        return intervals;
-    }
-
-    bool inside = false;
-    TunnelInterval current;
-
-    for (int i = 0; i < static_cast<int>(dense.size()); ++i) {
-        const bool in_tunnel = map.is_tunnel(dense[i].pos);
-
-        if (!inside && in_tunnel) {
-            // 进入隧道
-            inside = true;
-            current.entry_idx = i;
-            current.entry_s = dense[i].equiv_dist;
-        }
-
-        if (inside && !in_tunnel) {
-            // 离开隧道
-            inside = false;
-            current.exit_idx = i;
-            current.exit_s = dense[i].equiv_dist;
-            intervals.push_back(current);
-        }
-    }
-
-    // 如果终点仍处于隧道内
-    if (inside) {
-        current.exit_idx = static_cast<int>(dense.size()) - 1;
-        current.exit_s = dense.back().equiv_dist;
-        intervals.push_back(current);
-    }
-
-    return intervals;
 }
 }
