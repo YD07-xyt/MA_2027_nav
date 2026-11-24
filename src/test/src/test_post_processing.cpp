@@ -103,28 +103,28 @@ auto load_params(const std::string& path) -> PostProc::PathPostProcessingParams 
     p.max_acc = 3.0;
     p.time_resolution = 0.4;
     p.min_traj_num = 5;
-    p.traj_cut_length = 10.0;
-    p.distance_weight = 1.0;
-    p.yaw_weight = 0.5;
 
     const YAML::Node root = YAML::LoadFile(path);
     const YAML::Node n = root["planner_config"]["path_planning_params"];
     if (!n) throw std::runtime_error("planner_config.path_planning_params not found");
+    auto rb = [&](const char* k, bool& v) {
+        if (n[k]) v = n[k].as<bool>();
+    };
     auto rd = [&](const char* k, double& v) {
         if (n[k]) v = n[k].as<double>();
     };
     auto ri = [&](const char* k, int& v) {
         if (n[k]) v = n[k].as<int>();
     };
+    rb("use_jps", p.use_jps);
+    ri("search_timeout_ms", p.search_timeout_ms);
+    rd("jps_start_snap_radius", p.jps_start_snap_radius);
     rd("safe_threshold", p.safe_threshold);
     rd("max_vel", p.max_vel);
     rd("max_acc", p.max_acc);
     rd("time_resolution", p.time_resolution);
     ri("min_traj_num", p.min_traj_num);
     ri("max_traj_num", p.max_traj_num);
-    rd("traj_cut_length", p.traj_cut_length);
-    rd("distance_weight", p.distance_weight);
-    rd("yaw_weight", p.yaw_weight);
     rd("dense_sample_resolution", p.dense_sample_resolution);
     rd("rotation_penalty_weight", p.rotation_penalty_weight);
     rd("fold_time", p.fold_time);
@@ -385,6 +385,7 @@ int main(int argc, char** argv) {
             continue;
         }
         c->jps.set_safe_threshold(params.safe_threshold);
+        c->jps.set_max_snap_radius(params.jps_start_snap_radius);
         c->post.set_params(params);
 
         const auto level = logger::planning->level();

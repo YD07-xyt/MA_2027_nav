@@ -20,7 +20,6 @@
 //ros2
 
 #include "utils/clock.hpp"
-#include "utils/plotter.hpp"
 #include "utils/type_utils.hpp"
 
 #include <geometry_msgs/msg/point.hpp>
@@ -130,9 +129,8 @@ private:
     replan::FsmReplan fsm_replanner;
     std::optional<double> plan_start_time_sec_;
     replan::FsmReplan::PathState nav_state;
-   auto pub_nav_feedback()->std_msgs::msg::Int16;
+    auto pub_nav_feedback() -> std_msgs::msg::Int16;
     //FSM fsm_;
-    tools::Plotter plotter_;
     struct FoldEvent {
         bool fold = true;
         double time = 0.0;
@@ -141,10 +139,6 @@ private:
         double entry_time = 0.0;
         double exit_time = 0.0;
     };
-    bool is_print = true;
-    const float kFoldTime = 1.0; //折叠时间
-    const float kUnfoldTime = 1.0; //展开时间
-    const float kMarginTime = 0.5;
     std::vector<FoldEvent> fold_events_;
     size_t next_fold_event_idx_ = 0;
     // 当前下发的云台状态：true=折叠，false=抬升
@@ -171,11 +165,6 @@ private:
     auto get_goal_pose() const -> std::optional<utils::RobotState>;
     // 结束当前导航任务（成功/失败共用）：清空 goal 与计时并按状态发布 nav_feedback。
     void finish_nav_task(replan::FsmReplan::PathState state);
-
-private:
-    //contorller
-    double t_now_;
-    Trajectory<5, 2> minco_trajectory_;
 
 private:
     control::Mpc<control::MaSplineTrajectoryInterface> mpc_;

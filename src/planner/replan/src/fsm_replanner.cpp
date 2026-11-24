@@ -15,7 +15,7 @@ namespace replan {
 class FsmReplan::Impl {
 public:
     Impl() {
-        path_planning.set_use_jps(true);
+        path_planning.set_use_jps(planner_config_.path_planning_params.use_jps);
     }
 
     auto plan(
@@ -297,10 +297,12 @@ auto FsmReplan::Impl::plan(
             }
         }
 
+        const int timeout_ms = std::max(1, planner_config_.path_planning_params.search_timeout_ms);
         const Eigen::Vector3d current_vel(start_vel.x(), start_vel.y(), current_pose.wz);
         path_planning.set_velocity(current_vel, Eigen::Vector3d::Zero());
 
-        auto trajectory = path_planning.path_planning(*grid_map, start, goal, current_pose.yaw, goal_pose.yaw, 5000);
+        auto trajectory =
+            path_planning.path_planning(*grid_map, start, goal, current_pose.yaw, goal_pose.yaw, timeout_ms);
 
         if (!trajectory.has_value()) {
             logger::warn(logger::fsm_replan, "planning failed");
@@ -341,7 +343,8 @@ auto FsmReplan::Impl::plan(
                 );
 
                 path_planning.set_velocity(Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
-                trajectory = path_planning.path_planning(*grid_map, start, goal, current_pose.yaw, goal_pose.yaw, 5000);
+                trajectory =
+                    path_planning.path_planning(*grid_map, start, goal, current_pose.yaw, goal_pose.yaw, timeout_ms);
                 if (!trajectory.has_value()) {
                     logger::warn(logger::fsm_replan, "planning from brake stop point failed");
                     transition(Event::PLAN_FAILED);

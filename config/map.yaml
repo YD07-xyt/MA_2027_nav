@@ -1,6 +1,6 @@
 rog_map:
   # ROS 输入回调与里程计新鲜度过滤（实际话题名由 planner.yaml 配置）
-  ros_callback:
+  ros_callback: #基本无用
     enable: true                       # 无点云输入时是否定时打印告警
     odom_timeout: 0.2                  # 点云与里程计最大允许时间差 (s)
 
@@ -9,20 +9,24 @@ rog_map:
     time_rate: 30                      # 可视化回调最大发布频率 (Hz，<=0 表示不限频)
     range: [100, 60, 4]                # static_3d 静态体素提取窗口尺寸 [x, y, z] (m, 世界系)
 
-  # 输入点云预过滤
+  # 输入点云预过滤 基本无用
   intensity_thresh: -10                # 强度过滤下限（<=0 表示不过滤强度）
   point_filt_num: 1                    # 点云降采样步长（>=1，1 表示全点保留）
 
   # 2D 分层栅格地图（规划与 ESDF 使用）；初始边界 x ∈ [-x_left, +x_right], y ∈ [-y_left, +y_right]
   grid_map:
+    #只有建图有用
     x_left: 6.0                        # 原点向 -x 延伸 (m, 世界系)
     x_right: 22.0                      # 原点向 +x 延伸 (m, 世界系)
     y_left: 10.0                       # 原点向 -y 延伸 (m, 世界系)
     y_right: 10.0                      # 原点向 +y 延伸 (m, 世界系)
+    ##
+
     resolution: 0.05                   # 2D 栅格与 3D 感知体素分辨率 (m)
     expand_chunk_m: 4.0                # 建图模式单次动态扩图步长 (m，须 > 0)
     max_map_size: [80.0, 80.0]         # 建图模式 2D 地图最大尺寸 [x, y] (m)
     save_margin_cells: 2               # 建图保存时已探索包围盒外扩边距 (格)
+    #导航模式需要
     unknown_as_occupied: false         # 导航加载三态图时，UNKNOWN(205) 是否视为障碍
 
   # ---- 感知后端（STVL 动态障碍 + 2.5D 静态先验 + 零先验在线 3D 建图）----
@@ -30,20 +34,31 @@ rog_map:
     robot:
       footprint_radius: 0.20           # 机器人足迹半径 (m)，建图将车走过区域记为可通行地面
       footprint_ground_offset: 0.06    # base_odom 原点到脚底地面的高度 (m, base_odom 系)；建图足迹与导航回退地面共用
+      #无用  
       robot_height: 0.24               # 机器人净空高度 (m)：悬空结构下沿距地面 >= 此值直接放行（限高杆实测净空约 0.25 m）
+      ##
+
     sensor:
       # LiDAR 相对 base_odom 的平移 [x, y, z] (m, base_odom 系)
       t_base_lidar: [0.0, 0.0, 0.15]
       # LiDAR 相对 base_odom 的 Z-Y-X 欧拉角 [roll, pitch, yaw] (deg, ROS REP-103 右手系: +X 前, +Y 左, +Z 上)
       # 绕 +Y 旋转：pitch = -20.0 表示雷达前向 +X 上仰 20°；pitch = +20.0 表示下俯 20°
       rpy_deg: [0.0, 0.0, 0.0]
+
+
       fov_min_elev_deg: -7.0           # Mid-360 雷达系垂直视场下限 (deg)
       fov_max_elev_deg: 52.0           # Mid-360 雷达系垂直视场上限 (deg)
       fov_margin_deg: 3.0              # 视场边界容差 (deg)
+      
+      
       min_range: 0.50                  # 最小有效测距 (m)
       max_range: 15.0                  # 最大视场与射线清除有效测距 (m)
+
+      #清除机体
       self_filter_min: [-0.30, -0.30, -0.08] # 机体自滤盒下界 [x, y, z] (m, base_odom 系)
       self_filter_max: [0.30, 0.30, 0.35]    # 机体自滤盒上界 [x, y, z] (m, base_odom 系)
+      ##
+
     mapping:
       trust_range: 4.0                 # 建图允许写入静态占据命中的最大水平距离 (m)
       clear_range: 8.0                 # 建图 3D 射线扫空动态过客的最大距离 (m)

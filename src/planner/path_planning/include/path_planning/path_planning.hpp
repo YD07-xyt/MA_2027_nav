@@ -22,10 +22,11 @@ public:
     PathPlanning(const PathPlanning&) = delete;
     PathPlanning& operator=(const PathPlanning&) = delete;
 public:
+    // 设置前端搜索与后处理参数（同步更新 use_jps、safe_threshold 与 jps_start_snap_radius）。
     auto set_param(const PathPostProcessing::PathPostProcessingParams& params) -> void;
     auto set_velocity(const Eigen::Vector3d& start_vel, const Eigen::Vector3d& end_vel) -> void;
 
-    // 选择底层图搜索算法:默认 A*,开启后改用 JPS
+    // 显式覆写底层图搜索算法（未调用 set_param 前默认 A*；调用 set_param 后以 params.use_jps 为准）
     auto set_use_jps(bool use_jps) -> void;
     // 同步只读借用外部 GridMap 快照（调用期间须保持 grid_map 有效且不被并发修改）。
     auto path_planning(

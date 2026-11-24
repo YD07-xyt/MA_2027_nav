@@ -250,6 +250,23 @@ inline void load_path_post_processing_params(
 ) {
     if (!node) return;
 
+    if (node["use_jps"]) param.use_jps = node["use_jps"].as<bool>();
+    if (node["search_timeout_ms"]) {
+        const int v = node["search_timeout_ms"].as<int>();
+        if (v <= 0) {
+            throw std::invalid_argument("planner_config.path_planning_params.search_timeout_ms must be > 0");
+        }
+        param.search_timeout_ms = v;
+    }
+    if (node["jps_start_snap_radius"]) {
+        const double v = node["jps_start_snap_radius"].as<double>();
+        if (!std::isfinite(v) || v < 0.0) {
+            throw std::invalid_argument(
+                "planner_config.path_planning_params.jps_start_snap_radius must be finite and >= 0"
+            );
+        }
+        param.jps_start_snap_radius = v;
+    }
     if (node["max_traj_num"]) param.max_traj_num = node["max_traj_num"].as<int>();
     if (node["dense_sample_resolution"]) param.dense_sample_resolution = node["dense_sample_resolution"].as<double>();
     if (node["rotation_penalty_weight"]) param.rotation_penalty_weight = node["rotation_penalty_weight"].as<double>();
@@ -258,9 +275,6 @@ inline void load_path_post_processing_params(
     if (node["max_acc"]) param.max_acc = node["max_acc"].as<double>();
     if (node["time_resolution"]) param.time_resolution = node["time_resolution"].as<double>();
     if (node["min_traj_num"]) param.min_traj_num = node["min_traj_num"].as<int>();
-    if (node["traj_cut_length"]) param.traj_cut_length = node["traj_cut_length"].as<double>();
-    if (node["distance_weight"]) param.distance_weight = node["distance_weight"].as<double>();
-    if (node["yaw_weight"]) param.yaw_weight = node["yaw_weight"].as<double>();
 
     // ---------- 云台折叠参数 ----------
     if (node["fold_time"]) param.fold_time = node["fold_time"].as<double>();

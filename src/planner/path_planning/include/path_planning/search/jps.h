@@ -3,6 +3,7 @@
 #include "map/core/grid_map.hpp"
 #include <Eigen/Dense>
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <vector>
 
@@ -31,6 +32,10 @@ public:
     auto set_safe_threshold(const double& safe_threshold) -> void {
         safe_threshold_ = safe_threshold;
     }
+    // 起点格不可通行时环形找最近自由格的最大半径 (m)；非有限或负值按 0（不向外吸附）处理。
+    auto set_max_snap_radius(double max_snap_radius) -> void {
+        max_snap_radius_ = (std::isfinite(max_snap_radius) && max_snap_radius >= 0.0) ? max_snap_radius : 0.0;
+    }
 
     // 同步只读借用外部 GridMap 快照（调用期间须保持 map 有效且不被并发修改）。
     // JPS 搜索。返回航点路径(栅格中心,首点为精确起点,与
@@ -45,6 +50,7 @@ public:
 
 private:
     double safe_threshold_ = 0.0;
+    double max_snap_radius_ = 1.5;
 
     // 缓存的栅格几何信息(每次搜索入口与传入 map 同步)
     int nx_ = 0;

@@ -4,8 +4,10 @@ namespace path_planning {
 class PathPlanningImpl {
 public:
     auto set_param(const PathPostProcessing::PathPostProcessingParams& params) -> void {
+        use_jps_ = params.use_jps;
         astar_.set_safe_threshold(params.safe_threshold);
         jps_.set_safe_threshold(params.safe_threshold);
+        jps_.set_max_snap_radius(params.jps_start_snap_radius);
         post_processing_.set_params(params);
     }
     auto set_velocity(const Eigen::Vector3d& start_vel, const Eigen::Vector3d& end_vel) -> void {

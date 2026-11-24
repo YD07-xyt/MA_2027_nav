@@ -4,7 +4,6 @@
 #include "controller/mpc.h"
 #include "replan/fsm_replanner.h"
 #include "utils/logger.hpp"
-#include "utils/plotter.hpp"
 #include "utils/type_utils.hpp"
 #include <Eigen/Geometry>
 #include <Eigen/src/Core/Matrix.h>

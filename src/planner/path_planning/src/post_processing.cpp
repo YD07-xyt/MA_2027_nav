@@ -323,17 +323,6 @@ auto PathPostProcessing::fill_additional_trajectory_info(
         traj.timed_trajectory.back().state.z() = goal_yaw;
     }
 
-    // Generate unoccupied positions sequence
-    for (const auto& state: traj.path_states) {
-        traj.UnOccupied_positions.emplace_back(state.position.x(), state.position.y(), state.theta);
-    }
-
-    // Set initial time
-    traj.UnOccupied_initT = traj.total_time / traj.timed_trajectory.size();
-
-    // Check if needs truncation
-    traj.if_cut = (traj.total_length > params_.traj_cut_length);
-
     // Set default velocity/acceleration (can be adjusted as needed)
     traj.start_state = start_velocity_vector_; // Initial velocity 0
     traj.final_state = final_velocity_vector_; // Final velocity 0

@@ -235,16 +235,18 @@ auto JPS::jps_search(
     goal_idx.x() = std::clamp(goal_idx.x(), 0, nx_ - 1);
     goal_idx.y() = std::clamp(goal_idx.y(), 0, ny_ - 1);
 
-    // 起点所在栅格可能被占用 / 孤立(无人机贴地图边界或处于狭窄凹坑中)。
+    // 起点所在栅格可能被占用 / 孤立(贴地图边界或处于狭窄凹坑中)。
     // A* 只检查离散点所以能容忍这种情况,而 JPS 需要一个自由栅格作为
-    // 扩展起点——因此吸附到最近的可通行自由栅格(最多 1.5 m),保持行为一致。
-    const int max_snap_radius = std::max(1, static_cast<int>(1.5 / resolution_ + 0.5));
+    // 扩展起点——因此按 max_snap_radius_ 吸附到最近的可通行自由栅格(0 表示仅查起点格自身)。
+    const double snap_radius_m = (std::isfinite(max_snap_radius_) && max_snap_radius_ >= 0.0) ? max_snap_radius_ : 0.0;
+    const int max_snap_radius =
+        (snap_radius_m > 0.0) ? std::max(1, static_cast<int>(snap_radius_m / resolution_ + 0.5)) : 0;
     Eigen::Vector2i root_idx;
     if (!find_navigable_cell(map, start_idx.x(), start_idx.y(), max_snap_radius, root_idx)) {
         logger::error(
             logger::planning,
-            "JPS: no navigable cell within {:.1f} m of start cell ({},{}), start=({:.3f},{:.3f})",
-            1.5,
+            "JPS: no navigable cell within {:.2f} m of start cell ({},{}), start=({:.3f},{:.3f})",
+            snap_radius_m,
             start_idx.x(),
             start_idx.y(),
             start.x(),

@@ -49,10 +49,6 @@ private:
     using output= tl::expected<MAsplineOutput,MaOptError>;
 
 private:
-    SplineTrajectory::QuinticSplineND<2> last_xy_spline_;
-    bool has_last_traj_ = false;
-
-private:
     // ========================================================================
     // 2D xy 优化 L-BFGS 回调
     // ========================================================================

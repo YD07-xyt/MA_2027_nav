@@ -57,23 +57,19 @@ public:
         double total_time = 0;
         double total_length = 0;
         double weighted_length = 0;
-
-        bool if_cut = false;
-        std::vector<Eigen::Vector3d> UnOccupied_positions;
-        double UnOccupied_initT = 0.0;
     };
 
 public:
     struct PathPostProcessingParams {
+        bool use_jps = true; // true 使用 JPS，false 使用 A*
+        int search_timeout_ms = 5000; // 单次前端栅格搜索超时 (ms)，须 > 0
+        double jps_start_snap_radius = 1.5; // JPS 起点不可通行时环形寻找最近自由格的最大半径 (m)，须 >= 0
         double safe_threshold;
         double max_vel;
         double max_acc;
         double time_resolution;
         int min_traj_num;
         int max_traj_num = 12;
-        double traj_cut_length;
-        double distance_weight;
-        double yaw_weight;
         double start_vel {0.0};
         double end_vel {0.0};
         double dense_sample_resolution = 0.1;

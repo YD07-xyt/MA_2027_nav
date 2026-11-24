@@ -219,15 +219,15 @@ auto load_planner_config(const YAML::Node& root) -> replan::FsmReplan::PlannerCo
     replan::FsmReplan::PlannerConfig cfg {};
     if (const YAML::Node pp = pc["path_planning_params"]) {
         auto& p = cfg.path_planning_params;
+        if (pp["use_jps"]) p.use_jps = pp["use_jps"].as<bool>();
+        if (pp["search_timeout_ms"]) p.search_timeout_ms = pp["search_timeout_ms"].as<int>();
+        if (pp["jps_start_snap_radius"]) p.jps_start_snap_radius = pp["jps_start_snap_radius"].as<double>();
         if (pp["safe_threshold"]) p.safe_threshold = pp["safe_threshold"].as<double>();
         if (pp["max_vel"]) p.max_vel = pp["max_vel"].as<double>();
         if (pp["max_acc"]) p.max_acc = pp["max_acc"].as<double>();
         if (pp["time_resolution"]) p.time_resolution = pp["time_resolution"].as<double>();
         if (pp["min_traj_num"]) p.min_traj_num = pp["min_traj_num"].as<int>();
         if (pp["max_traj_num"]) p.max_traj_num = pp["max_traj_num"].as<int>();
-        if (pp["traj_cut_length"]) p.traj_cut_length = pp["traj_cut_length"].as<double>();
-        if (pp["distance_weight"]) p.distance_weight = pp["distance_weight"].as<double>();
-        if (pp["yaw_weight"]) p.yaw_weight = pp["yaw_weight"].as<double>();
         if (pp["dense_sample_resolution"]) p.dense_sample_resolution = pp["dense_sample_resolution"].as<double>();
         if (pp["rotation_penalty_weight"]) p.rotation_penalty_weight = pp["rotation_penalty_weight"].as<double>();
         if (pp["fold_time"]) p.fold_time = pp["fold_time"].as<double>();
@@ -604,6 +604,7 @@ auto run_sanity_checks(BenchEnv& env) -> bool {
         path_planning::JPS jps;
         astar.set_safe_threshold(env.planner_cfg.path_planning_params.safe_threshold);
         jps.set_safe_threshold(env.planner_cfg.path_planning_params.safe_threshold);
+        jps.set_max_snap_radius(env.planner_cfg.path_planning_params.jps_start_snap_radius);
 
         path_planning::PathPlanning frontend;
         frontend.set_param(env.planner_cfg.path_planning_params);

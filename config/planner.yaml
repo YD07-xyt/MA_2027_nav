@@ -28,18 +28,15 @@ map:
 planner_config:
   # ---------- 上游路径规划 / 后处理速度与时间分配参数 ----------
   path_planning_params:
+    use_jps: true                 # 前端图搜索算法：true=JPS，false=A*
+    search_timeout_ms: 5000       # 单次前端栅格搜索超时时间 (ms)，须 > 0
+    jps_start_snap_radius: 1.5    # JPS 起点格不可通行时环形找最近自由格的最大半径 (m)，须 >= 0（0 表示仅查起点格自身不向外吸附）
     safe_threshold: 0.3       # JPS/A* 搜索、折线剪枝碰撞检测、起终点/刹停点外推与刹车射线检测的安全距离阈值 (m，ESDF < 此值判碰撞)；也用于推导重规划硬净空 max(0.05, 0.2*safe_threshold)
     max_vel: 3.0              # 后处理前向/后向速度传播的最大速度上限 (m/s)
     max_acc: 3.0              # 后处理前向加速/后向减速传播的最大加速度上限 (m/s²)
     time_resolution: 0.4      # 均匀时间重采样目标单段时长 (s)，用于决定段数 round(total_time / time_resolution)；越小 timed_trajectory 点越密，最终夹紧到 [min_traj_num, max_traj_num]
     min_traj_num: 5           # 均匀时间重采样的最少时间分段数（对应至少 min_traj_num+1 个航点），防止短轨迹采样点太少
     max_traj_num: 16          # 均匀时间重采样的最多时间分段数，限制后端样条优化变量维度与耗时
-    #无用
-    traj_cut_length: 10       # [当前无用] 仅在 post_processing 中写入 traj.if_cut = (total_length > traj_cut_length)，全仓无任何读取，未实际截断 (m)
-    distance_weight: 1.0      # [当前无用] 历史梯形速度规划残留，已加载进结构体但从未被代码使用；当前等效距离直接采用线性距离
-    yaw_weight: 0.5           # [当前无用] 历史残留，已加载进结构体但从未被代码使用；当前转弯时间惩罚已改用 rotation_penalty_weight
-    ##
-
     dense_sample_resolution: 0.05   # 高密度路径细分间距 (m)，同时作为 FsmReplan 折线碰撞监控的采样步长（内部下限 0.02 m）
     rotation_penalty_weight: 1.0    # 转弯惩罚权重 (m/rad)：等效距离 ds_equiv = ds_linear + rotation_penalty_weight * |Δθ|，越大转弯处分配时间越充裕
 
@@ -106,10 +103,6 @@ planner_config:
     #replan_interval: 2.0             # [当前无用] 已注释：历史按时间强制重规划参数，代码已移除
     
     replan_lateral_dev: 0.5           # 横向偏差阈值 (m)：机器人偏离当前参考路径（含刹车段）超过 0.5m 就重规划
-    #无用
-    min_replan_interval: 0.5          # [当前无用] 代码完全未加载该字段（config.hpp / ReplanParam / FsmReplan 均无引用），修改不生效
-    ##
-    
     goal_reached_radius: 0.3          # 到达判定半径 (m)：距目标 2D 欧氏距离小于 0.3m 直接认为到达（ROS2 节点与 FsmReplan 均使用）
     
     #hard_clearance: 0.2              # [当前无用] 已注释：代码未加载，当前 FsmReplan 硬编码为 max(0.05, safe_threshold * 0.2)
