@@ -1,0 +1,153 @@
+# ==================== ROS2 话题 / 路径配置 ====================
+ros2:
+  num_threads: 8   # MultiThreadedExecutor 线程数（0 表示使用全部 CPU 核心数）
+  frame_id: "world"   # 全局坐标系：所有发布的地图/路径/marker 统一使用；须与点云、里程计 header.frame_id 一致（LIO 发 world，本节点不做 TF 变换）
+  map_topic_name: "/lio/cloud_world"          # 点云输入话题 (sensor_msgs/PointCloud2)，全局坐标系，用于实时建图/更新
+  target_topic_name: "/goal_pose"             # 目标点输入话题 (geometry_msgs/PoseStamped)，全局坐标系，RViz 或上层下发目标
+  clickedPoint_topic_name: "/clicked_point"   # RViz 点选话题 (geometry_msgs/PointStamped)，全局坐标系；每点 4 个点生成并自动保存一个隧道多边形
+  odom_topic_name: "/lio/base_odom"           # 控制/规划用里程计话题 (nav_msgs/Odometry)，全局坐标系；提供位置/速度/姿态；当 map_odom_topic_name 为空时也用于建图
+  map_odom_topic_name: "/lio/odom"            # 可选：建图专用位姿话题 (nav_msgs/Odometry)，须与点云同一状态/同一时间戳；为空则沿用 odom_topic_name
+  # /lio/odom 机体（IMU）在 base 系下的位姿 [x,y,z,roll,pitch,yaw]，单位 m/deg，须与 Super-LIO lio.extrinsic.odom_robo 一致
+  # 仅在 map_odom_topic_name 非空时生效，用于将 world->IMU 变换为 world->base（缺失默认全 0；非 6 维或含 NaN/Inf 会抛异常）
+  map_odom_imu_in_base: [0.011, 0.02329, 0.10588, 0.0, 0.0, 0.0]
+  cmd_vel_name: "/cmd_vel_chassis" #"/cmd_vel" #"/cmd_vel_chassis"  # 底盘速度输出话题 (geometry_msgs/Twist)，body 系 linear.x/y (m/s)，angular.z 恒为 0
+  fold_cmd_topic_name: "/ma_nav/fold"             # 云台折叠电平输出话题 (std_msgs/Bool)，true=折叠锁定，false=允许展开（翻转即发 + 周期心跳）
+  fold_feedback_topic_name: "/ma_nav/fold_state"  # 下位机云台物理折叠反馈话题 (std_msgs/Bool)，true=已确认折叠到位(DOWN)，false=未到位/运动中/故障
+  save_global_map_path:  "map"                # 探索地图保存目录路径，调用 save_map_srv_topic 后传给 MaMap 保存 .pgm + .yaml
+  save_map_srv_topic: "/save_global_map"      # 保存探索地图的 ROS2 服务名 (std_srvs/srv/Trigger)
+  map_params_path: "src/navigation/config/map.yaml"   # 地图配置文件路径，传给 MaMap 构造加载
+  global_map_path: "src/navigation/map/rmuc2027.pgm"  # 静态全局栅格地图路径，仅 mapping_model=false 时启动加载
+  # 点击隧道区域保存/加载
+  tunnel_regions_path: "map/tunnel_regions.yaml"          # 隧道多边形 YAML 路径（相对进程工作目录）；mapping_model=false 启动加载，点选满 4 点或调服务时保存
+  save_tunnel_regions_srv_topic: "/save_tunnel_regions"   # 手动保存隧道区域的 ROS2 服务名 (std_srvs/srv/Trigger)
+
+# ==================== 地图模式 ====================
+map:
+  mapping_model: false   # true=建图模式（允许图外目标按块扩图），false=规划模式（加载静态先验图与隧道区域，图外目标拒收）
+
+
+# ==================== 规划器配置 ====================
+planner_config:
+  # ---------- 上游路径规划 / 后处理速度与时间分配参数 ----------
+  path_planning_params:
+    use_jps: true                 # 前端图搜索算法：true=JPS，false=A*
+    search_timeout_ms: 5000       # 单次前端栅格搜索超时时间 (ms)，须 > 0
+    jps_start_snap_radius: 1.5    # JPS 起点格不可通行时环形找最近自由格的最大半径 (m)，须 >= 0（0 表示仅查起点格自身不向外吸附）
+    safe_threshold: 0.3       # JPS/A* 搜索、折线剪枝碰撞检测、起终点/刹停点外推与刹车射线检测的安全距离阈值 (m，ESDF < 此值判碰撞)
+    max_vel: 3.0              # 后处理前向/后向速度传播的最大速度上限 (m/s)
+    max_acc: 3.0              # 后处理前向加速/后向减速传播的最大加速度上限 (m/s²)
+    time_resolution: 0.4      # 均匀时间重采样目标单段时长 (s)，用于决定段数 round(total_time / time_resolution)；越小 timed_trajectory 点越密，最终夹紧到 [min_traj_num, max_traj_num]
+    min_traj_num: 5           # 均匀时间重采样的最少时间分段数（对应至少 min_traj_num+1 个航点），防止短轨迹采样点太少
+    max_traj_num: 16          # 均匀时间重采样的最多时间分段数，限制后端样条优化变量维度与耗时
+    dense_sample_resolution: 0.05   # 高密度路径细分间距 (m)，同时作为 FsmReplan 执行轨迹碰撞监控的空间细分步长上限（内部下限 0.05 m）
+    rotation_penalty_weight: 1.0    # 转弯惩罚权重 (m/rad)：等效距离 ds_equiv = ds_linear + rotation_penalty_weight * |Δθ|，越大转弯处分配时间越充裕
+
+  # ---------- MA Spline 轨迹优化参数 ----------
+  ma_spline_opt_params:
+    #mode: "OMNI_XY"        # [当前无用] 代码未解析该键；FsmReplan 当前硬编码使用 OptModel::OMNI_XY（2D xy 优化，输出 yaw 置零）
+    safe_distance: 0.3      # 后端两阶段公用 ESDF 避障安全距离阈值 (m)，距离小于此值按 smoothedL1 惩罚
+    v_max: 3.0              # 后端两阶段公用 2D 合速度约束上限 (m/s)，惩罚 ||v||² > v_max²
+    a_max: 3.0              # 后端两阶段公用 2D 合加速度约束上限 (m/s²)，惩罚 ||a||² > a_max²
+    integral_num_steps: 8   # 每段五次样条的数值积分采样步数 K；越大避障与动力学约束越精细，但优化耗时线性增加
+
+    # [当前未启用] 仅在 OptModel::OMNI_XY_YAW_JOINT (3D 联合优化) 生效；config.hpp 仍保留读取，但当前线上固定走 OMNI_XY
+    # weight_yaw_vel: 40.0  # yaw 角速度超限惩罚权重
+    # weight_yaw_acc: 40.0  # yaw 角加速度超限惩罚权重
+    # yaw_rate_max: 1.5     # yaw 最大角速度 (rad/s)
+    # yaw_acc_max: 1.5      # yaw 最大角加速度 (rad/s²)
+
+    # ========== Stage 1：形状优化（使用完整 ESDF 梯度，split_esdf=false） ==========
+    stage1:
+      rho_energy: 10.0         # 样条平滑能量代价权重；越大轨迹越平滑、越不贴近初始折线
+      weight_time: 80.0        # 总时间代价权重 (cost += w_time * ΣT_i)；越大轨迹总耗时越短
+      weight_mean_time: 40.0   # 各段时间均匀性惩罚权重，惩罚偏离平均时长 [mean_lower, mean_upper] 倍的段
+      mean_lower: 0.9          # 单段时长相对平均时长的下界比例（仅 weight_mean_time > 0 时生效）
+      mean_upper: 1.1          # 单段时长相对平均时长的上界比例（仅 weight_mean_time > 0 时生效）
+      min_time: 0.1            # 单段最小时长下限 (s)，低于该值施加二次惩罚防止段时长坍缩
+      weight_min_time: 100.0   # 单段时长低于 min_time 时的二次惩罚权重
+      weight_obstacle: 800.0   # ESDF 避障违规惩罚权重（Stage 1 偏小，先拉开大致形状）
+      weight_vel: 5.0          # 合速度超限 (||v||² - v_max²) 的 smoothedL1 惩罚权重
+      weight_acc: 5.0          # 合加速度超限 (||a||² - a_max²) 的 smoothedL1 惩罚权重
+      max_iterations: 100      # L-BFGS 最大迭代次数
+      g_epsilon: 1e-4          # L-BFGS 梯度收敛阈值：||g||_inf / max(1, ||x||_inf) < g_epsilon
+      lbfgs_mem_size: 64       # L-BFGS 历史校正对记忆深度（近似 Hessian 窗口大小）
+      lbfgs_delta: 5e-3        # L-BFGS 相对代价下降收敛阈值：|f(k-3) - f(k)| / max(1, |f(k)|) < delta（past 固定为 3）
+
+    # ========== Stage 2：严格优化（去切向 ESDF 梯度 + 势谷探测，split_esdf=true；失败时回退保留 Stage 1） ==========
+    stage2:
+      rho_energy: 5.0          # 样条平滑能量代价权重
+      weight_time: 20.0        # 总时间代价权重
+      weight_mean_time: 0.0    # 各段时间均匀性惩罚权重（当前设为 0.0，关闭均匀性惩罚以允许按需自由分配各段时长）
+      mean_lower: 0.9          # 单段时长相对平均时长的下界比例；因 weight_mean_time=0.0 不产生代价，改为 >0 时生效
+      mean_upper: 1.1          # 单段时长相对平均时长的上界比例；因 weight_mean_time=0.0 不产生代价，改为 >0 时生效
+      min_time: 0.1            # 单段最小时长下限 (s)
+      weight_min_time: 100.0   # 单段时长低于 min_time 时的二次惩罚权重
+      weight_obstacle: 8000.0  # ESDF 避障违规惩罚权重（Stage 2 放大 10 倍，严格推离障碍物）
+      weight_vel: 40.0         # 合速度超限惩罚权重
+      weight_acc: 40.0         # 合加速度超限惩罚权重
+      max_iterations: 200      # L-BFGS 最大迭代次数
+      g_epsilon: 1e-4          # L-BFGS 梯度收敛阈值
+      lbfgs_mem_size: 64       # L-BFGS 历史校正对记忆深度
+      lbfgs_delta: 5e-3        # L-BFGS 相对代价下降收敛阈值（past 固定为 3）
+
+
+  # ---------- 重规划参数 ----------
+  replan_params:
+    goal_deviation: [0.2, 0.2, 0.0]   # 目标点变化重规划阈值 [dx, dy, dz(占位)] (m)：仅 x/y 生效，任一轴超阈值触发重规划；第 3 维 [当前无用] 但须保留 3 维格式（否则 load_vector3d 返回零）
+    
+    #replan_interval: 2.0             # [当前无用] 已注释：历史按时间强制重规划参数，代码已移除
+    
+    replan_lateral_dev: 0.5           # 横向偏差阈值 (m)：机器人偏离当前参考路径（含刹车段）超过 0.5m 就重规划
+    goal_reached_radius: 0.3          # 到达判定半径 (m)：距目标 2D 欧氏距离小于 0.3m 直接认为到达（ROS2 节点与 FsmReplan 均使用）
+    hard_clearance: 0.2               # 后端执行轨迹（刹车段+样条）提交验收与监控态前向碰撞检测的统一硬净空 (m)，须 > 0；建议 >= footprint_radius(0.20) 且 < safe_threshold(0.30) 以留出规划-监控滞回带宽
+    
+    projection_search_resolution: 0.02   # 热启动时在上一条轨迹上搜索最近投影点的时间步长 (s，内部下限 1e-3)，越小越精确但计算量越大
+    # 反向重规划（速度与新路径首段夹角 > 90° 且速率 > 0.2 m/s）：先沿当前速度方向匀减速刹停，再从刹停点反向规划
+    brake_acc: 6.0         # 常规反向刹车减速度 (m/s²)
+    brake_acc_max: 10.0    # 刹车距离不够时最多提到该值 (m/s²)，仍不够则急停发零速；注释建议 ≤ 底盘能力且 ≤ MPC u_max（注意当前 MPC u_max 为 3.0）
+    start_oob_recover_dist: 0.3  # 导航模式下起点轻微越界允许沿虚拟墙向内恢复的最大距离 (m)
+
+  # ---------- 闭环云台折叠与洞口虚拟门禁参数 ----------
+  fold_params:
+    fold_time: 1.0              # 云台物理折叠耗时 (s)，须 >= 0；用于提前触发折叠、合并相邻隧道与折叠超时判定
+    unfold_time: 1.0            # 云台物理展开耗时 (s)，须 >= 0；用于相邻隧道合并窗口 fold_time + unfold_time + 2*fold_margin
+    fold_margin: 0.5            # 折叠/展开安全时间裕量 (s)，须 >= 0
+    gimbal_radius: 0.3          # 禁入区 T_in 外扩半径 = 云台包络半径 + 定位误差 (m)，须 >= 0
+    unfold_hysteresis: 0.2      # 出洞滞回外扩量 (m)，须 >= 0；T_out = gimbal_radius + unfold_hysteresis，须离开 T_out 才允许计时抬升
+    unfold_confirm_time: 0.4    # 离开 T_out 且前瞻窗口内无隧道后的持续确认去抖时间 (s)，须 >= 0；抑制重规划抖动误抬升
+    feedback_timeout: 0.3       # 下位机折叠反馈超时阈值 (s)，须 > 0；超时视为未确认折叠到位并锁定洞口门禁
+    fold_timeout_margin: 1.0    # 折叠超时告警裕量 (s)，须 >= 0；持续请求折叠超过 fold_time + fold_timeout_margin 仍未到位时告警
+    gate_brake_acc: 3.0         # 虚拟门禁制动速度包络减速度 (m/s²)，须 > 0；未确认折叠到位时按 v_gate = sqrt(2*a*max(0, s-buf)) 限速
+    gate_stop_buffer: 0.15      # 门禁停靠时距禁入区 T_in 边界的停车缓冲距离 (m)，须 >= 0
+    lookahead_dt: 0.05          # 沿当前轨迹（刹车段+样条段）前瞻隧道入口的采样步长 (s)，须 > 0
+    cmd_pub_rate: 20.0          # /ma_nav/fold 电平心跳发布频率 (Hz)，须 > 0；状态翻转时立即发布，稳态按该频率补发
+
+
+# ==================== 线性 MPC 参数 ====================
+# 状态: [x, y, vx, vy]（世界系，单位 m / m/s）
+# 控制: [ax, ay]（世界系，单位 m/s²）
+mpc_param:
+  N: 20                # 预测时域步数（总预测时长 = N * dt = 1.0 s）
+  dt: 0.05             # MPC 离散化与参考轨迹采样步长 (s)
+
+  # 状态跟踪权重 [x, y, vx, vy]（支持 4 元素对角列表或 4x4 矩阵；注意 QP Hessian 仅取对角元素，建议只配对角）
+  Q:  [30.0, 30.0, 1.0, 1.0]
+
+  # 第 N 步终端状态跟踪权重 [x, y, vx, vy]（同样仅对角元素进入 Hessian）
+  QN: [40.0, 40.0, 2.0, 2.0]
+
+  # 控制量跟踪权重 [ax, ay]（支持 2 元素对角列表或 2x2 矩阵；惩罚相对参考加速度的偏差，仅对角进入 Hessian）
+  R:  [0.05, 0.05]
+
+  # 控制增量平滑权重 [dax, day]（仅惩罚预测时域内相邻步 u_k - u_{k-1}, k=1..N-1；注：帧间 u_0 - u_prev 当前未纳入 QP）
+  Rd: [0.05, 0.05]
+
+  # 状态硬约束上下界 [x, y, vx, vy] (m, m, m/s, m/s)：
+  # 前两维 x/y [当前无用]（MPC 仅对索引 2,3 即 vx,vy 构建不等式约束），但须保留 4 维格式（否则 load_vector4d 返回全 0）；
+  # 后两维 vx/vy 为世界系速度硬约束（±3.0 m/s）
+  x_min: [-1000.0, -1000.0, -3.0, -3.0]
+  x_max: [ 1000.0,  1000.0,  3.0,  3.0]
+
+  # 控制量硬限幅 [ax, ay]，世界系加速度约束 (m/s²)
+  u_min: [-3.0, -3.0]
+  u_max: [ 3.0,  3.0]

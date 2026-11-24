@@ -844,7 +844,7 @@ Visualization Manager:
       Max Intensity: 156
       Min Color: 0; 0; 0
       Min Intensity: 0
-      Name: /lio/cloud_world
+      Name: /localization/lio_world_cloud
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 3
@@ -856,7 +856,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /lio/cloud_world
+        Value: /localization/lio_world_cloud
       Use Fixed Frame: true
       Use rainbow: true
       Value: false
@@ -1026,14 +1026,14 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /lio/cloud_world
+        Value: /localization/lio_world_cloud
       Use Fixed Frame: true
       Use rainbow: true
       Value: false
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
-    Fixed Frame: world
+    Fixed Frame: map
     Frame Rate: 30
   Name: root
   Tools:

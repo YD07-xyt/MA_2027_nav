@@ -1,0 +1,96 @@
+rog_map:
+  # ROS 输入回调与里程计新鲜度过滤（实际话题名由 planner.yaml 配置）
+  ros_callback: #基本无用
+    enable: true                       # 无点云输入时是否定时打印告警
+    odom_timeout: 0.2                  # 点云与里程计最大允许时间差 (s)
+
+  # 可视化节流与 3D 调试窗口范围
+  visualization:
+    time_rate: 30                      # 可视化回调最大发布频率 (Hz，<=0 表示不限频)
+    range: [100, 60, 4]                # static_3d 静态体素提取窗口尺寸 [x, y, z] (m, 世界系)
+
+  # 输入点云预过滤 基本无用
+  intensity_thresh: -10                # 强度过滤下限（<=0 表示不过滤强度）
+  point_filt_num: 1                    # 点云降采样步长（>=1，1 表示全点保留）
+
+  # 2D 分层栅格地图（规划与 ESDF 使用）；初始边界 x ∈ [-x_left, +x_right], y ∈ [-y_left, +y_right]
+  grid_map:
+    #只有建图有用
+    x_left: 6.0                        # 原点向 -x 延伸 (m, 世界系)
+    x_right: 22.0                      # 原点向 +x 延伸 (m, 世界系)
+    y_left: 10.0                       # 原点向 -y 延伸 (m, 世界系)
+    y_right: 10.0                      # 原点向 +y 延伸 (m, 世界系)
+    ##
+
+    resolution: 0.05                   # 2D 栅格与 3D 感知体素分辨率 (m)
+    expand_chunk_m: 4.0                # 建图模式单次动态扩图步长 (m，须 > 0)
+    max_map_size: [80.0, 80.0]         # 建图模式 2D 地图最大尺寸 [x, y] (m)
+    save_margin_cells: 2               # 建图保存时已探索包围盒外扩边距 (格)
+    #导航模式需要
+    unknown_as_occupied: false         # 导航加载三态图时，UNKNOWN(205) 是否视为障碍
+
+  # ---- 感知后端（STVL 动态障碍 + 2.5D 静态先验 + 零先验在线 3D 建图）----
+  perception:
+    robot:
+      footprint_radius: 0.20           # 机器人足迹半径 (m)，建图将车走过区域记为可通行地面
+      footprint_ground_offset: 0.09    # base_odom(云台) 原点到脚底地面的高度 (m, base_odom 系；bag 推算 LiDAR 离地 ~0.525 - 0.433 ≈ 0.092 m，按实测微调)
+      #无用  
+      robot_height: 0.24               # 机器人净空高度 (m)：悬空结构下沿距地面 >= 此值直接放行（限高杆实测净空约 0.25 m）
+      ##
+
+    sensor:
+      # LiDAR 光心相对 base_odom(云台) 的平移 [x, y, z] (m, base_odom 系；与 backend.yaml IMU->云台 外参闭合)
+      t_base_lidar: [-0.038, 0.0, 0.433]
+      # LiDAR 相对 base_odom 的 Z-Y-X 欧拉角 [roll, pitch, yaw] (deg, ROS REP-103 右手系: +X 前, +Y 左, +Z 上)
+      # 倒置 Mid-360 须设 roll=180.0，使传感器系视场 [-7°, +52°] 正确映射到世界系 [-52°, +7°]
+      rpy_deg: [180.0, 0.0, 0.0]
+
+
+      fov_min_elev_deg: -7.0           # Mid-360 雷达系垂直视场下限 (deg)
+      fov_max_elev_deg: 52.0           # Mid-360 雷达系垂直视场上限 (deg)
+      fov_margin_deg: 3.0              # 视场边界容差 (deg)
+      
+      
+      min_range: 0.50                  # 最小有效测距 (m)
+      max_range: 15.0                  # 最大视场与射线清除有效测距 (m)
+
+      #清除机体（上界须包住 z=+0.433 m 倒置雷达光心及 +0.477 m 顶面外壳）
+      self_filter_min: [-0.30, -0.30, -0.10] # 机体自滤盒下界 [x, y, z] (m, base_odom 系)
+      self_filter_max: [0.30, 0.30, 0.55]    # 机体自滤盒上界 [x, y, z] (m, base_odom 系)
+      ##
+
+    mapping:
+      trust_range: 4.0                 # 建图允许写入静态占据命中的最大水平距离 (m)
+      clear_range: 8.0                 # 建图 3D 射线扫空动态过客的最大距离 (m)
+      clear_stop_margin: 0.15          # 扫空射线在端点前提前停止的余量 (m)，防侵蚀静态墙面
+      min_z: -1.2                      # 建图最小世界系 Z (m；z-localization map 系平地地面约在 -0.57 m)
+      max_z: 1.0                       # 建图最大世界系 Z (m；覆盖地面上方 ~1.57 m，裁掉高处天花板杂波与 30 万点截断闪烁)
+      static_min_hits: 3               # 判定静态体素的最少跨帧命中数（提高门槛抑制高处稀疏飞点闪烁）
+      static_clear_ratio: 2.0          # clears > static_clear_ratio * hits 剔除为动态过客
+      preview_radius: 4.5              # 在线实时 2D 预览提取半径 (m)
+      tilt_jump_deg: 5.0               # 建图倾角跳变门控阈值 (deg)
+      tilt_hold_frames: 3              # 建图倾角跳变暂停写入帧数
+      max_slope_deg: 25.0              # 静态地形最大可通行坡度 (deg)
+      step_tol: 0.03                   # 邻格步高容差 (m)
+      plane_rms_max: 0.035             # 5x5 局部平面拟合最大 RMS 残差 (m)
+      max_surface_thickness: 0.11      # 单地面段最大竖向跨度 (m)，超过视为竖直墙体
+      min_overhang_clearance: 0.225    # 悬空结构最小放行净空 (m)；间隙在 [此值, robot_height) 且下方被扫空时放行
+      overhang_ground_radius: 6        # 悬空列搜索邻域参考地面的半径 (格，0.3 m @ 0.05 m)
+    navigation:
+      max_range: 5.0                   # 导航动态障碍检测最大水平半径 (m)
+      wall_suppress_dist: 0.08         # 距纯静态 ESDF 障碍 <= 此值抑制为静态墙体/边沿抖动 (m)
+      ground_margin_base: 0.06         # 贴地噪声剥离基础余量 (m)
+      ground_margin_per_m: 0.012       # 距离自适应贴地余量系数 (m/m)
+      dynamic_max_height: 0.85         # 相对地面动态障碍检测高度上限 (m)
+      overhang_margin: 0.06            # 已知静态悬空下沿抑制余量 (m)
+      tunnel_clearance_z: 0.22         # 无 .terrain.bin 时 TUNNEL 语义区洞顶抑制高度 (m)
+      ray_clear_margin: 0.15           # 极坐标深度图射线穿透清除余量 (m)
+      miss_clear_frames: 2             # 视场内连续射线穿透即刻清除帧数
+      decay_in_fov_sec: 0.35           # 视场内未命中衰减时间 (s)
+      decay_blind_sec: 0.45            # 盲区/身后未命中衰减时间 (s)
+      confirm_min_frames: 2            # 孤立动态体素确认最少跨帧数
+      fast_confirm_with_neighbor: true # 单帧 3D 成簇（>=2 个邻体素同帧命中）立即确认
+      tilt_jump_deg: 5.0               # 导航倾角跳变门控阈值 (deg)
+      tilt_hold_frames: 3              # 导航倾角跳变暂停帧数
+      drift_max_abs: 0.35              # 在线 Z 漂移补偿限幅 (m)
+      drift_min_samples: 30            # 更新 Z 漂移估计的最少有效地面点数

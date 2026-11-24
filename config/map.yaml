@@ -33,17 +33,17 @@ rog_map:
   perception:
     robot:
       footprint_radius: 0.20           # 机器人足迹半径 (m)，建图将车走过区域记为可通行地面
-      footprint_ground_offset: 0.06    # base_odom 原点到脚底地面的高度 (m, base_odom 系)；建图足迹与导航回退地面共用
+      footprint_ground_offset: 0.09    # base_odom(云台) 原点到脚底地面的高度 (m, base_odom 系；bag 推算 LiDAR 离地 ~0.525 - 0.433 ≈ 0.092 m，按实测微调)
       #无用  
       robot_height: 0.24               # 机器人净空高度 (m)：悬空结构下沿距地面 >= 此值直接放行（限高杆实测净空约 0.25 m）
       ##
 
     sensor:
-      # LiDAR 相对 base_odom 的平移 [x, y, z] (m, base_odom 系)
-      t_base_lidar: [0.0, 0.0, 0.15]
+      # LiDAR 光心相对 base_odom(云台) 的平移 [x, y, z] (m, base_odom 系；与 backend.yaml IMU->云台 外参闭合)
+      t_base_lidar: [-0.038, 0.0, 0.433]
       # LiDAR 相对 base_odom 的 Z-Y-X 欧拉角 [roll, pitch, yaw] (deg, ROS REP-103 右手系: +X 前, +Y 左, +Z 上)
-      # 绕 +Y 旋转：pitch = -20.0 表示雷达前向 +X 上仰 20°；pitch = +20.0 表示下俯 20°
-      rpy_deg: [0.0, 0.0, 0.0]
+      # 倒置 Mid-360 须设 roll=180.0，使传感器系视场 [-7°, +52°] 正确映射到世界系 [-52°, +7°]
+      rpy_deg: [180.0, 0.0, 0.0]
 
 
       fov_min_elev_deg: -7.0           # Mid-360 雷达系垂直视场下限 (deg)
@@ -54,18 +54,18 @@ rog_map:
       min_range: 0.50                  # 最小有效测距 (m)
       max_range: 15.0                  # 最大视场与射线清除有效测距 (m)
 
-      #清除机体
-      self_filter_min: [-0.30, -0.30, -0.08] # 机体自滤盒下界 [x, y, z] (m, base_odom 系)
-      self_filter_max: [0.30, 0.30, 0.35]    # 机体自滤盒上界 [x, y, z] (m, base_odom 系)
+      #清除机体（上界须包住 z=+0.433 m 倒置雷达光心及 +0.477 m 顶面外壳）
+      self_filter_min: [-0.48, -0.48, -0.12] # 机体自滤盒下界 [x, y, z] (m, base_odom 系)
+      self_filter_max: [0.48, 0.48, 0.55]   # 机体自滤盒上界 [x, y, z] (m, base_odom 系)
       ##
 
     mapping:
       trust_range: 4.0                 # 建图允许写入静态占据命中的最大水平距离 (m)
       clear_range: 8.0                 # 建图 3D 射线扫空动态过客的最大距离 (m)
       clear_stop_margin: 0.15          # 扫空射线在端点前提前停止的余量 (m)，防侵蚀静态墙面
-      min_z: -1.0                      # 建图最小世界系 Z (m)
-      max_z: 2.5                       # 建图最大世界系 Z (m)
-      static_min_hits: 2               # 判定静态体素的最少跨帧命中数
+      min_z: -1.2                      # 建图最小世界系 Z (m；z-localization map 系平地地面约在 -0.57 m)
+      max_z: 1.0                       # 建图最大世界系 Z (m；覆盖地面上方 ~1.57 m，裁掉高处天花板杂波与 30 万点截断闪烁)
+      static_min_hits: 3               # 判定静态体素的最少跨帧命中数（提高门槛抑制高处稀疏飞点闪烁）
       static_clear_ratio: 2.0          # clears > static_clear_ratio * hits 剔除为动态过客
       preview_radius: 4.5              # 在线实时 2D 预览提取半径 (m)
       tilt_jump_deg: 5.0               # 建图倾角跳变门控阈值 (deg)
