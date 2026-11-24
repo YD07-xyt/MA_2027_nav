@@ -385,7 +385,7 @@ auto build_env() -> BenchEnv {
 
     // 2. 初始化生产配置 MaMap，并将 rmuc2024 障碍嵌入 560x400 占据矩阵
     {
-        // ROGMap 构造期会通过 printf/std::cout 打印参数表，局部静默以保证基准输出与 JSON 格式干净。
+        // 局部静默 stdout，保证基准输出与 JSON 格式干净。
         ScopedSilenceStdout silence;
         env.ma_map = std::make_unique<ma_map::MaMap>(kMapConfigPath);
     }
@@ -2548,6 +2548,44 @@ auto run_sanity_checks(BenchEnv& env) -> bool {
 
             env.ma_map->set_mode(orig_mode);
             env.ma_map->set_global_map(env.ma_occ_a);
+
+            // 9j. 删除 legacy_rog / ROGMap 后，单进程可构造多实例 MaMap 且配置加载与 get_robot_position 语义正确
+            std::unique_ptr<ma_map::MaMap> second_map;
+            {
+                ScopedSilenceStdout silence;
+                second_map = std::make_unique<ma_map::MaMap>(kMapConfigPath);
+            }
+            const auto loaded_cfg = second_map->get_config();
+            ok &= check(
+                std::abs(loaded_cfg.perception_footprint_radius - 0.20) < 1e-9
+                    && std::abs(loaded_cfg.perception_footprint_ground_offset - 0.06) < 1e-9
+                    && std::abs(loaded_cfg.perception_robot_height - 0.24f) < 1e-6f
+                    && std::abs(loaded_cfg.perception_map_min_overhang_clearance - 0.225f) < 1e-6f
+                    && loaded_cfg.perception_map_overhang_ground_radius == 6,
+                "MaMap loads consolidated perception robot/mapping parameters from config/map.yaml"
+            );
+            ok &= check(
+                !second_map->get_robot_position().has_value(),
+                "Second MaMap constructs without init_once failure and starts with empty robot position"
+            );
+            second_map->update_odom(
+                rog_map::Pose {Eigen::Vector3d(1.25, -2.5, 0.3), Eigen::Quaterniond::Identity()},
+                200.0
+            );
+            const auto pos_after = second_map->get_robot_position();
+            ok &= check(
+                pos_after.has_value() && (*pos_after - Eigen::Vector3d(1.25, -2.5, 0.3)).norm() < 1e-9,
+                "MaMap get_robot_position returns updated finite position"
+            );
+            const rog_map::Pose nan_pose {
+                Eigen::Vector3d(std::numeric_limits<double>::quiet_NaN(), 0.0, 0.0),
+                Eigen::Quaterniond::Identity()
+            };
+            second_map->update_odom(nan_pose, 200.1);
+            ok &= check(
+                !second_map->get_robot_position().has_value(),
+                "MaMap get_robot_position rejects non-finite odom position"
+            );
         }
     }
 

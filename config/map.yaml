@@ -1,146 +1,36 @@
 rog_map:
-  # 地图基本参数
-  resolution: 0.05                      # 概率地图分辨率(m)
-  inflation_resolution: 0.1            # 膨胀分辨率(m)
-  inflation_step: 1                    # 膨胀步长
-  unk_inflation_en: false
-  unk_inflation_step: 1
-  map_size: [10, 10, 4]               # 地图大小 [x, y, z] (m) - 注意x方向较小
-  # If the map rolling is disable, the map origin [m] should be set.
-  fix_map_origin: [0, 0, 0]          # 固定地图原点
-  frontier_extraction_en: false
-
-  # Virtual ceil and ground
-  virtual_ceil_height: 5               # 天花板高度(m)
-  virtual_ground_height: -1.53 #-0.5          # 地面高度(m)
-
-  load_pcd_en: false
-
-  # ROS 回调配置（本节点经 MaMap::update_cloud 手动喂数据，不依赖 ROGMap 自带订阅；
-  # odom_timeout 用于点云回调的“里程计新鲜度”过滤，默认 0.05s 太严——odom 稍慢就丢所有点云帧）
+  # ROS 输入回调与里程计新鲜度过滤（实际话题名由 planner.yaml 配置）
   ros_callback:
-    enable: true
-    cloud_topic: "/lio/cloud_world"
-    odom_topic: "/lio/base_odom"
-    odom_timeout: 0.2
+    enable: true                       # 无点云输入时是否定时打印告警
+    odom_timeout: 0.2                  # 点云与里程计最大允许时间差 (s)
 
-  map_sliding:
-    enable: true                      # 禁用滑动窗口（因为已固定原点）
-    threshold: 0.3
-
-  esdf:
-    enable: false
-    resolution: 0.3                    # 必须 >= rog_map.resolution
-    # The range of esdf around the odom [m]
-    local_update_box: [15, 15, 3]      # 增大ESDF更新范围以匹配地图
-
+  # 可视化节流与 3D 调试窗口范围
   visualization:
-    enable: true
-    time_rate: 30                       # 可视化更新
-    range: [100, 60, 4]                 # 可视化范围(m)
-    pub_unknown_map_en: true
+    time_rate: 30                      # 可视化回调最大发布频率 (Hz，<=0 表示不限频)
+    range: [100, 60, 4]                # static_3d 静态体素提取窗口尺寸 [x, y, z] (m, 世界系)
 
-  # Intensity filter for input point cloud
-  intensity_thresh: -10                # -10表示不进行强度滤波
-  point_filt_num: 1
+  # 输入点云预过滤
+  intensity_thresh: -10                # 强度过滤下限（<=0 表示不过滤强度）
+  point_filt_num: 1                    # 点云降采样步长（>=1，1 表示全点保留）
 
-
-  forget_threshold: -1                  # 遗忘阈值(s)，小于等于0表示不进行遗忘衰减。关闭：按时间遗忘会误删被遮挡的静态障碍，改由射线清除动态障碍
-  # 导航模式（planner.yaml mapping_model: false）专用遗忘时间(s)。静态障碍由先验 global map 兜底，
-  # 动态障碍离开视野后 2 s 清掉；建图模式仍用上面的 forget_threshold。
-  nav_forget_threshold: 2.0
-  forget_keep_radius: 0.0               # 车周 1.5 m（水平）内不遗忘
-
-  terrain:
-      # 3x3 滤波，如果发现台阶边缘 2D 漏检严重，可改为 1 关闭滤波
-      kernel_size: 3                    
-      # 超过 5cm 就不当平地，必须做间隙分析
-      max_step_height: 0.05              
-      # 实际高度 + 安全余量。
-      # 改为 0.24：限高杆实测净空约 250mm，判据是"间隙 >= robot_height 才放行"，
-      # 取 0.26 时 0.25 >= 0.26 不成立，限高杆必然判障碍。0.24 可放行，20cm 台阶仍判障碍。
-      robot_height: 0.24                 
-      # 建议从 0.12 调低到 0.08，让算法对台阶和墙体边缘更敏感，
-      # 因为新代码不会因为陡峭而误杀限高杆，所以可以放心调小。
-      steep_threshold: 0.08              
-      # ---- 悬空结构（杆/洞）3D 证据 ----
-      # 间隙在 [min_overhang_clearance, robot_height) 之间时，只有下沿正下方被射线扫空、
-      # 且空闲段一直通到地面才放行；悬空列（最低占据下方就是已知空闲）不当地面来源。
-      # 台面/台阶顶面下方是实心，射线进不去（未知），不会被放行。
-      # 0.225：rosbag 回放里 0.18 会多放掉 2 格台阶边沿，0.225 台阶与旧逻辑一致。
-      min_overhang_clearance: 0.225
-      overhang_free_voxels: 3          # 下沿正下方至少连续 3 个已知空闲体素（0.15 m）
-      overhang_unknown_skip: 1         # 允许跳过 1 个未知体素（杆底混合体素）
-      overhang_ground_radius: 6        # 悬空列找邻域地面的半径（格，0.3 m）
-      # 以下三项原为 terrain_analysis.cpp 硬编码常量，值不变
-      obstacle_band: 0.08              # 高出参考地面多少以内算"贴地"(m)
-      ground_jump_thresh: 0.10         # 本格地面比邻域最低地面高出多少才认为被抬高(m)
-      ground_min_radius: 2             # 邻域最低地面搜索半径（格）
-      # ---- 持久 2.5D 地面层：记住被射线擦掉的车周地面 ----
-      ground_layer:
-        enable: true
-        size: 20.0                     # 环形缓冲边长(m)，需 > 2*max_range
-        max_range: 7.5                 # 只用水平距离以内的点(m)
-        drop_votes: 2                  # 地面下降需连续几帧一致
-        rise_votes: 3                  # 地面上升需连续几帧一致
-        rise_max: 0.24                 # 高于地面超过此值的量测当悬空物（= robot_height）
-        footprint_radius: 0.20         # 车走过的格按 base 高度记为地面(m)
-        footprint_ground_offset: 0.06   # base_odom 到脚底的高度(m)
-        seed_radius: 1.5               # 启动时车周盲区按 base 平面给低置信地面(m)
-        # 姿态跳变门控：机体 z 轴相邻帧转角 > tilt_jump_deg(度) 时，本帧及其后 tilt_hold_frames 帧
-        # 点云配准不可信（压过凸起/上下坡瞬间），不更新地面层，避免平地被记成低洼坑。0 关闭
-        # 仿真 10Hz：正常行驶帧间转角 p90 0.4°，跳变帧 2.5~12°
-        tilt_jump_deg: 2.0
-        tilt_hold_frames: 4
-        drop_min_support: 2            # 地面下降需至少几个 8 邻格高度一致才生效（挡孤立坑），0 关闭
-      # ---- 可达生长：以持久地面判上下沿/陡坡，只有从车所在格可达的地面给空闲证据（需 ground_layer）----
-      reach:
-        enable: true
-        max_slope_deg: 25.0            # 可通行最大坡度（20°/23° 坡可通行）
-        step_tol: 0.03                 # 相邻格高差在坡度允许值之外的容差(m)
-        plane_rms_max: 0.02            # 5x5 平面拟合残差小于此值才按平面坡度判陡坡(m)
-        drop_edge_enable: false        # 射线上界判下沿：高台上看不见的下坡也会被挡，默认关
-        drop_thresh: 0.10              # 下沿判定：外侧射线上界低于本格地面多少(m)
-
-  # 2D grid map (A* 规划用)。边界按原点向四个方向的延伸量设置：
-  # x ∈ [-x_left, +x_right], y ∈ [-y_left, +y_right]，即 x,-x,y,-y
+  # 2D 分层栅格地图（规划与 ESDF 使用）；初始边界 x ∈ [-x_left, +x_right], y ∈ [-y_left, +y_right]
   grid_map:
-    x_left: 6.0                      # 原点向左（-x）延伸 (m)
-    x_right: 22.0                      # 原点向右（+x）延伸 (m)
-    y_left: 10.0                        # 原点向左（-y）延伸 (m)
-    y_right: 10.0                       # 原点向右（+y）延伸 (m)
-    resolution: 0.05                   # 2D 栅格分辨率(m)
-    expand_chunk_m: 4.0                # 建图模式单次动态扩图步长(m)，须 > 0
+    x_left: 6.0                        # 原点向 -x 延伸 (m, 世界系)
+    x_right: 22.0                      # 原点向 +x 延伸 (m, 世界系)
+    y_left: 10.0                       # 原点向 -y 延伸 (m, 世界系)
+    y_right: 10.0                      # 原点向 +y 延伸 (m, 世界系)
+    resolution: 0.05                   # 2D 栅格与 3D 感知体素分辨率 (m)
+    expand_chunk_m: 4.0                # 建图模式单次动态扩图步长 (m，须 > 0)
     max_map_size: [80.0, 80.0]         # 建图模式 2D 地图最大尺寸 [x, y] (m)
-    save_margin_cells: 2               # 建图保存时已探索包围盒外扩边距(格)
-    unknown_as_occupied: false          # 导航加载三态图时，UNKNOWN(205) 是否视为障碍
+    save_margin_cells: 2               # 建图保存时已探索包围盒外扩边距 (格)
+    unknown_as_occupied: false         # 导航加载三态图时，UNKNOWN(205) 是否视为障碍
 
-
-  # Probabilistic update - 必须启用才能构建地图
-  raycasting:
-    enable: true                       # 改为true，启用射线投射更新地图
-    batch_update_size: 1
-    local_update_box: [10, 10, 4]      # 局部更新范围(m)
-    # The range of raycasting [m]
-    ray_range: [0.5, 30]               # 射线范围，根据LiDAR实际探测距离调整
-    # 雷达相对 base_odom 的位置（机体系, m），射线从这里出发。点云已是世界系，雷达位置只能由此给出。
-    # 0.194：rosbag 10_23 中 /lio/odom 与 /lio/base_odom 的高度差（tf_static 写的是 0.15，未核实以哪个为准）。
-    # 设为 [0, 0, 0] 恢复旧行为（射线从 base 出发）。
-    sensor_offset: [0.0, 0.0, 0.15]
-
-    # 概率参数
-    p_min: 0.12
-    p_miss: 0.45                       # 原 0.49；配合 p_max 0.93，饱和体素约 5 次射线穿过即清除
-    p_free: 0.499
-    p_occ: 0.85
-    p_hit: 0.8
-    p_max: 0.93                        # 原 0.98；上限越低，久站的动态障碍离开后清除越快
-    # 未知区域阈值
-    unk_thresh: 1.0
-
-  # ---- 新感知后端（STVL 动态障碍 + 2.5D 静态先验 + 零先验在线 3D 建图）----
+  # ---- 感知后端（STVL 动态障碍 + 2.5D 静态先验 + 零先验在线 3D 建图）----
   perception:
-    backend: "stvl_prior"              # "stvl_prior"（默认新管线）| "legacy_rog"（回退旧 ROGMap+TerrainAnalyzer）
+    robot:
+      footprint_radius: 0.20           # 机器人足迹半径 (m)，建图将车走过区域记为可通行地面
+      footprint_ground_offset: 0.06    # base_odom 原点到脚底地面的高度 (m, base_odom 系)；建图足迹与导航回退地面共用
+      robot_height: 0.24               # 机器人净空高度 (m)：悬空结构下沿距地面 >= 此值直接放行（限高杆实测净空约 0.25 m）
     sensor:
       # LiDAR 相对 base_odom 的平移 [x, y, z] (m, base_odom 系)
       t_base_lidar: [0.0, 0.0, 0.15]
@@ -169,6 +59,8 @@ rog_map:
       step_tol: 0.03                   # 邻格步高容差 (m)
       plane_rms_max: 0.035             # 5x5 局部平面拟合最大 RMS 残差 (m)
       max_surface_thickness: 0.11      # 单地面段最大竖向跨度 (m)，超过视为竖直墙体
+      min_overhang_clearance: 0.225    # 悬空结构最小放行净空 (m)；间隙在 [此值, robot_height) 且下方被扫空时放行
+      overhang_ground_radius: 6        # 悬空列搜索邻域参考地面的半径 (格，0.3 m @ 0.05 m)
     navigation:
       max_range: 5.0                   # 导航动态障碍检测最大水平半径 (m)
       wall_suppress_dist: 0.08         # 距纯静态 ESDF 障碍 <= 此值抑制为静态墙体/边沿抖动 (m)

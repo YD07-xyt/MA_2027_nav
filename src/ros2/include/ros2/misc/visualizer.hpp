@@ -52,15 +52,12 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr SurfMapPub; // SurfMappub
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr GlobalPathPub;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr OptPathPub;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr occ_pub, unknown_pub, occ_inf_pub, unknown_inf_pub,
-        frontier_pub, esdf_pub, terrain_map_pub;
-    // stvl_prior 独立 3D 可视化话题（不复用 /ma_nav/map/occ，全部按订阅者按需发布）
+    // stvl_prior 独立 3D 可视化话题（全部按订阅者按需发布）
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr filtered_cloud_pub;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr stvl_dynamic_pub;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr static_3d_pub;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr prior_ground_pub;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr prior_overhang_pub;
-    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr mkr_arr_pub;
 
     // 2D 地图/ESDF 与 stvl_prior 3D 调试图层的 revision 缓存：无订阅者或数据未变化时跳过扫描与消息分配。
     // last_subs 用于识别“订阅者从无到有/数量增加”，此时强制重发一帧，避免新 RViz 客户端长时间空白。
@@ -145,18 +142,11 @@ public:
         SurfMapPub = node->create_publisher<sensor_msgs::msg::PointCloud2>("/ma_nav/surf_map", 10);
         GlobalPathPub = node->create_publisher<nav_msgs::msg::Path>("/ma_nav/global_path", 10);
         OptPathPub = node->create_publisher<nav_msgs::msg::Path>("/ma_nav/opt_path", 10);
-        occ_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>("/ma_nav/map/occ", 10);
-        unknown_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>("/ma_nav/map/unk", 10);
-        occ_inf_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>("/ma_nav/map/inf_occ", 10);
-        unknown_inf_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>("/ma_nav/map/inf_unk", 10);
-        esdf_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>("/ma_nav/map/esdf", 10);
-        frontier_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>("/ma_nav/map/frontier", 10);
         filtered_cloud_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>("/ma_nav/map/filtered_cloud", 10);
         stvl_dynamic_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>("/ma_nav/map/stvl_dynamic", 10);
         static_3d_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>("/ma_nav/map/static_3d", 10);
         prior_ground_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>("/ma_nav/map/prior_ground", 10);
         prior_overhang_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>("/ma_nav/map/prior_overhang", 10);
-        mkr_arr_pub = node->create_publisher<visualization_msgs::msg::MarkerArray>("/ma_nav/map/map_bound", 10);
     }
 
     // 根据订阅者数量同步 stvl_prior 3D 调试点云采集开关，并在退订时重置 revision 缓存，
@@ -181,10 +171,8 @@ public:
     // 无订阅者时避免不必要的快照拷贝与 marker 构建。
     bool map_viz_active() const {
         const auto has_sub = [](const auto& pub) { return pub && pub->get_subscription_count() > 0; };
-        return has_sub(unknown_pub) || has_sub(unknown_inf_pub) || has_sub(frontier_pub) || has_sub(occ_pub)
-            || has_sub(occ_inf_pub) || has_sub(esdf_pub) || has_sub(filtered_cloud_pub) || has_sub(stvl_dynamic_pub)
-            || has_sub(static_3d_pub) || has_sub(prior_ground_pub) || has_sub(prior_overhang_pub)
-            || has_sub(mkr_arr_pub);
+        return has_sub(filtered_cloud_pub) || has_sub(stvl_dynamic_pub) || has_sub(static_3d_pub)
+            || has_sub(prior_ground_pub) || has_sub(prior_overhang_pub);
     }
 
     bool needs_grid_map_snapshot() const {
@@ -1458,12 +1446,7 @@ void PubOptPath(SplineTrajectory::PPolyND<2, 6> traj, const std::string& frame_i
         pub->publish(pcl_msg);
     }
 
-    void publish_stvl_prior_3d_viz(
-        ma_map::MaMap& ma_map,
-        const std::shared_ptr<rog_map::ROGMap>& rog_map,
-        const rog_map::Config& cfg,
-        const std::string& frame_id
-    ) {
+    void publish_stvl_prior_3d_viz(ma_map::MaMap& ma_map, const rog_map::Config& cfg, const std::string& frame_id) {
         // 1. 前端过滤后的当帧 3D 点云（建图/导航通用）
         if (should_publish(
                 filtered_cloud_pub,
@@ -1497,9 +1480,7 @@ void PubOptPath(SplineTrajectory::PPolyND<2, 6> traj, const std::string& frame_i
             const bool throttled = !new_sub && static_3d_last_pub_sec_ >= 0.0 && now_sec >= static_3d_last_pub_sec_
                 && (now_sec - static_3d_last_pub_sec_) < kStatic3dMinIntervalSec;
             if (!throttled && should_publish(static_3d_pub, static_rev, static_3d_last_rev_, static_3d_last_subs_)) {
-                const Eigen::Vector3d center = (rog_map && rog_map->robot_state_.p.allFinite())
-                    ? Eigen::Vector3d(rog_map->robot_state_.p)
-                    : Eigen::Vector3d(0.0, 0.0, 0.0);
+                const Eigen::Vector3d center = ma_map.get_robot_position().value_or(Eigen::Vector3d(0.0, 0.0, 0.0));
                 const Eigen::Vector3d half_range = cfg.visualization_range.allFinite()
                     ? Eigen::Vector3d(0.5 * cfg.visualization_range.cwiseAbs())
                     : Eigen::Vector3d(50.0, 30.0, 2.0);
@@ -1581,230 +1562,7 @@ void PubOptPath(SplineTrajectory::PPolyND<2, 6> traj, const std::string& frame_i
     }
 
     void map_viz_callback(ma_map::MaMap& ma_map, std::string frame_id = "world") {
-        auto rog_map = ma_map.get_rog_map();
         const auto cfg_ = ma_map.get_config();
-
-        if (cfg_.perception_backend == "stvl_prior") {
-            publish_stvl_prior_3d_viz(ma_map, rog_map, cfg_, frame_id);
-        }
-
-        if (!rog_map) {
-            if (cfg_.perception_backend == "legacy_rog") {
-                logger::ros2->warn("[ROGMap] Visualization skipped: rog_map is null.");
-            }
-            return;
-        }
-
-        const bool need_legacy_3d = (cfg_.perception_backend == "legacy_rog");
-        const bool need_mkr_arr = (mkr_arr_pub && mkr_arr_pub->get_subscription_count() > 0);
-        if (!need_legacy_3d && !need_mkr_arr) {
-            return;
-        }
-
-        utils::Vec3f box_max = rog_map->robot_state_.p + cfg_.visualization_range / 2;
-        utils::Vec3f box_min = rog_map->robot_state_.p - cfg_.visualization_range / 2;
-
-        rog_map->boundBoxByLocalMap(box_min, box_max);
-        if ((box_max - box_min).minCoeff() <= 0) {
-            logger::ros2->warn("[ROGMap] Visualization range is too small.");
-            return;
-        }
-
-        // stvl_prior 后端下 rog_map 不承载感知数据，跳过 3D 体素 boxSearch/boxSearchInflate
-        // 与 ESDF 点云扫描；legacy_rog 保持完整旧可视化。
-        if (need_legacy_3d) {
-            if (cfg_.pub_unknown_map_en && unknown_pub->get_subscription_count() >= 1) {
-                utils::vec_E<utils::Vec3f> unknown_map, inf_unknown_map;
-                rog_map->boxSearch(box_min, box_max, utils::UNKNOWN, unknown_map);
-                sensor_msgs::msg::PointCloud2 cloud_msg;
-                vecEVec3fToPC2(unknown_map, cloud_msg, frame_id);
-                cloud_msg.header.stamp = node->get_clock()->now();
-                unknown_pub->publish(cloud_msg);
-                if (cfg_.unk_inflation_en && unknown_inf_pub->get_subscription_count() >= 1) {
-                    rog_map->boxSearchInflate(box_min, box_max, utils::UNKNOWN, inf_unknown_map);
-                    vecEVec3fToPC2(inf_unknown_map, cloud_msg, frame_id);
-                    cloud_msg.header.stamp = node->get_clock()->now();
-                    unknown_inf_pub->publish(cloud_msg);
-                }
-            }
-
-            if (cfg_.frontier_extraction_en && frontier_pub->get_subscription_count() >= 1) {
-                utils::vec_E<utils::Vec3f> frontier_map;
-                rog_map->boxSearch(box_min, box_max, utils::FRONTIER, frontier_map);
-                sensor_msgs::msg::PointCloud2 cloud_msg;
-                vecEVec3fToPC2(frontier_map, cloud_msg, frame_id);
-                cloud_msg.header.stamp = node->get_clock()->now();
-                frontier_pub->publish(cloud_msg);
-            }
-
-            utils::vec_E<utils::Vec3f> occ_map, inf_occ_map;
-            sensor_msgs::msg::PointCloud2 cloud_msg;
-
-            if (occ_pub->get_subscription_count() >= 1) {
-                rog_map->boxSearch(box_min, box_max, utils::OCCUPIED, occ_map);
-                vecEVec3fToPC2(occ_map, cloud_msg, frame_id);
-                occ_pub->publish(cloud_msg);
-            }
-
-            if (occ_inf_pub->get_subscription_count() >= 1) {
-                rog_map->boxSearchInflate(box_min, box_max, utils::OCCUPIED, inf_occ_map);
-                vecEVec3fToPC2(inf_occ_map, cloud_msg, frame_id);
-                cloud_msg.header.stamp = node->get_clock()->now();
-                occ_inf_pub->publish(cloud_msg);
-            }
-
-            /* visualize ESDF Map*/
-            if (cfg_.esdf_en) {
-                if (esdf_pub->get_subscription_count() >= 1) {
-                    rog_map::PointCloud pc;
-                    rog_map->get_esdf_map()
-                        ->getPositiveESDFPointCloud(box_min, box_max, rog_map->robot_state_.p.z() - 0.5, pc);
-                    pcl::toROSMsg(pc, cloud_msg);
-                    cloud_msg.header.frame_id = frame_id;
-                    cloud_msg.header.stamp = node->get_clock()->now();
-                    esdf_pub->publish(cloud_msg);
-                }
-
-                // if (vm_.esdf_neg_pub->get_subscription_count() >= 1) {
-                //     PointCloud pc;
-                //     esdf_map_->getNegativeESDFPointCloud(box_min, box_max,
-                //     robot_state_.p.z() - 0.5, pc); pcl::toROSMsg(pc, cloud_msg);
-                //     cloud_msg.header.frame_id = "world";
-                //     cloud_msg.header.stamp = nh_->get_clock()->now();
-                //     vm_.esdf_neg_pub->publish(cloud_msg);
-                // }
-
-#ifdef ESDF_MAP_DEBUG
-                esdf_map_->getESDFOccPC2(box_min, box_max, cloud_msg);
-                cloud_msg.header.stamp = nh_->get_clock()->now();
-                vm_.esdf_occ_pub->publish(cloud_msg);
-#endif
-            }
-        }
-
-        if (!mkr_arr_pub || mkr_arr_pub->get_subscription_count() == 0) {
-            return;
-        }
-
-        /* Publish visualization range */
-        visualization_msgs::msg::MarkerArray mkr_arr;
-        visualizeBoundingBox(
-            mkr_arr,
-            node->get_clock()->now().seconds(),
-            box_min,
-            box_max,
-            "Visualization Range",
-            utils::Color::Purple(),
-            0.1,
-            1.0,
-            true,
-            frame_id
-        );
-        visualizeText(
-            mkr_arr,
-            node->get_clock()->now().seconds(),
-            "Visualization Range Text",
-            "Visualization Range",
-            box_max + utils::Vec3f(0, 0, 0.5),
-            utils::Color::Purple(),
-            0.6,
-            0,
-            frame_id
-        );
-
-        /* Publish local map range */
-        utils::Vec3f local_map_max(999, 999, 999), local_map_min(-999, -999, -999);
-        rog_map->boundBoxByLocalMap(local_map_min, local_map_max);
-        visualizeBoundingBox(
-            mkr_arr,
-            node->get_clock()->now().seconds(),
-            local_map_min,
-            local_map_max,
-            "Local Map Range",
-            utils::Color::Orange(),
-            0.1,
-            1.0,
-            true,
-            frame_id
-        );
-        visualizeText(
-            mkr_arr,
-            node->get_clock()->now().seconds(),
-            "Local Map Range Text",
-            "Local Map Range",
-            local_map_max + utils::Vec3f(0, 0, 1.0),
-            utils::Color::Orange(),
-            0.6,
-            0,
-            frame_id
-        );
-
-        /* Publish Ray-casting range */
-        visualizeBoundingBox(
-            mkr_arr,
-            node->get_clock()->now().seconds(),
-            rog_map->get_raycast_data().cache_box_min,
-            rog_map->get_raycast_data().cache_box_max,
-            "Updating Range",
-            utils::Color::Green(),
-            0.1,
-            1.0,
-            true,
-            frame_id
-        );
-        visualizeText(
-            mkr_arr,
-            node->get_clock()->now().seconds(),
-            "Updating Range Text",
-            "Updating Range",
-            rog_map->get_raycast_data().cache_box_max + utils::Vec3f(0, 0, 0.5),
-            utils::Color::Green(),
-            0.6,
-            0,
-            frame_id
-        );
-
-        /* Publish Local map origin */
-        visualizePoint(
-            mkr_arr,
-            node->get_clock()->now().seconds(),
-            rog_map->getLocalMapOrigin(),
-            utils::Color::Red(),
-            "Local Map Origin",
-            0.2,
-            0,
-            true,
-            frame_id
-        );
-
-        if (cfg_.esdf_en && rog_map->get_esdf_map()) {
-            utils::Vec3f esdf_box_max, esdf_box_min;
-            rog_map->get_esdf_map()->getUpdatedBbox(esdf_box_min, esdf_box_max);
-            visualizeText(
-                mkr_arr,
-                node->get_clock()->now().seconds(),
-                "ESDF Map Text",
-                "ESDF Map",
-                esdf_box_max + utils::Vec3f(0, 0, 1.0),
-                utils::Color::Blue(),
-                0.6,
-                0,
-                frame_id
-            );
-            visualizeBoundingBox(
-                mkr_arr,
-                node->get_clock()->now().seconds(),
-                esdf_box_min,
-                esdf_box_max,
-                "ESDF Updating Range",
-                utils::Color::Blue(),
-                0.1,
-                1.0,
-                true,
-                frame_id
-            );
-        }
-
-        mkr_arr_pub->publish(mkr_arr);
+        publish_stvl_prior_3d_viz(ma_map, cfg_, frame_id);
     }
 };

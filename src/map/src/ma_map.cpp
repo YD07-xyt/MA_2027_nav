@@ -61,8 +61,7 @@ auto MaMap::update_cloud(const rog_map::PointCloud& cloud, double stamp_sec) -> 
 }
 
 auto MaMap::update_map() -> void {
-    const StaticNavContext static_ctx =
-        (impl_->layered_map.mode() == MapMode::NAVIGATION && impl_->perception.usesStvlPrior())
+    const StaticNavContext static_ctx = (impl_->layered_map.mode() == MapMode::NAVIGATION)
         ? impl_->layered_map.getStaticNavContext()
         : StaticNavContext {};
     auto frame = impl_->perception.processPendingFrame(static_ctx);
@@ -86,9 +85,7 @@ auto MaMap::load_static_map(std::string_view map_path) -> tl::expected<LoadRepor
 
 auto MaMap::save_explored_map(std::string_view output_path, const std::optional<SaveOptions>& options) const
     -> tl::expected<SaveReport, std::string> {
-    if (impl_->layered_map.mode() == MapMode::MAPPING && impl_->perception.usesStvlPrior()
-        && impl_->perception.hasOnlineMappingData())
-    {
+    if (impl_->layered_map.mode() == MapMode::MAPPING && impl_->perception.hasOnlineMappingData()) {
         auto built = impl_->perception.buildGlobalStaticMap();
         if (built.has_value() && built->geometry.isValid()) {
             const SaveOptions effective_opts = options.value_or(impl_->layered_map.defaultSaveOptions());
@@ -160,12 +157,8 @@ auto MaMap::get_static_terrain_prior(uint64_t* revision) const -> std::shared_pt
     return impl_->layered_map.getStaticTerrainPrior(revision);
 }
 
-auto MaMap::get_ground_layer() const -> const Terrain::GroundLayer& {
-    return impl_->perception.getGroundLayer();
-}
-
-auto MaMap::get_rog_map() const -> std::shared_ptr<rog_map::ROGMap> {
-    return impl_->perception.getRogMap();
+auto MaMap::get_robot_position() const -> std::optional<Eigen::Vector3d> {
+    return impl_->perception.getRobotPosition();
 }
 
 auto MaMap::get_config() const -> rog_map::Config {

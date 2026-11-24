@@ -21,7 +21,7 @@ if(ipo_supported)
 
     add_compile_options($<$<CONFIG:Release>:-flto=auto>)
     add_link_options($<$<CONFIG:Release>:-flto=auto>)
-     message(STATUS "全局 LTO 已启用")
+    message(STATUS "全局 LTO 已启用")
 else()
     message(WARNING "LTO 不被支持: ${ipo_error}")
 endif()

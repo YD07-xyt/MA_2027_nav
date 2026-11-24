@@ -1,13 +1,11 @@
 #pragma once
 
 #include "map/3d_occ_map/config.hpp"
-#include "map/3d_occ_map/rog_map.h"
 #include "map/core/grid_map.hpp"
 #include "map/core/map_io.hpp"
 #include "map/core/static_terrain_prior.hpp"
 #include "map/layered/layered_map.hpp"
 #include "map/layered/map_layers.hpp"
-#include "map/perception/ground_layer.hpp"
 #include "utils/clock.hpp"
 #include "utils/expected.hpp"
 
@@ -93,7 +91,7 @@ public:
     auto copy_dynamic_3d_cloud(std::vector<Eigen::Vector3f>& out) const -> uint64_t;
 
     // 查询建图模式 OnlineTerrainMapper 累积静态 3D 体素版本号及 AABB 窗口内静态体素点云（世界系, m）；线程安全。
-    // max_points > 0 时限制输出点数上限；非 stvl_prior 后端返回 0 并清空 out。
+    // max_points > 0 时限制输出点数上限。
     auto static_3d_revision() const -> uint64_t;
     auto extract_static_3d_cloud(
         const Eigen::Vector3d& box_min,
@@ -105,9 +103,8 @@ public:
     // 获取当前已加载 2.5D 静态地形先验只读快照（.terrain.bin）及其单调版本号；仅持轻量 front_mtx_，不触发 ESDF 重算。
     auto get_static_terrain_prior(uint64_t* revision = nullptr) const -> std::shared_ptr<const StaticTerrainPrior>;
 
-    // 持久地面层（只读，地图线程外读取需自行保证不与 update_map 并发）
-    auto get_ground_layer() const -> const Terrain::GroundLayer&;
-    auto get_rog_map() const -> std::shared_ptr<rog_map::ROGMap>;
+    // 获取最近一次有效里程计的机器人 3D 位置（世界系, m）；未收到有效位姿或含非有限值时返回 std::nullopt；线程安全。
+    auto get_robot_position() const -> std::optional<Eigen::Vector3d>;
     auto get_config() const -> rog_map::Config;
 
 private:

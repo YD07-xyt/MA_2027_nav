@@ -209,22 +209,6 @@ int main(int argc, char** argv) {
                                                                                                               : 255);
             pgm.put(static_cast<char>(v));
         }
-    // 持久地面层：每个 2D 格一行 x, y, h, flags（只写有地面的格）
-    {
-        const auto& gl = map.get_ground_layer();
-        std::ofstream g(prefix + "_ground.csv");
-        g << "x,y,h,flags,ub\n";
-        const double gres = gl.config().resolution;
-        for (int x = 0; x < nvox.x(); ++x)
-            for (int y = 0; y < nvox.y(); ++y) {
-                Eigen::Vector2d p;
-                gm_final->indexToPos(Eigen::Vector2i(x, y), p);
-                const auto* c =
-                    gl.cell(static_cast<int>(std::floor(p.x() / gres)), static_cast<int>(std::floor(p.y() / gres)));
-                if (c == nullptr || c->flags == 0) continue;
-                g << p.x() << ',' << p.y() << ',' << c->h << ',' << int(c->flags) << ',' << c->ub << '\n';
-            }
-    }
     // 导航新增障碍格并集：行 = 世界 X（顶行为最大 X），列 = 世界 Y（与 MapIO 保存约定一致）。
     if (!extra_union.empty()) {
         std::ofstream xg(prefix + "_extra.pgm", std::ios::binary);
