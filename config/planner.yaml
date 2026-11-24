@@ -99,7 +99,7 @@ planner_config:
     
     replan_lateral_dev: 0.5           # 横向偏差阈值 (m)：机器人偏离当前参考路径（含刹车段）超过 0.5m 就重规划
     goal_reached_radius: 0.3          # 到达判定半径 (m)：距目标 2D 欧氏距离小于 0.3m 直接认为到达（ROS2 节点与 FsmReplan 均使用）
-    hard_clearance: 0.2               # 监控态前向执行轨迹（刹车段+样条）碰撞检测硬净空 (m)，须 > 0；建议 >= footprint_radius(0.20) 且 < safe_threshold(0.30) 以留出规划-监控滞回带宽
+    hard_clearance: 0.2               # 后端执行轨迹（刹车段+样条）提交验收与监控态前向碰撞检测的统一硬净空 (m)，须 > 0；建议 >= footprint_radius(0.20) 且 < safe_threshold(0.30) 以留出规划-监控滞回带宽
     
     projection_search_resolution: 0.02   # 热启动时在上一条轨迹上搜索最近投影点的时间步长 (s，内部下限 1e-3)，越小越精确但计算量越大
     # 反向重规划（速度与新路径首段夹角 > 90° 且速率 > 0.2 m/s）：先沿当前速度方向匀减速刹停，再从刹停点反向规划

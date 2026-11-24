@@ -18,7 +18,7 @@ public:
         double replan_lateral_dev; // 横向偏差阈值（m），机器人偏离参考路径超过则重规划
         double goal_reached_radius; // 起点≈终点判定半径（m）：机器人距目标小于该值时直接退出不规划，
         // 避免退化路径（A* 单点）与无意义的周期重规划
-        // 监控态前向执行轨迹碰撞检测硬净空（m），须 > 0（运行期夹紧至 <= safe_threshold）
+        // 后端执行轨迹（刹车段+样条）提交验收与监控态前向碰撞检测的统一硬净空（m），须 > 0（运行期夹紧至 <= safe_threshold）
         double hard_clearance = 0.20;
         double projection_search_resolution; ///< 投影点搜索时间分辨率 (s)，越小越精确但计算量越大
         // 反向重规划刹车段：常规减速度；空间不够时最多提到 brake_acc_max，仍不够则急停（发零速）
