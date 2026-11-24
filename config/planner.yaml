@@ -13,14 +13,14 @@ ros2:
   save_global_map_path:  "map"
   save_map_srv_topic: "/save_global_map"
   map_params_path: "config/map.yaml"   # 地图参数
-  global_map_path: "map/rmuc2027.pgm" # 全局栅格地图
+  global_map_path: "/home/xyt/map/src/MA_2027_nav/map/rmuc2027.pgm" # 全局栅格地图
   # 点击隧道区域保存/加载
   tunnel_regions_path: "map/tunnel_regions.yaml"
   save_tunnel_regions_srv_topic: "/save_tunnel_regions"
 
 # ==================== 地图模式 ====================
 map:
-  mapping_model: true   # true=建图模式，false=规划模式
+  mapping_model: false   # true=建图模式，false=规划模式
 
 
 # ==================== 规划器配置 ====================

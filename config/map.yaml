@@ -113,7 +113,7 @@ rog_map:
     expand_chunk_m: 4.0                # 建图模式单次动态扩图步长(m)，须 > 0
     max_map_size: [80.0, 80.0]         # 建图模式 2D 地图最大尺寸 [x, y] (m)
     save_margin_cells: 2               # 建图保存时已探索包围盒外扩边距(格)
-    unknown_as_occupied: true          # 导航加载三态图时，UNKNOWN(205) 是否视为障碍
+    unknown_as_occupied: false          # 导航加载三态图时，UNKNOWN(205) 是否视为障碍
 
 
   # Probabilistic update - 必须启用才能构建地图
