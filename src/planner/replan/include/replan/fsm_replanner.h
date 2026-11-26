@@ -7,7 +7,9 @@
 #include "utils/expected.hpp"
 #include "utils/type_utils.hpp"
 #include <Eigen/Core>
+#include <cstddef>
 #include <memory>
+#include <vector>
 namespace replan {
 class FsmReplan {
 public:
@@ -25,6 +27,14 @@ public:
         double brake_acc = 6.0; ///< 常规刹车减速度 (m/s²)
         double brake_acc_max = 10.0; ///< 刹车减速度上限 (m/s²)，应 ≤ 底盘真实能力且 ≤ MPC u_max
         double start_oob_recover_dist = 0.3; ///< 导航模式下允许轻微越界起点沿虚拟墙向内恢复的最大距离 (m)
+        // 多点途经导航参数（单点导航不生效）
+        double via_pass_radius = 0.5; ///< 中间途径点通过判定半径 (m)，须 >= 0
+        double via_opt_radius = 0.35; ///< 后端软球优化死区半径 (m)，运行期夹紧至 <= via_pass_radius
+        double via_time_pass_hysteresis = 0.15; ///< 轨迹时间锚点越过判据的滞回时间 (s)，须 >= 0
+        double via_min_spacing = 0.25; ///< 相邻冗余中间途径点自动合并间距 (m)，须 >= 0
+        double horizon_length = 12.0; ///< 滑动规划视野长度 (m)；<= 0 表示不截断全量规划
+        double horizon_replan_dist = 6.0; ///< 有后续未纳入点时触发滚动延伸的剩余弧长阈值 (m)
+        int max_waypoints = 64; ///< 单次多点任务允许的最大航点数上限，须 >= 1
     };
     struct PlannerConfig {
         ReplanParam replan_params;
@@ -62,6 +72,9 @@ private:
         PathState path_state = PathState::IDLE;
         // true 表示这次返回的是新规划的轨迹
         bool is_new_trajectory = false;
+        // 多点任务进度：当前待通过工作点索引，以及含最终点在内的剩余目标数（到达最终点时为 0）
+        size_t active_goal_index = 0;
+        size_t remaining_goals = 0;
     };
 
 public:
@@ -75,6 +88,15 @@ public:
     // 失败只返回单次错误，已提交的轨迹保持不变。
     auto plan(
         const utils::RobotState& goal_pose,
+        const utils::RobotState& current_pose,
+        grid_map::GridMap::ConstPtr grid_map
+    ) -> path;
+
+    // 多点途经规划：按序高速通过中间途径点（不减速），仅在最终点 goals.back() 刹停。
+    // 中间途径点通过仅推进内部进度，不触发重规划；goals 为空、超过 max_waypoints、含非有限坐标
+    // 或在导航模式越界时返回 PLANNING_FAILED，且不改变已提交轨迹与旧任务进度。
+    auto plan(
+        const std::vector<utils::RobotState>& goals,
         const utils::RobotState& current_pose,
         grid_map::GridMap::ConstPtr grid_map
     ) -> path;

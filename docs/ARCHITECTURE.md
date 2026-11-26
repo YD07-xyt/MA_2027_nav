@@ -29,7 +29,7 @@ path_planning → 3d_occ_map + utils
 | 数据/任务 | 当前入口与归属 |
 | :--- | :--- |
 | 点云、里程计 | `map_callback` / `odom_callback`，同一 map callback group |
-| 目标 | `target_callback`，control callback group |
+| 目标 | `target_callback`（单点 `/goal_pose`，`PoseStamped`）与 `waypoints_callback`（多点 `/goal_poses`，`nav_msgs/Path`），control callback group |
 | 规划 | planner callback group，33 ms timer |
 | 控制与可视化 | control callback group，各 10 ms timer |
 | 速度 | GlobalPlanner2d 发布到 YAML 的 `ros2.cmd_vel_name` |

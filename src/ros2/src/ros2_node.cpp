@@ -109,6 +109,13 @@ GlobalPlanner2d::GlobalPlanner2d(rclcpp::Node::SharedPtr nh_, std::string params
         opts_target
     );
 
+    waypoints_sub_ = nh->create_subscription<nav_msgs::msg::Path>(
+        config.waypoints_topic_name,
+        rclcpp::QoS(10),
+        [this](const nav_msgs::msg::Path::SharedPtr msg) { waypoints_callback(msg); },
+        opts_target
+    );
+
     fold_feedback_sub_ = nh->create_subscription<std_msgs::msg::Bool>(
         config.fold_feedback_topic_name,
         rclcpp::QoS(10),
@@ -212,17 +219,22 @@ void GlobalPlanner2d::set_current_state(const utils::RobotState& pose, const Eig
     current_XYTheta = xytheta;
 }
 
-auto GlobalPlanner2d::get_goal_pose() const -> std::optional<utils::RobotState> {
+auto GlobalPlanner2d::is_nav_task_current(uint64_t expected_gen) const -> bool {
     std::lock_guard<std::mutex> lock(nav_task_mtx_);
-    return goal_pose;
+    return nav_task_gen_ == expected_gen && !goal_poses_.empty();
 }
 
-void GlobalPlanner2d::finish_nav_task(replan::FsmReplan::PathState state) {
+void GlobalPlanner2d::finish_nav_task(replan::FsmReplan::PathState state, uint64_t expected_gen) {
     {
         std::lock_guard<std::mutex> lock(nav_task_mtx_);
+        if (nav_task_gen_ != expected_gen) {
+            return;
+        }
         nav_state = state;
-        goal_pose.reset();
+        goal_poses_.clear();
         plan_start_time_sec_.reset();
+        segment_start_time_sec_.reset();
+        last_active_goal_idx_ = 0;
     }
     nav_feedback_pub_->publish(pub_nav_feedback());
 }
@@ -434,66 +446,109 @@ void GlobalPlanner2d::planner_callback() {
     GlobalPlanner2d::plan_omni();
 }
 void GlobalPlanner2d::plan_omni() {
-    const auto goal_pose_snapshot = get_goal_pose();
-    if (!goal_pose_snapshot.has_value()) {
-        logger::debug(logger::ros2, "no goal");
-        return;
-    }
     const auto current_pose_snapshot = get_current_pose();
     if (!current_pose_snapshot.has_value()) {
         logger::debug(logger::ros2, "no current_pose");
         return;
     }
     const double now = clock_.nowSec();
+    std::vector<utils::RobotState> goals_snapshot;
+    uint64_t task_gen = 0;
+    size_t active_idx_before = 0;
     double deadline = 0.0;
     {
         std::lock_guard<std::mutex> lock(nav_task_mtx_);
+        if (goal_poses_.empty()) {
+            logger::debug(logger::ros2, "no goal");
+            return;
+        }
+        goals_snapshot = goal_poses_;
+        task_gen = nav_task_gen_;
+        active_idx_before = last_active_goal_idx_;
         if (!plan_start_time_sec_.has_value()) {
             plan_start_time_sec_ = now;
         }
-        deadline = plan_start_time_sec_.value() + 20.0;
+        if (!segment_start_time_sec_.has_value()) {
+            segment_start_time_sec_ = now;
+        }
+        deadline = segment_start_time_sec_.value() + config.nav_segment_timeout_sec;
+        if (goals_snapshot.size() > 1 && config.nav_total_timeout_sec > 0.0) {
+            deadline = std::min(deadline, plan_start_time_sec_.value() + config.nav_total_timeout_sec);
+        }
     }
     if (now >= deadline) {
-        logger::warn(logger::ros2, "navigation task exceeded 20s -> nav:failed");
-        finish_nav_task(replan::FsmReplan::PathState::FAILED);
+        logger::warn(logger::ros2, "navigation task exceeded timeout -> nav:failed");
+        finish_nav_task(replan::FsmReplan::PathState::FAILED, task_gen);
         return;
     }
 
-    const double dist_to_goal = (current_pose_snapshot->p.head<2>() - goal_pose_snapshot->p.head<2>()).norm();
-    if (dist_to_goal < config.planner_config.replan_params.goal_reached_radius) {
-        // 到达后收尾，避免重复触发
-        finish_nav_task(replan::FsmReplan::PathState::SUCCESSED);
-        return;
+    // 单点快速到达收尾；多点由 fsm_replanner 顺序过点后在 remaining_goals == 0 时收尾。
+    if (goals_snapshot.size() == 1) {
+        const Eigen::Vector2d cur_xy(current_pose_snapshot->p.x(), current_pose_snapshot->p.y());
+        const Eigen::Vector2d final_xy(goals_snapshot.back().p.x(), goals_snapshot.back().p.y());
+        if ((cur_xy - final_xy).norm() < config.planner_config.replan_params.goal_reached_radius) {
+            finish_nav_task(replan::FsmReplan::PathState::SUCCESSED, task_gen);
+            return;
+        }
     }
 
     // 本次规划全程使用同一份地图快照（双缓冲），地图线程的更新不会改写它。
     const auto plan_map = ma_map_->get_grid_map();
-    auto result = fsm_replanner.plan(goal_pose_snapshot.value(), current_pose_snapshot.value(), plan_map);
+    auto result = fsm_replanner.plan(goals_snapshot, current_pose_snapshot.value(), plan_map);
+    if (!is_nav_task_current(task_gen)) {
+        return;
+    }
     const double finished_at = clock_.nowSec();
     if (finished_at >= deadline) {
-        logger::warn(logger::ros2, "planning result arrived after 20s -> nav:failed");
-        finish_nav_task(replan::FsmReplan::PathState::FAILED);
+        logger::warn(logger::ros2, "planning result arrived after timeout -> nav:failed");
+        finish_nav_task(replan::FsmReplan::PathState::FAILED, task_gen);
         return;
     }
     if (!result) {
         std::lock_guard<std::mutex> lock(nav_task_mtx_);
-        nav_state = replan::FsmReplan::PathState::RUNNING;
+        if (nav_task_gen_ == task_gen) {
+            nav_state = replan::FsmReplan::PathState::RUNNING;
+        }
         return;
     }
     auto path_result = result.value();
 
-    // 规划失败保留当前任务，下一帧继续重试；20 秒期限由上方统一处理。
+    // 规划失败保留当前任务，下一帧继续重试；超时期限由上方统一处理。
     if (path_result.path_state != replan::FsmReplan::PathState::SUCCESSED) {
         logger::debug(logger::ros2, "PathState not SUCCESSED, waiting...");
         std::lock_guard<std::mutex> lock(nav_task_mtx_);
-        nav_state = replan::FsmReplan::PathState::RUNNING;
+        if (nav_task_gen_ == task_gen) {
+            nav_state = replan::FsmReplan::PathState::RUNNING;
+        }
         return;
     }
 
-    // 交接前再次检查，过期结果不能下发给控制器。
+    // 通过中间途径点时刷新单段超时计时（总任务上限不变）。
+    if (path_result.active_goal_index > active_idx_before) {
+        std::lock_guard<std::mutex> lock(nav_task_mtx_);
+        if (nav_task_gen_ == task_gen) {
+            last_active_goal_idx_ = path_result.active_goal_index;
+            segment_start_time_sec_ = finished_at;
+            deadline = finished_at + config.nav_segment_timeout_sec;
+            if (goals_snapshot.size() > 1 && config.nav_total_timeout_sec > 0.0 && plan_start_time_sec_.has_value()) {
+                deadline = std::min(deadline, plan_start_time_sec_.value() + config.nav_total_timeout_sec);
+            }
+        }
+    }
+
+    // 多点或单点最终点已到达：立即收尾，不再下发旧轨迹。
+    if (path_result.remaining_goals == 0) {
+        finish_nav_task(replan::FsmReplan::PathState::SUCCESSED, task_gen);
+        return;
+    }
+
+    // 交接前再次检查，过期或已被新任务抢占的结果不能下发给控制器。
+    if (!is_nav_task_current(task_gen)) {
+        return;
+    }
     if (clock_.nowSec() >= deadline) {
         logger::warn(logger::ros2, "planning result expired before handoff -> nav:failed");
-        finish_nav_task(replan::FsmReplan::PathState::FAILED);
+        finish_nav_task(replan::FsmReplan::PathState::FAILED, task_gen);
         return;
     }
 
@@ -707,7 +762,7 @@ void GlobalPlanner2d::target_callback(const geometry_msgs::msg::PoseStamped::Sha
         return;
     }
     const Eigen::Vector3d goal(goal_xy.x(), goal_xy.y(), 1.0);
-    if (old_goal_pose_ == goal) {
+    if (old_goal_pose_.has_value() && old_goal_pose_.value() == goal) {
         //logger::warn(logger::ros2,"old_goal_pose_==goal");
         return;
     }
@@ -735,18 +790,121 @@ void GlobalPlanner2d::target_callback(const geometry_msgs::msg::PoseStamped::Sha
             return;
         }
     }
-    utils::RobotState temp_goal_pose;
+    utils::RobotState temp_goal_pose {};
     temp_goal_pose.p = goal;
     temp_goal_pose.yaw = atan2(msg->pose.orientation.z, msg->pose.orientation.w) * 2.0;
-    // goal/nav_state/plan_start_time_sec_ 会被 planner 组并发读取，短临界区内整体更新。
+    const double now_sec = clock_.nowSec();
+    // goal_poses_/nav_state/计时字段会被 planner 组并发读取，短临界区内整体更新。
     {
         std::lock_guard<std::mutex> lock(nav_task_mtx_);
-        goal_pose = temp_goal_pose;
+        goal_poses_.assign(1, temp_goal_pose);
         nav_state = replan::FsmReplan::PathState::RUNNING;
         //logger::info(logger::ros2, "set goal success");
-        plan_start_time_sec_ = clock_.nowSec();
+        plan_start_time_sec_ = now_sec;
+        segment_start_time_sec_ = now_sec;
+        last_active_goal_idx_ = 0;
+        ++nav_task_gen_;
     }
     old_goal_pose_ = goal;
+    old_waypoints_.clear();
+}
+
+void GlobalPlanner2d::waypoints_callback(const nav_msgs::msg::Path::SharedPtr& msg) {
+    warn_frame_mismatch_once(waypoints_frame_warned_, config.waypoints_topic_name, msg->header.frame_id, frame_id);
+    if (!mapInitialized) {
+        logger::warn(logger::ros2, "map no init");
+        return;
+    }
+    const int max_waypoints = std::max(1, config.planner_config.replan_params.max_waypoints);
+    if (msg->poses.empty() || static_cast<int>(msg->poses.size()) > max_waypoints) {
+        logger::warn(
+            logger::ros2,
+            "Reject waypoints path with invalid size {} (allowed 1..{})",
+            msg->poses.size(),
+            max_waypoints
+        );
+        return;
+    }
+
+    std::vector<Eigen::Vector2d> raw_xy;
+    std::vector<utils::RobotState> parsed_goals;
+    raw_xy.reserve(msg->poses.size());
+    parsed_goals.reserve(msg->poses.size());
+    for (size_t i = 0; i < msg->poses.size(); ++i) {
+        const auto& ps = msg->poses[i];
+        warn_frame_mismatch_once(waypoints_frame_warned_, config.waypoints_topic_name, ps.header.frame_id, frame_id);
+        const Eigen::Vector2d xy(ps.pose.position.x, ps.pose.position.y);
+        if (!xy.allFinite()) {
+            logger::warn(logger::ros2, "Reject waypoints path: non-finite pose at index {}", i);
+            return;
+        }
+        raw_xy.push_back(xy);
+        utils::RobotState st {};
+        st.p = Eigen::Vector3d(xy.x(), xy.y(), 1.0);
+        st.yaw = std::atan2(ps.pose.orientation.z, ps.pose.orientation.w) * 2.0;
+        parsed_goals.push_back(st);
+    }
+
+    // 原始点列去重：避免上层高频重发同一路径反复重置途径点进度与重规划。
+    if (old_waypoints_.size() == raw_xy.size()) {
+        bool same = true;
+        for (size_t i = 0; i < raw_xy.size(); ++i) {
+            if ((old_waypoints_[i] - raw_xy[i]).squaredNorm() > 1e-12) {
+                same = false;
+                break;
+            }
+        }
+        if (same) {
+            return;
+        }
+    }
+
+    if (config.mapping_model) {
+        for (size_t i = 0; i < raw_xy.size(); ++i) {
+            if (!ma_map_->ensure_covers(raw_xy[i])) {
+                logger::warn(
+                    logger::ros2,
+                    "Reject waypoints path: pose[{}] ({:.2f}, {:.2f}) outside mapping max_map_size",
+                    i,
+                    raw_xy[i].x(),
+                    raw_xy[i].y()
+                );
+                return;
+            }
+        }
+    } else {
+        const auto snap = ma_map_->get_grid_map();
+        if (!snap) {
+            logger::warn(logger::ros2, "Reject waypoints path: navigation map snapshot unavailable");
+            return;
+        }
+        for (size_t i = 0; i < raw_xy.size(); ++i) {
+            if (!snap->isInsideMap(raw_xy[i])) {
+                logger::warn(
+                    logger::ros2,
+                    "Reject waypoints path: pose[{}] ({:.2f}, {:.2f}) outside loaded navigation map bounds",
+                    i,
+                    raw_xy[i].x(),
+                    raw_xy[i].y()
+                );
+                return;
+            }
+        }
+    }
+
+    const double now_sec = clock_.nowSec();
+    {
+        std::lock_guard<std::mutex> lock(nav_task_mtx_);
+        goal_poses_ = std::move(parsed_goals);
+        nav_state = replan::FsmReplan::PathState::RUNNING;
+        plan_start_time_sec_ = now_sec;
+        segment_start_time_sec_ = now_sec;
+        last_active_goal_idx_ = 0;
+        ++nav_task_gen_;
+    }
+    old_waypoints_ = std::move(raw_xy);
+    old_goal_pose_.reset();
+    logger::info(logger::ros2, "Accepted waypoints path with {} poses", old_waypoints_.size());
 }
 
 void GlobalPlanner2d::publish_clicked_regions() {

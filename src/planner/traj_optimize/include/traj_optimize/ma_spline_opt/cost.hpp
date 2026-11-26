@@ -1,4 +1,5 @@
 #pragma once
+#include "optimizer_config.h"
 #include "traj_optimize/esdf_Interface.hpp"
 #include "SplineTrajectory/SplineOptimizer.hpp"
 
@@ -244,6 +245,63 @@ struct TimeCost
                     }
                 }
             }
+        }
+
+        return cost;
+    }
+};
+
+// 中间途径点 C^2 光滑死区软球约束：
+// ||q_k - w|| <= pass_radius 时零代价零梯度；超出时施加梯度有界（<= weight）的拉回惩罚。
+struct ViaPointsCost {
+    const std::vector<ViaPointAnchor>* anchors = nullptr;
+
+    static inline void smoothedL1(double x, double& f, double& df) {
+        constexpr double pe = 1e-2;
+        const double f3c = 1.0 / (pe * pe);
+        const double f4c = -0.5 * f3c / pe;
+
+        if (x <= 0.0) {
+            f = 0.0;
+            df = 0.0;
+        } else if (x < pe) {
+            f = (f4c * x + f3c) * x * x * x;
+            df = (4.0 * f4c * x + 3.0 * f3c) * x * x;
+        } else {
+            f = x - 0.5 * pe;
+            df = 1.0;
+        }
+    }
+
+    template<typename WaypointsType, typename GradMatrixType>
+    double operator()(const WaypointsType& waypoints, GradMatrixType& grad_q) const {
+        if (!anchors || anchors->empty()) {
+            return 0.0;
+        }
+
+        const Eigen::Index rows = waypoints.rows();
+        constexpr double kEps2 = 1e-8;
+        double cost = 0.0;
+
+        for (const auto& anchor: *anchors) {
+            if (anchor.knot_index <= 0 || anchor.knot_index >= rows - 1 || anchor.weight <= 0.0) {
+                continue;
+            }
+            const double dx = waypoints(anchor.knot_index, 0) - anchor.target.x();
+            const double dy = waypoints(anchor.knot_index, 1) - anchor.target.y();
+            const double dist = std::sqrt(dx * dx + dy * dy + kEps2);
+            const double excess = dist - std::max(0.0, anchor.pass_radius);
+            if (excess <= 0.0) {
+                continue;
+            }
+
+            double f = 0.0;
+            double df = 0.0;
+            smoothedL1(excess, f, df);
+            cost += anchor.weight * f;
+            const double scale = anchor.weight * df / dist;
+            grad_q(anchor.knot_index, 0) += scale * dx;
+            grad_q(anchor.knot_index, 1) += scale * dy;
         }
 
         return cost;

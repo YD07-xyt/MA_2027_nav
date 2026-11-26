@@ -70,6 +70,8 @@ private:
     bool odom_frame_warned_ = false;
     bool map_odom_frame_warned_ = false;
     bool target_frame_warned_ = false;
+    bool waypoints_frame_warned_ = false;
+
 private:
     rclcpp::CallbackGroup::SharedPtr map_cb_group_;
     rclcpp::CallbackGroup::SharedPtr planner_cb_group_;
@@ -95,6 +97,7 @@ private:
 
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr map_sub_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr target_sub_;
+    rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr waypoints_sub_;
     rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr clickedPoint_sub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
     // 可选：建图专用位姿（与点云同状态/同时间戳），控制仍用 odom_sub_。
@@ -118,7 +121,7 @@ private:
     rclcpp::TimerBase::SharedPtr controller_timer_;
     rclcpp::TimerBase::SharedPtr pub_viz_timer_;
     std::optional<utils::RobotState> current_pose = std::nullopt;
-    std::optional<utils::RobotState> goal_pose = std::nullopt;
+    std::vector<utils::RobotState> goal_poses_;
     std::optional<Eigen::Vector3d> current_XYTheta = std::nullopt;
     std::atomic<bool> mapInitialized;
     // 导航模式下静态先验图是否成功加载；失败时 map_callback 不得把 mapInitialized 置 true。
@@ -127,12 +130,16 @@ private:
     Visualizer visualizer;
 
 private:
-    Eigen::Vector3d old_goal_pose_=Eigen::Vector3d::Zero();
+    std::optional<Eigen::Vector3d> old_goal_pose_;
+    std::vector<Eigen::Vector2d> old_waypoints_;
     //地图
     std::shared_ptr<ma_map::MaMap> ma_map_;
     //重规划
     replan::FsmReplan fsm_replanner;
     std::optional<double> plan_start_time_sec_;
+    std::optional<double> segment_start_time_sec_;
+    size_t last_active_goal_idx_ = 0;
+    uint64_t nav_task_gen_ = 0;
     replan::FsmReplan::PathState nav_state;
     auto pub_nav_feedback() -> std_msgs::msg::Int16;
     //FSM fsm_;
@@ -143,9 +150,9 @@ private:
     auto get_current_pose() const -> std::optional<utils::RobotState>;
     auto get_current_xytheta() const -> std::optional<Eigen::Vector3d>;
     void set_current_state(const utils::RobotState& pose, const Eigen::Vector3d& xytheta);
-    auto get_goal_pose() const -> std::optional<utils::RobotState>;
-    // 结束当前导航任务（成功/失败共用）：清空 goal 与计时并按状态发布 nav_feedback。
-    void finish_nav_task(replan::FsmReplan::PathState state);
+    auto is_nav_task_current(uint64_t expected_gen) const -> bool;
+    // 结束当前导航任务（成功/失败共用）：仅当代际仍匹配时清空目标与计时并发布 nav_feedback。
+    void finish_nav_task(replan::FsmReplan::PathState state, uint64_t expected_gen);
 
 private:
     control::Mpc<control::MaSplineTrajectoryInterface> mpc_;
@@ -178,6 +185,7 @@ public:
     // 建图位姿回调：把 world->IMU 的后验位姿转换到 base 后送入地图。
     void map_odom_callback(const nav_msgs::msg::Odometry::SharedPtr& msg);
     void target_callback(const geometry_msgs::msg::PoseStamped::SharedPtr& msg);
+    void waypoints_callback(const nav_msgs::msg::Path::SharedPtr& msg);
     void clicked_point_callback(const geometry_msgs::msg::PointStamped::SharedPtr& msg);
     void planner_callback();
     void controller_callback();

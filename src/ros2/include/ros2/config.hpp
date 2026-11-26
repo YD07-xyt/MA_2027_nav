@@ -211,6 +211,13 @@ inline void load_ma_spline_opt_config(const YAML::Node& node, ma_spline_opt::MaS
     if (node["v_max"]) param.v_max = node["v_max"].as<double>();
     if (node["a_max"]) param.a_max = node["a_max"].as<double>();
     if (node["integral_num_steps"]) param.integral_num_steps = node["integral_num_steps"].as<int>();
+    if (node["via_point_weight"]) {
+        const double v = node["via_point_weight"].as<double>();
+        if (!std::isfinite(v) || v < 0.0) {
+            throw std::invalid_argument("planner_config.ma_spline_opt_params.via_point_weight must be finite and >= 0");
+        }
+        param.via_point_weight = v;
+    }
 
     if (node["weight_yaw_vel"]) param.weight_yaw_vel = node["weight_yaw_vel"].as<double>();
     if (node["weight_yaw_acc"]) param.weight_yaw_acc = node["weight_yaw_acc"].as<double>();
@@ -246,6 +253,35 @@ inline void load_replan_param(const YAML::Node& node, replan::FsmReplan::ReplanP
     if (node["start_oob_recover_dist"]) {
         const double v = node["start_oob_recover_dist"].as<double>();
         param.start_oob_recover_dist = (std::isfinite(v) && v >= 0.0) ? v : 0.3;
+    }
+    auto load_non_neg = [&](const char* key, double& dst) {
+        if (!node[key]) return;
+        const double v = node[key].as<double>();
+        if (!std::isfinite(v) || v < 0.0) {
+            throw std::invalid_argument(
+                std::string("planner_config.replan_params.") + key + " must be finite and >= 0"
+            );
+        }
+        dst = v;
+    };
+    load_non_neg("via_pass_radius", param.via_pass_radius);
+    load_non_neg("via_opt_radius", param.via_opt_radius);
+    load_non_neg("via_time_pass_hysteresis", param.via_time_pass_hysteresis);
+    load_non_neg("via_min_spacing", param.via_min_spacing);
+    if (node["horizon_length"]) {
+        const double v = node["horizon_length"].as<double>();
+        if (!std::isfinite(v)) {
+            throw std::invalid_argument("planner_config.replan_params.horizon_length must be finite");
+        }
+        param.horizon_length = v;
+    }
+    load_non_neg("horizon_replan_dist", param.horizon_replan_dist);
+    if (node["max_waypoints"]) {
+        const int v = node["max_waypoints"].as<int>();
+        if (v < 1) {
+            throw std::invalid_argument("planner_config.replan_params.max_waypoints must be >= 1");
+        }
+        param.max_waypoints = v;
     }
 }
 
@@ -367,7 +403,10 @@ inline void load_mpc_param(const YAML::Node& node, control::MpcParam& param) {
 struct Config {
     std::string map_topic_name;
     std::string target_topic_name;
+    std::string waypoints_topic_name = "/goal_poses";
     std::string clickedPoint_topic_name;
+    double nav_segment_timeout_sec = 20.0; // 单段（每经过一个途径点刷新）任务超时 (s)，> 0
+    double nav_total_timeout_sec = 60.0; // 多点总任务超时上限 (s)，>= 0（0 表示关闭总上限）
     std::string odom_topic_name;
     // 建图位姿话题：须与点云同一状态/同一时间戳；为空则沿用 odom_topic_name。
     std::string map_odom_topic_name;
@@ -400,6 +439,26 @@ struct Config {
             if (config["ros2"]["frame_id"]) frame_id = config["ros2"]["frame_id"].as<std::string>();
             map_topic_name = config["ros2"]["map_topic_name"].as<std::string>();
             target_topic_name = config["ros2"]["target_topic_name"].as<std::string>();
+            if (config["ros2"]["waypoints_topic_name"]) {
+                waypoints_topic_name = config["ros2"]["waypoints_topic_name"].as<std::string>();
+                if (waypoints_topic_name.empty()) {
+                    throw std::invalid_argument("ros2.waypoints_topic_name must not be empty");
+                }
+            }
+            if (config["ros2"]["nav_segment_timeout_sec"]) {
+                const double v = config["ros2"]["nav_segment_timeout_sec"].as<double>();
+                if (!std::isfinite(v) || v <= 0.0) {
+                    throw std::invalid_argument("ros2.nav_segment_timeout_sec must be finite and > 0");
+                }
+                nav_segment_timeout_sec = v;
+            }
+            if (config["ros2"]["nav_total_timeout_sec"]) {
+                const double v = config["ros2"]["nav_total_timeout_sec"].as<double>();
+                if (!std::isfinite(v) || v < 0.0) {
+                    throw std::invalid_argument("ros2.nav_total_timeout_sec must be finite and >= 0");
+                }
+                nav_total_timeout_sec = v;
+            }
             clickedPoint_topic_name = config["ros2"]["clickedPoint_topic_name"].as<std::string>();
             odom_topic_name = config["ros2"]["odom_topic_name"].as<std::string>();
             if (config["ros2"]["map_odom_topic_name"]) {

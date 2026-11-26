@@ -52,6 +52,9 @@ struct MaSplineOptimizerConfig {
     // 积分采样
     int integral_num_steps = 8;
 
+    // 中间途径点软球拉回权重（须 << stage2.weight_obstacle，保证安全避障优先）
+    double via_point_weight = 600.0;
+
     // ========== 两次优化参数分开 ==========
     StageOptimizerConfig stage1;
     StageOptimizerConfig stage2;
@@ -62,9 +65,17 @@ struct TimedReferencePoint {
     Eigen::Vector2d pos = Eigen::Vector2d::Zero();
     double yaw = 0.0;
 };
+// 中间途径点软球约束锚点（容忍半径内零惩罚，允许平滑高速通过不减速）
+struct ViaPointAnchor {
+    int knot_index = -1; // 对应 timed_trajectory / 样条内部节点索引 [1, N-1]
+    Eigen::Vector2d target = Eigen::Vector2d::Zero();
+    double pass_radius = 0.35; // 死区容忍半径 r_via (m)，>= 0
+    double weight = 600.0; // 拉回权重（须 << stage2.weight_obstacle）
+};
 enum OptModel { OMNI_XY, OMNI_XY_YAW_JOINT };
 struct MaSplineInput {
     std::vector<TimedReferencePoint> timed_trajectory;
+    std::vector<ViaPointAnchor> via_anchors;
     OptModel model;
     Eigen::Vector2d start_vel = Eigen::Vector2d::Zero();
     Eigen::Vector2d start_acc = Eigen::Vector2d::Zero();
@@ -92,6 +103,8 @@ struct MAsplineOutput {
     SplineTrajectory::QuinticSplineND<3> trajectory;//xy_yaw_spline;
 
     BrakeSegment brake; // 刹车段在前，样条从刹停点开始
+    // 各中间途径点在执行轨迹局部时间轴上的时刻 (s)；优化器输出相对样条起点，拼入刹车段后由调用方偏移 brake.duration
+    std::vector<double> via_anchor_times;
 
     double cost = 0.0;
     bool success = false;

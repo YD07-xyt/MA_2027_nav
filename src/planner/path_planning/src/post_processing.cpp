@@ -1,4 +1,8 @@
 #include "path_planning/post_processing.h"
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <utility>
 
 namespace path_planning {
 auto PathPostProcessing::optimize_path(const grid_map::GridMap& map, const std::vector<Eigen::Vector2d>& path)
@@ -120,6 +124,13 @@ auto PathPostProcessing::normalize_angle(double ref_angle, double& angle) const 
 }
 
 auto PathPostProcessing::assign_trajectory_timing(Trajectory& traj) -> void {
+    assign_trajectory_timing_with_anchors(traj, {});
+}
+
+auto PathPostProcessing::assign_trajectory_timing_with_anchors(
+    Trajectory& traj,
+    const std::vector<size_t>& opt_via_indices
+) -> void {
     /**1. 高密度采样
         -> 保留路径细节，避免拐角信息丢失
 
@@ -132,9 +143,10 @@ auto PathPostProcessing::assign_trajectory_timing(Trajectory& traj) -> void {
         4. min/max waypoints
         -> 优化变量数量可控，不会因为 time_resolution 太小而爆炸
 
-        5. 均匀初始时间
-        -> 每段时间相等，优化器在此基础上微调 */
+        5. 均匀/保锚点初始时间
+        -> 单点均匀分配；多点在各子段按时长比例分配并精确保留途径点锚点 */
 
+    traj.via_knot_indices.clear();
     if (traj.optimized_path.size() < 2) return;
 
     // ============================================================
@@ -142,6 +154,8 @@ auto PathPostProcessing::assign_trajectory_timing(Trajectory& traj) -> void {
     // ============================================================
 
     std::vector<DenseSample> dense;
+    std::vector<size_t> dense_via_indices(opt_via_indices.size(), 0);
+    size_t next_via = 0;
 
     // 起点
     Eigen::Vector2d start_pos = traj.optimized_path.front();
@@ -192,6 +206,13 @@ auto PathPostProcessing::assign_trajectory_timing(Trajectory& traj) -> void {
             accumulated_equiv += ds_equiv;
 
             dense.push_back({accumulated_linear, accumulated_equiv, 0.0, pos, yaw});
+        }
+
+        while (next_via < opt_via_indices.size() && opt_via_indices[next_via] <= i) {
+            if (opt_via_indices[next_via] == i) {
+                dense_via_indices[next_via] = dense.size() - 1;
+            }
+            ++next_via;
         }
 
         last_pos = curr_pos;
@@ -245,21 +266,6 @@ auto PathPostProcessing::assign_trajectory_timing(Trajectory& traj) -> void {
 
     traj.total_time = total_time;
 
-    // ============================================================
-    // 4. 限制 min/max waypoints，生成均匀初始时间
-    // ============================================================
-    int num_segments = static_cast<int>(std::lround(total_time / params_.time_resolution));
-
-    num_segments = std::max(params_.min_traj_num, num_segments);
-    num_segments = std::min(params_.max_traj_num, num_segments);
-
-    const double sample_time = total_time / num_segments;
-
-    traj.time_segments = Eigen::VectorXd::Constant(num_segments, sample_time);
-
-    // ============================================================
-    // 5. 按均匀时间重采样 timed_trajectory
-    // ============================================================
     auto interpolateDense = [&](double t) -> std::pair<Eigen::Vector2d, double> {
         if (t <= 0.0) return {dense.front().pos, dense.front().yaw};
 
@@ -282,6 +288,106 @@ auto PathPostProcessing::assign_trajectory_timing(Trajectory& traj) -> void {
 
         return {pos, yaw};
     };
+
+    // ============================================================
+    // 4 & 5. 按单点均匀 / 多点保锚点比例重采样 timed_trajectory
+    // ============================================================
+    if (!opt_via_indices.empty()) {
+        traj.via_knot_indices.assign(opt_via_indices.size(), -1);
+        std::vector<double> bound_times = {0.0};
+        std::vector<int> via_to_bound(opt_via_indices.size(), -1);
+        constexpr double kMinLegTime = 1e-3;
+        for (size_t m = 0; m < opt_via_indices.size(); ++m) {
+            const size_t d_idx = dense_via_indices[m];
+            if (d_idx == 0 || d_idx >= dense.size() - 1) {
+                continue;
+            }
+            const double t_via = dense[d_idx].time;
+            if (t_via >= total_time - kMinLegTime) {
+                continue;
+            }
+            if (t_via <= bound_times.back() + kMinLegTime) {
+                if (bound_times.size() > 1) {
+                    via_to_bound[m] = static_cast<int>(bound_times.size()) - 1;
+                }
+                continue;
+            }
+            via_to_bound[m] = static_cast<int>(bound_times.size());
+            bound_times.push_back(t_via);
+        }
+        bound_times.push_back(total_time);
+
+        const int num_legs = static_cast<int>(bound_times.size()) - 1;
+        if (num_legs >= 2) {
+            std::vector<double> leg_dur(static_cast<size_t>(num_legs), 0.0);
+            for (int l = 0; l < num_legs; ++l) {
+                leg_dur[static_cast<size_t>(l)] =
+                    bound_times[static_cast<size_t>(l + 1)] - bound_times[static_cast<size_t>(l)];
+            }
+
+            const int min_segs = std::max(params_.min_traj_num, num_legs);
+            const int max_segs = std::max(params_.max_traj_num, min_segs);
+            int num_segments = static_cast<int>(std::lround(total_time / std::max(params_.time_resolution, 1e-3)));
+            num_segments = std::clamp(num_segments, min_segs, max_segs);
+
+            std::vector<int> leg_segs(static_cast<size_t>(num_legs), 1);
+            const int rem = num_segments - num_legs;
+            std::vector<std::pair<double, int>> remainders;
+            remainders.reserve(static_cast<size_t>(num_legs));
+            int assigned = num_legs;
+            for (int l = 0; l < num_legs; ++l) {
+                const double exact = static_cast<double>(rem) * leg_dur[static_cast<size_t>(l)] / total_time;
+                const int floor_add = static_cast<int>(std::floor(exact));
+                leg_segs[static_cast<size_t>(l)] += floor_add;
+                assigned += floor_add;
+                remainders.emplace_back(exact - static_cast<double>(floor_add), l);
+            }
+            std::sort(remainders.begin(), remainders.end(), [](const auto& a, const auto& b) {
+                return a.first > b.first;
+            });
+            for (int i = 0; i < (num_segments - assigned) && i < num_legs; ++i) {
+                leg_segs[static_cast<size_t>(remainders[static_cast<size_t>(i)].second)] += 1;
+            }
+
+            std::vector<int> bound_to_knot(bound_times.size(), -1);
+            bound_to_knot[0] = 0;
+            traj.timed_trajectory.clear();
+            traj.timed_trajectory.reserve(static_cast<size_t>(num_segments + 1));
+            traj.time_segments.resize(num_segments);
+
+            const auto [p0, yaw0] = interpolateDense(0.0);
+            traj.timed_trajectory.push_back({Eigen::Vector3d(p0.x(), p0.y(), yaw0), 0.0});
+
+            int seg_cursor = 0;
+            for (int l = 0; l < num_legs; ++l) {
+                const int segs = leg_segs[static_cast<size_t>(l)];
+                const double t_start = bound_times[static_cast<size_t>(l)];
+                const double dt_leg = leg_dur[static_cast<size_t>(l)] / static_cast<double>(segs);
+                for (int s = 1; s <= segs; ++s) {
+                    const double t = (s == segs) ? bound_times[static_cast<size_t>(l + 1)] : (t_start + s * dt_leg);
+                    const auto [pos, yaw] = interpolateDense(t);
+                    traj.timed_trajectory.push_back({Eigen::Vector3d(pos.x(), pos.y(), yaw), t});
+                    traj.time_segments[seg_cursor++] = dt_leg;
+                }
+                bound_to_knot[static_cast<size_t>(l + 1)] = static_cast<int>(traj.timed_trajectory.size()) - 1;
+            }
+            for (size_t m = 0; m < opt_via_indices.size(); ++m) {
+                if (via_to_bound[m] > 0) {
+                    traj.via_knot_indices[m] = bound_to_knot[static_cast<size_t>(via_to_bound[m])];
+                }
+            }
+            return;
+        }
+    }
+
+    int num_segments = static_cast<int>(std::lround(total_time / params_.time_resolution));
+
+    num_segments = std::max(params_.min_traj_num, num_segments);
+    num_segments = std::min(params_.max_traj_num, num_segments);
+
+    const double sample_time = total_time / num_segments;
+
+    traj.time_segments = Eigen::VectorXd::Constant(num_segments, sample_time);
 
     traj.timed_trajectory.clear();
     traj.timed_trajectory.reserve(num_segments + 1);

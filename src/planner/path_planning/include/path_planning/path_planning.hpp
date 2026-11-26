@@ -37,5 +37,18 @@ public:
         double goal_yaw,
         int timeout_ms
     ) -> std::optional<PathPostProcessing::Trajectory>;
+
+    // 多点途经规划：按序分段搜索与分段剪枝（保留中间途径点拓扑），整体连续速度传播且中间不减速，
+    // 并在 Trajectory::via_knot_indices 返回各中间途径点对应的 timed_trajectory 节点索引。
+    // via_points 为空时直接等价于单点 path_planning；任一子段不可达或总超时返回 std::nullopt。
+    auto path_planning_through_poses(
+        const grid_map::GridMap& grid_map,
+        const Eigen::Vector2d& start,
+        const std::vector<Eigen::Vector2d>& via_points,
+        const Eigen::Vector2d& goal,
+        double start_yaw,
+        double goal_yaw,
+        int timeout_ms
+    ) -> std::optional<PathPostProcessing::Trajectory>;
 };
 }

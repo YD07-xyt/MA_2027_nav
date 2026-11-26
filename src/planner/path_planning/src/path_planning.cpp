@@ -1,4 +1,7 @@
 #include "path_planning/path_planning.hpp"
+#include <algorithm>
+#include <chrono>
+#include <cstddef>
 
 namespace path_planning {
 class PathPlanningImpl {
@@ -59,6 +62,95 @@ public:
         return traj;
     };
 
+    auto path_planning_through_poses(
+        const grid_map::GridMap& grid_map,
+        const Eigen::Vector2d& start,
+        const std::vector<Eigen::Vector2d>& via_points,
+        const Eigen::Vector2d& goal,
+        double start_yaw,
+        double goal_yaw,
+        int timeout_ms
+    ) -> std::optional<PathPostProcessing::Trajectory> {
+        if (via_points.empty()) {
+            return path_planning(grid_map, start, goal, start_yaw, goal_yaw, timeout_ms);
+        }
+
+        utils::TimeConsuming timer("PlanningThroughPoses", false);
+        const auto t_start = std::chrono::steady_clock::now();
+
+        std::vector<Eigen::Vector2d> nodes;
+        nodes.reserve(via_points.size() + 2);
+        nodes.push_back(start);
+        nodes.insert(nodes.end(), via_points.begin(), via_points.end());
+        nodes.push_back(goal);
+
+        PathPostProcessing::Trajectory traj;
+        std::vector<size_t> opt_via_indices;
+        opt_via_indices.reserve(via_points.size());
+
+        const size_t num_legs = nodes.size() - 1;
+        for (size_t l = 0; l < num_legs; ++l) {
+            const auto elapsed_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_start)
+                    .count();
+            const int rem_ms = timeout_ms - static_cast<int>(elapsed_ms);
+            if (rem_ms <= 0) {
+                logger::warn(logger::planning, "多点分段搜索总耗时超限 ({} ms)", timeout_ms);
+                return std::nullopt;
+            }
+
+            const std::vector<Eigen::Vector2d> leg_raw = use_jps_
+                ? jps_.jps_search(grid_map, nodes[l], nodes[l + 1], rem_ms)
+                : astar_.original_astar_search(grid_map, nodes[l], nodes[l + 1], rem_ms);
+            if (leg_raw.empty()) {
+                return std::nullopt;
+            }
+
+            if (traj.raw_path.empty()) {
+                traj.raw_path.insert(traj.raw_path.end(), leg_raw.begin(), leg_raw.end());
+            } else {
+                const size_t begin_idx = ((leg_raw.front() - traj.raw_path.back()).norm() < 1e-6) ? 1 : 0;
+                traj.raw_path.insert(
+                    traj.raw_path.end(),
+                    leg_raw.begin() + static_cast<std::ptrdiff_t>(begin_idx),
+                    leg_raw.end()
+                );
+            }
+
+            const std::vector<Eigen::Vector2d> leg_opt = post_processing_.optimize_path(grid_map, leg_raw);
+            if (leg_opt.empty()) {
+                return std::nullopt;
+            }
+            if (traj.optimized_path.empty()) {
+                traj.optimized_path.insert(traj.optimized_path.end(), leg_opt.begin(), leg_opt.end());
+            } else {
+                const size_t begin_idx = ((leg_opt.front() - traj.optimized_path.back()).norm() < 1e-6) ? 1 : 0;
+                traj.optimized_path.insert(
+                    traj.optimized_path.end(),
+                    leg_opt.begin() + static_cast<std::ptrdiff_t>(begin_idx),
+                    leg_opt.end()
+                );
+            }
+
+            if (l + 1 < num_legs) {
+                opt_via_indices.push_back(traj.optimized_path.size() - 1);
+            }
+        }
+
+        if (traj.optimized_path.size() < 2) {
+            return std::nullopt;
+        }
+
+        traj.path_states = post_processing_.sample_path_states(traj.optimized_path);
+        post_processing_.assign_trajectory_timing_with_anchors(traj, opt_via_indices);
+        post_processing_.fill_additional_trajectory_info(traj, start, goal, start_yaw, goal_yaw);
+        if (traj.timed_trajectory.empty() || traj.total_time <= 1e-6) {
+            logger::warn(logger::planning, "多点规划生成的轨迹没有有效时间，已丢弃");
+            return std::nullopt;
+        }
+        return traj;
+    };
+
 private:
     AStar astar_;
     JPS jps_;
@@ -92,5 +184,17 @@ auto PathPlanning::path_planning(
     int timeout_ms
 ) -> std::optional<PathPostProcessing::Trajectory> {
     return impl_->path_planning(grid_map, start, goal, start_yaw, goal_yaw, timeout_ms);
+};
+
+auto PathPlanning::path_planning_through_poses(
+    const grid_map::GridMap& grid_map,
+    const Eigen::Vector2d& start,
+    const std::vector<Eigen::Vector2d>& via_points,
+    const Eigen::Vector2d& goal,
+    double start_yaw,
+    double goal_yaw,
+    int timeout_ms
+) -> std::optional<PathPostProcessing::Trajectory> {
+    return impl_->path_planning_through_poses(grid_map, start, via_points, goal, start_yaw, goal_yaw, timeout_ms);
 };
 };

@@ -4,6 +4,9 @@ ros2:
   frame_id: "map"   # 全局坐标系：所有发布的地图/路径/marker 统一使用；须与点云、里程计 header.frame_id 一致（LIO 发 world，本节点不做 TF 变换）
   map_topic_name: "/localization/lio_world_cloud"          # 点云输入话题 (sensor_msgs/PointCloud2)，全局坐标系，用于实时建图/更新
   target_topic_name: "/goal_pose"             # 目标点输入话题 (geometry_msgs/PoseStamped)，全局坐标系，RViz 或上层下发目标
+  waypoints_topic_name: "/goal_poses"         # 多点途经输入话题 (nav_msgs/Path)，全局坐标系，中间点不减速通过、仅末尾点刹停
+  nav_segment_timeout_sec: 20.0               # 单段任务超时 (s)，须 > 0；多点任务每通过一个途径点刷新一次，单点任务等价于总超时
+  nav_total_timeout_sec: 60.0                 # 多点总任务超时上限 (s)，须 >= 0（0 表示关闭总上限；单点任务不生效）
   clickedPoint_topic_name: "/clicked_point"   # RViz 点选话题 (geometry_msgs/PointStamped)，全局坐标系；每点 4 个点生成并自动保存一个隧道多边形
   odom_topic_name: "/localization/body_odometry"           # 控制/规划用里程计话题 (nav_msgs/Odometry)，全局坐标系；提供位置/速度/姿态；当 map_odom_topic_name 为空时也用于建图
   map_odom_topic_name: ""            # 可选：建图专用位姿话题 (nav_msgs/Odometry)，须与点云同一状态/同一时间戳；为空则沿用 odom_topic_name
@@ -49,6 +52,7 @@ planner_config:
     v_max: 3.0              # 后端两阶段公用 2D 合速度约束上限 (m/s)，惩罚 ||v||² > v_max²
     a_max: 3.0              # 后端两阶段公用 2D 合加速度约束上限 (m/s²)，惩罚 ||a||² > a_max²
     integral_num_steps: 8   # 每段五次样条的数值积分采样步数 K；越大避障与动力学约束越精细，但优化耗时线性增加
+    via_point_weight: 600.0 # 多点途经软球拉回权重（须 >= 0 且远小于 stage2.weight_obstacle，保证安全避障优先）
 
     # [当前未启用] 仅在 OptModel::OMNI_XY_YAW_JOINT (3D 联合优化) 生效；config.hpp 仍保留读取，但当前线上固定走 OMNI_XY
     # weight_yaw_vel: 40.0  # yaw 角速度超限惩罚权重
@@ -106,6 +110,14 @@ planner_config:
     brake_acc: 6.0         # 常规反向刹车减速度 (m/s²)
     brake_acc_max: 10.0    # 刹车距离不够时最多提到该值 (m/s²)，仍不够则急停发零速；注释建议 ≤ 底盘能力且 ≤ MPC u_max（注意当前 MPC u_max 为 3.0）
     start_oob_recover_dist: 0.3  # 导航模式下起点轻微越界允许沿虚拟墙向内恢复的最大距离 (m)
+    # 多点途经导航参数（单点 /goal_pose 不生效）
+    via_pass_radius: 0.5            # 中间途径点通过判定半径 (m)，须 >= 0
+    via_opt_radius: 0.35            # 后端样条软球死区半径 (m)，须 >= 0（运行期夹紧至 <= via_pass_radius），死区内零惩罚允许高速切弯
+    via_time_pass_hysteresis: 0.15  # 轨迹时间锚点越过判据的滞回时间 (s)，须 >= 0；绕障无法进入 via_pass_radius 时按轨迹进度自动推进不回头
+    via_min_spacing: 0.25           # 相邻冗余中间途径点自动合并间距 (m)，须 >= 0（始终保留最终点）
+    horizon_length: 12.0            # 滑动规划视野长度 (m)；<= 0 表示不截断全量规划
+    horizon_replan_dist: 6.0        # 有后续未纳入点时触发滚动延伸的剩余弧长阈值 (m)，须 >= 0（运行期夹紧至 <= 0.7*horizon_length）
+    max_waypoints: 64               # 单次多点任务允许的最大航点数上限，须 >= 1
 
   # ---------- 闭环云台折叠与洞口虚拟门禁参数 ----------
   fold_params:

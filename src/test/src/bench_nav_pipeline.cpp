@@ -238,6 +238,7 @@ auto load_planner_config(const YAML::Node& root) -> replan::FsmReplan::PlannerCo
         if (opt["v_max"]) o.v_max = opt["v_max"].as<double>();
         if (opt["a_max"]) o.a_max = opt["a_max"].as<double>();
         if (opt["integral_num_steps"]) o.integral_num_steps = opt["integral_num_steps"].as<int>();
+        if (opt["via_point_weight"]) o.via_point_weight = opt["via_point_weight"].as<double>();
         if (opt["weight_yaw_vel"]) o.weight_yaw_vel = opt["weight_yaw_vel"].as<double>();
         if (opt["weight_yaw_acc"]) o.weight_yaw_acc = opt["weight_yaw_acc"].as<double>();
         if (opt["yaw_rate_max"]) o.yaw_rate_max = opt["yaw_rate_max"].as<double>();
@@ -257,6 +258,13 @@ auto load_planner_config(const YAML::Node& root) -> replan::FsmReplan::PlannerCo
         if (rp["brake_acc"]) r.brake_acc = rp["brake_acc"].as<double>();
         if (rp["brake_acc_max"]) r.brake_acc_max = rp["brake_acc_max"].as<double>();
         if (rp["start_oob_recover_dist"]) r.start_oob_recover_dist = rp["start_oob_recover_dist"].as<double>();
+        if (rp["via_pass_radius"]) r.via_pass_radius = rp["via_pass_radius"].as<double>();
+        if (rp["via_opt_radius"]) r.via_opt_radius = rp["via_opt_radius"].as<double>();
+        if (rp["via_time_pass_hysteresis"]) r.via_time_pass_hysteresis = rp["via_time_pass_hysteresis"].as<double>();
+        if (rp["via_min_spacing"]) r.via_min_spacing = rp["via_min_spacing"].as<double>();
+        if (rp["horizon_length"]) r.horizon_length = rp["horizon_length"].as<double>();
+        if (rp["horizon_replan_dist"]) r.horizon_replan_dist = rp["horizon_replan_dist"].as<double>();
+        if (rp["max_waypoints"]) r.max_waypoints = rp["max_waypoints"].as<int>();
     }
     return cfg;
 }
@@ -2762,6 +2770,72 @@ auto run_sanity_checks(BenchEnv& env) -> bool {
                 ok &= check(
                     r_brake_mon.has_value() && !r_brake_mon->is_new_trajectory,
                     "FsmReplan tracks brake segment elapsed time via injected utils::Clock"
+                );
+            }
+        }
+
+        // 多点途经规划自检：中间不减速、锚点进度推进不触发重规划、绕障时间越过推进、滑动视野滚动延伸与非法输入拒收
+        {
+            auto wp_gm = std::make_shared<grid_map::GridMap>();
+            wp_gm->init(10.0, 10.0, 4.0, 4.0, 0.05, grid_map::OutOfBoundsPolicy::OCCUPIED);
+            grid_map::RowMatrixXi wp_occ = grid_map::RowMatrixXi::Zero(400, 160);
+            ok &= check(wp_gm->overwriteMapAndUpdateEsdf(wp_occ), "Multi-waypoint open GridMap ESDF init");
+
+            replan::FsmReplan wp_fsm(env.planner_cfg);
+            utils::ManualClock wp_clk;
+            wp_clk.setSec(100.0);
+            wp_fsm.set_clock(wp_clk.asClock());
+
+            const utils::RobotState wp_start = make_robot_state(Eigen::Vector2d(-8.0, 0.0));
+            const std::vector<utils::RobotState> wp_goals = {
+                make_robot_state(Eigen::Vector2d(-3.0, 0.0)),
+                make_robot_state(Eigen::Vector2d(2.0, 2.0)),
+                make_robot_state(Eigen::Vector2d(7.0, 2.0)),
+            };
+
+            // 非法空列表拒收
+            const auto r_empty = wp_fsm.plan(std::vector<utils::RobotState> {}, wp_start, wp_gm);
+            ok &= check(
+                !r_empty.has_value() && r_empty.error() == replan::FsmReplan::PathError::PLANNING_FAILED,
+                "FsmReplan rejects empty multi-waypoint goal list"
+            );
+
+            // 首次多点规划成功并产出非零中间点通过速度与时间锚点
+            const auto r_wp0 = wp_fsm.plan(wp_goals, wp_start, wp_gm);
+            ok &= check(
+                r_wp0.has_value() && r_wp0->is_new_trajectory && r_wp0->ma_spline_traj.success
+                    && r_wp0->remaining_goals == wp_goals.size() && !r_wp0->ma_spline_traj.via_anchor_times.empty(),
+                "FsmReplan multi-waypoint initial plan succeeds with via anchors"
+            );
+            if (r_wp0.has_value() && !r_wp0->ma_spline_traj.via_anchor_times.empty()) {
+                const double t_via0 = r_wp0->ma_spline_traj.via_anchor_times[0];
+                Eigen::Vector2d p_via, v_via, a_via;
+                ma_spline_opt::sample_xy(r_wp0->ma_spline_traj, t_via0, p_via, v_via, a_via);
+                ok &= check(
+                    v_via.norm() > 0.8
+                        && (p_via - Eigen::Vector2d(-3.0, 0.0)).norm()
+                            <= env.planner_cfg.replan_params.via_pass_radius + 0.25,
+                    "FsmReplan multi-waypoint maintains non-zero speed through intermediate via point"
+                );
+
+                // 通过第一个途径点仅推进进度，不触发重规划
+                wp_clk.advanceSec(t_via0 + 0.25);
+                Eigen::Vector2d p_past, v_past, a_past;
+                ma_spline_opt::sample_xy(r_wp0->ma_spline_traj, t_via0 + 0.25, p_past, v_past, a_past);
+                const auto r_wp1 = wp_fsm.plan(wp_goals, make_robot_state(p_past), wp_gm);
+                ok &= check(
+                    r_wp1.has_value() && !r_wp1->is_new_trajectory && r_wp1->active_goal_index >= 1
+                        && r_wp1->remaining_goals == wp_goals.size() - r_wp1->active_goal_index,
+                    "FsmReplan advances passed via point without triggering replan"
+                );
+
+                // 仅通过中间点后抵达最终点才返回 remaining_goals == 0
+                const auto r_wp_mid2 = wp_fsm.plan(wp_goals, wp_goals[1], wp_gm);
+                const auto r_wp_done = wp_fsm.plan(wp_goals, wp_goals[2], wp_gm);
+                ok &= check(
+                    r_wp_mid2.has_value() && r_wp_done.has_value() && r_wp_done->remaining_goals == 0
+                        && r_wp_done->path_state == replan::FsmReplan::PathState::SUCCESSED,
+                    "FsmReplan finishes multi-waypoint mission at final goal"
                 );
             }
         }

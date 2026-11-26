@@ -23,6 +23,11 @@ public:
         const utils::RobotState& current_pose,
         grid_map::GridMap::ConstPtr grid_map
     ) -> path;
+    auto plan(
+        const std::vector<utils::RobotState>& goals,
+        const utils::RobotState& current_pose,
+        grid_map::GridMap::ConstPtr grid_map
+    ) -> path;
     auto set_param(const PlannerConfig& planner_config) -> void;
     auto set_clock(utils::Clock clock) -> void;
     path_planning::PathPlanning path_planning;
@@ -47,7 +52,11 @@ private:
 
     State state_ = State::IDLE;
     PlannerConfig planner_config_;
-    utils::RobotState old_goal_pose_;
+    std::vector<utils::RobotState> old_goals_; // 已提交任务的原始输入点列（用于变更检测）
+    std::vector<utils::RobotState> working_goals_; // 已过滤冗余相邻中间点的工作点列（末尾必为最终点）
+    size_t working_active_idx_ = 0; // 当前待通过工作点索引
+    std::vector<size_t> window_via_goal_indices_; // 当前样条每个 via_anchor_times 对应的 working_goals_ 索引
+    bool window_includes_final_ = true; // 当前样条末端是否已覆盖最终点
     ResultPath result_;
     utils::Clock clock_ = utils::Clock::steady();
     std::optional<double> last_trajectory_time_sec_; ///< 上一条轨迹的提交时刻（秒，跟随 clock_，刹车段按时间推进用）
@@ -140,6 +149,14 @@ auto FsmReplan::plan(
     return impl_->plan(goal_pose, current_pose, std::move(grid_map));
 }
 
+auto FsmReplan::plan(
+    const std::vector<utils::RobotState>& goals,
+    const utils::RobotState& current_pose,
+    grid_map::GridMap::ConstPtr grid_map
+) -> path {
+    return impl_->plan(goals, current_pose, std::move(grid_map));
+}
+
 // 点到线段 [a, b] 的最短距离。
 static double point_to_segment_dist(const Eigen::Vector2d& pos, const Eigen::Vector2d& a, const Eigen::Vector2d& b) {
     const Eigen::Vector2d ab = b - a;
@@ -214,8 +231,88 @@ static auto project_on_trajectory(
     }
     return {best_t, std::sqrt(best_d2)};
 }
+
+// 比较原始目标点列是否发生变化（任一点 xy 超 goal_deviation 或长度变化）
+static auto goals_sequence_changed(
+    const std::vector<utils::RobotState>& old_goals,
+    const std::vector<utils::RobotState>& new_goals,
+    const Eigen::Vector2d& threshold
+) -> bool {
+    if (old_goals.size() != new_goals.size()) {
+        return true;
+    }
+    for (size_t i = 0; i < old_goals.size(); ++i) {
+        const double dx = std::abs(old_goals[i].p.x() - new_goals[i].p.x());
+        const double dy = std::abs(old_goals[i].p.y() - new_goals[i].p.y());
+        if (dx > threshold.x() || dy > threshold.y()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 过滤间距过小的冗余相邻中间途径点，始终严格保留最终目标点。
+static auto filter_redundant_via_points(const std::vector<utils::RobotState>& goals, double min_spacing)
+    -> std::vector<utils::RobotState> {
+    if (goals.size() <= 1 || min_spacing <= 0.0) {
+        return goals;
+    }
+    std::vector<utils::RobotState> filtered;
+    filtered.reserve(goals.size());
+    for (size_t i = 0; i + 1 < goals.size(); ++i) {
+        const Eigen::Vector2d pt(goals[i].p.x(), goals[i].p.y());
+        if (filtered.empty()) {
+            filtered.push_back(goals[i]);
+            continue;
+        }
+        const Eigen::Vector2d prev(filtered.back().p.x(), filtered.back().p.y());
+        if ((pt - prev).norm() >= min_spacing) {
+            filtered.push_back(goals[i]);
+        }
+    }
+    const Eigen::Vector2d final_xy(goals.back().p.x(), goals.back().p.y());
+    while (!filtered.empty()) {
+        const Eigen::Vector2d prev(filtered.back().p.x(), filtered.back().p.y());
+        if ((final_xy - prev).norm() < min_spacing) {
+            filtered.pop_back();
+        } else {
+            break;
+        }
+    }
+    filtered.push_back(goals.back());
+    return filtered;
+}
+
+// 估算执行轨迹自局部时刻 t_from 至末端的剩余弧长（m），用于滑动视野滚动延伸判定。
+static auto remaining_arc_length(const ma_spline_opt::MAsplineOutput& out, double t_from) -> double {
+    const double dur = ma_spline_opt::total_duration(out);
+    const double t_start = std::clamp(t_from, 0.0, dur);
+    if (t_start >= dur - 1e-6) {
+        return 0.0;
+    }
+    constexpr double kDt = 0.05;
+    Eigen::Vector2d prev = sample_traj_pos(out, t_start);
+    double length = 0.0;
+    double t = t_start;
+    while (t < dur - 1e-9) {
+        t = std::min(t + kDt, dur);
+        const Eigen::Vector2d cur = sample_traj_pos(out, t);
+        length += (cur - prev).norm();
+        prev = cur;
+    }
+    return length;
+}
+
 auto FsmReplan::Impl::plan(
     const utils::RobotState& goal_pose,
+    const utils::RobotState& current_pose,
+    grid_map::GridMap::ConstPtr grid_map
+) -> path {
+    return plan(std::vector<utils::RobotState> {goal_pose}, current_pose, std::move(grid_map));
+}
+
+auto FsmReplan::Impl::plan(
+    const std::vector<utils::RobotState>& goals,
     const utils::RobotState& current_pose,
     grid_map::GridMap::ConstPtr grid_map
 ) -> path {
@@ -224,31 +321,50 @@ auto FsmReplan::Impl::plan(
         return tl::make_unexpected(PathError::PLANNING_FAILED);
     }
 
+    const auto& rp = planner_config_.replan_params;
+    const int max_waypoints = std::max(1, rp.max_waypoints);
+    if (goals.empty() || static_cast<int>(goals.size()) > max_waypoints) {
+        logger::warn(
+            logger::fsm_replan,
+            "Reject goals sequence with invalid size {} (allowed 1..{})",
+            goals.size(),
+            max_waypoints
+        );
+        return tl::make_unexpected(PathError::PLANNING_FAILED);
+    }
+
     result_.is_new_trajectory = false;
 
     const Eigen::Vector2d current_xy(current_pose.p.x(), current_pose.p.y());
-    const Eigen::Vector2d goal_xy(goal_pose.p.x(), goal_pose.p.y());
-    if (!current_xy.allFinite() || !goal_xy.allFinite()) {
-        logger::warn(logger::fsm_replan, "Reject non-finite start or goal pose");
+    if (!current_xy.allFinite()) {
+        logger::warn(logger::fsm_replan, "Reject non-finite start pose");
         return tl::make_unexpected(PathError::PLANNING_FAILED);
     }
 
     const bool oob_occupied = (grid_map->outOfBoundsPolicy() == grid_map::OutOfBoundsPolicy::OCCUPIED);
-    if (oob_occupied && !grid_map->isInsideMap(goal_xy)) {
-        logger::warn(
-            logger::fsm_replan,
-            "Reject out-of-bounds goal ({:.2f}, {:.2f}) in navigation mode",
-            goal_xy.x(),
-            goal_xy.y()
-        );
-        return tl::make_unexpected(PathError::PLANNING_FAILED);
+    for (size_t i = 0; i < goals.size(); ++i) {
+        const Eigen::Vector2d g_xy(goals[i].p.x(), goals[i].p.y());
+        if (!g_xy.allFinite()) {
+            logger::warn(logger::fsm_replan, "Reject non-finite goal pose at index {}", i);
+            return tl::make_unexpected(PathError::PLANNING_FAILED);
+        }
+        if (oob_occupied && !grid_map->isInsideMap(g_xy)) {
+            logger::warn(
+                logger::fsm_replan,
+                "Reject out-of-bounds goal[{}] ({:.2f}, {:.2f}) in navigation mode",
+                i,
+                g_xy.x(),
+                g_xy.y()
+            );
+            return tl::make_unexpected(PathError::PLANNING_FAILED);
+        }
     }
 
     // 导航模式允许轻微越界的起点沿虚拟墙向内恢复（<= start_oob_recover_dist），
     // 越界过深时直接拒收，避免在定位异常期间覆盖状态与在途轨迹。
     if (oob_occupied && !grid_map->isInsideMap(current_xy)) {
         const double oob_dist = -std::min(0.0, grid_map->getDistance(current_xy));
-        const double max_recover = std::max(0.0, planner_config_.replan_params.start_oob_recover_dist);
+        const double max_recover = std::max(0.0, rp.start_oob_recover_dist);
         if (oob_dist > max_recover + 1e-9) {
             logger::warn(
                 logger::fsm_replan,
@@ -262,48 +378,126 @@ auto FsmReplan::Impl::plan(
         }
     }
 
-    // 起点≈终点（机器人已到达目标附近）：直接退出，不规划。
-    if ((current_xy - goal_xy).norm() < planner_config_.replan_params.goal_reached_radius) {
-        result_.path_state = PathState::SUCCESSED;
-        transition(Event::GOAL_REACHED);
-        return result_;
-    }
-
-    // if(grid_map->is_tunnel(current_pose.p.head<2>())){
-    //     logger::fsm_replan->error("now robot in tunnel");
-    // }
-
-    const auto safe_threshold = planner_config_.path_planning_params.safe_threshold;
-    const double hard_clearance =
-        std::min(std::max(1e-3, planner_config_.replan_params.hard_clearance), safe_threshold);
+    const double safe_threshold = planner_config_.path_planning_params.safe_threshold;
+    const double hard_clearance = std::min(std::max(1e-3, rp.hard_clearance), safe_threshold);
+    const double r_pass = std::max(0.0, rp.via_pass_radius);
+    const double r_opt = std::clamp(rp.via_opt_radius, 0.0, r_pass);
+    const double via_hyst = std::max(0.0, rp.via_time_pass_hysteresis);
     const double elapsed_traj = elapsed_since_last_traj();
 
-    Eigen::Vector2d diff = (old_goal_pose_.p - goal_pose.p).head<2>();
-    Eigen::Vector2d threshold = planner_config_.replan_params.goal_deviation.head<2>();
-    const bool goal_changed = diff.cwiseAbs().x() > threshold.x() || diff.cwiseAbs().y() > threshold.y();
+    const Eigen::Vector2d goal_threshold(rp.goal_deviation.x(), rp.goal_deviation.y());
+    const bool goals_changed = goals_sequence_changed(old_goals_, goals, goal_threshold);
 
-    bool must_replan = state_ == State::IDLE || state_ == State::RETRY_PENDING || goal_changed;
-    std::optional<double> projected_t;
-    if (!must_replan) {
-        const auto& cur_traj = result_.ma_spline_traj;
-        if (!cur_traj.success || !cur_traj.trajectory.isInitialized()) {
-            must_replan = true;
-        } else {
-            const auto proj = project_on_trajectory(
+    const auto& cur_traj = result_.ma_spline_traj;
+    const bool has_cur_traj = cur_traj.success && cur_traj.trajectory.isInitialized();
+
+    std::vector<utils::RobotState> candidate_goals;
+    size_t candidate_active_idx = 0;
+    std::optional<TrajProjection> proj_opt;
+
+    if (!goals_changed && !working_goals_.empty()) {
+        if (has_cur_traj) {
+            const TrajProjection proj = project_on_trajectory(
                 cur_traj,
                 current_xy,
                 elapsed_traj,
                 last_monitor_t_,
-                planner_config_.replan_params.projection_search_resolution,
-                planner_config_.replan_params.replan_lateral_dev
+                rp.projection_search_resolution,
+                rp.replan_lateral_dev
             );
-            projected_t = proj.t;
+            proj_opt = proj;
             last_monitor_t_ = proj.t;
-            must_replan = (proj.dist > planner_config_.replan_params.replan_lateral_dev)
-                || check_trajectory_collision(cur_traj, proj.t, *grid_map, hard_clearance);
+        }
+
+        // 严格按序推进队首中间途径点：空间半径或轨迹时间锚点越过（未偏离轨迹）满足任一即推进，
+        // 避免绕障无法进入途径点半径时回头死循环；推进本身不触发重规划。
+        while (working_active_idx_ + 1 < working_goals_.size()) {
+            const Eigen::Vector2d head_xy(
+                working_goals_[working_active_idx_].p.x(),
+                working_goals_[working_active_idx_].p.y()
+            );
+            bool passed = ((current_xy - head_xy).norm() <= r_pass);
+            if (!passed && proj_opt.has_value() && proj_opt->dist <= rp.replan_lateral_dev
+                && window_via_goal_indices_.size() == cur_traj.via_anchor_times.size())
+            {
+                for (size_t k = 0; k < window_via_goal_indices_.size(); ++k) {
+                    if (window_via_goal_indices_[k] == working_active_idx_) {
+                        if (proj_opt->t > cur_traj.via_anchor_times[k] + via_hyst) {
+                            passed = true;
+                        }
+                        break;
+                    }
+                }
+            }
+            if (!passed) {
+                break;
+            }
+            ++working_active_idx_;
+        }
+
+        // 仅当所有中间点均已通过，且当前位于最终点到达半径内时直接完成。
+        if (working_active_idx_ + 1 == working_goals_.size()) {
+            const Eigen::Vector2d final_xy(working_goals_.back().p.x(), working_goals_.back().p.y());
+            if ((current_xy - final_xy).norm() < rp.goal_reached_radius) {
+                result_.path_state = PathState::SUCCESSED;
+                result_.active_goal_index = working_active_idx_;
+                result_.remaining_goals = 0;
+                transition(Event::GOAL_REACHED);
+                return result_;
+            }
+        }
+
+        candidate_goals = working_goals_;
+        candidate_active_idx = working_active_idx_;
+    } else {
+        // 新任务：在局部候选中过滤相邻冗余中间点，并跳过出发即已在通过半径内的前导中间点。
+        candidate_goals = filter_redundant_via_points(goals, std::max(0.0, rp.via_min_spacing));
+        candidate_active_idx = 0;
+        while (candidate_active_idx + 1 < candidate_goals.size()) {
+            const Eigen::Vector2d head_xy(
+                candidate_goals[candidate_active_idx].p.x(),
+                candidate_goals[candidate_active_idx].p.y()
+            );
+            if ((current_xy - head_xy).norm() <= r_pass) {
+                ++candidate_active_idx;
+            } else {
+                break;
+            }
+        }
+
+        // 起点≈最终点：直接退出，不规划退化路径（A* 单点）。
+        if (candidate_active_idx + 1 == candidate_goals.size()) {
+            const Eigen::Vector2d final_xy(candidate_goals.back().p.x(), candidate_goals.back().p.y());
+            if ((current_xy - final_xy).norm() < rp.goal_reached_radius) {
+                old_goals_ = goals;
+                working_goals_ = std::move(candidate_goals);
+                working_active_idx_ = candidate_active_idx;
+                window_via_goal_indices_.clear();
+                window_includes_final_ = true;
+                result_.path_state = PathState::SUCCESSED;
+                result_.active_goal_index = working_active_idx_;
+                result_.remaining_goals = 0;
+                transition(Event::GOAL_REACHED);
+                return result_;
+            }
+        }
+    }
+
+    bool must_replan = (state_ == State::IDLE) || (state_ == State::RETRY_PENDING) || goals_changed || !has_cur_traj;
+    if (!must_replan) {
+        const TrajProjection& proj = proj_opt.value();
+        must_replan = (proj.dist > rp.replan_lateral_dev)
+            || check_trajectory_collision(cur_traj, proj.t, *grid_map, hard_clearance);
+        if (!must_replan && !window_includes_final_ && rp.horizon_length > 0.0 && elapsed_traj >= 0.3) {
+            const double eff_replan_dist = std::min(std::max(0.0, rp.horizon_replan_dist), 0.7 * rp.horizon_length);
+            if (remaining_arc_length(cur_traj, proj.t) <= eff_replan_dist) {
+                must_replan = true;
+            }
         }
     }
     if (!must_replan) {
+        result_.active_goal_index = working_active_idx_;
+        result_.remaining_goals = working_goals_.size() - working_active_idx_;
         transition(Event::KEEP_MONITORING);
         return result_;
     }
@@ -312,10 +506,37 @@ auto FsmReplan::Impl::plan(
     {
         utils::TimeConsuming timer("planner_fsm", true); // true 表示允许打印
 
-        Eigen::Vector2d start(current_pose.p.x(), current_pose.p.y());
-        Eigen::Vector2d goal(goal_pose.p.x(), goal_pose.p.y());
+        // 滑动规划视野截断：至少包含下一个目标点；视野内保留全部中间途径点直到累计弧长达到 horizon_length
+        std::vector<size_t> win_via_indices;
+        size_t win_goal_idx = candidate_active_idx;
+        const int max_via_in_window = std::max(0, planner_config_.path_planning_params.max_traj_num - 1);
+        double accum_dist =
+            (Eigen::Vector2d(candidate_goals[candidate_active_idx].p.x(), candidate_goals[candidate_active_idx].p.y())
+             - current_xy)
+                .norm();
+        while (win_goal_idx + 1 < candidate_goals.size()) {
+            if (rp.horizon_length > 0.0 && accum_dist >= rp.horizon_length) {
+                break;
+            }
+            if (static_cast<int>(win_via_indices.size()) >= max_via_in_window) {
+                break;
+            }
+            const Eigen::Vector2d p_cur(candidate_goals[win_goal_idx].p.x(), candidate_goals[win_goal_idx].p.y());
+            const Eigen::Vector2d p_next(
+                candidate_goals[win_goal_idx + 1].p.x(),
+                candidate_goals[win_goal_idx + 1].p.y()
+            );
+            win_via_indices.push_back(win_goal_idx);
+            ++win_goal_idx;
+            accum_dist += (p_next - p_cur).norm();
+        }
+        const bool win_includes_final = (win_goal_idx + 1 == candidate_goals.size());
+        const utils::RobotState& win_goal_state = candidate_goals[win_goal_idx];
 
-        // 若起点/终点过于靠近障碍物或导航模式轻微越界，沿 ESDF/虚拟墙梯度外推到安全点
+        Eigen::Vector2d start(current_pose.p.x(), current_pose.p.y());
+        Eigen::Vector2d goal(win_goal_state.p.x(), win_goal_state.p.y());
+
+        // 若起点/中间点/窗口终点过于靠近障碍物或导航模式轻微越界，沿 ESDF/虚拟墙梯度外推到安全点
         const Eigen::Vector2d robot_pos = start;
         start = get_safe_pos(start, *grid_map, safe_threshold);
         goal = get_safe_pos(goal, *grid_map, safe_threshold);
@@ -341,6 +562,26 @@ auto FsmReplan::Impl::plan(
             transition(Event::PLAN_FAILED);
             return tl::make_unexpected(PathError::PLANNING_FAILED);
         }
+
+        std::vector<Eigen::Vector2d> safe_vias;
+        safe_vias.reserve(win_via_indices.size());
+        for (size_t idx: win_via_indices) {
+            const Eigen::Vector2d raw_via(candidate_goals[idx].p.x(), candidate_goals[idx].p.y());
+            const Eigen::Vector2d safe_via = get_safe_pos(raw_via, *grid_map, safe_threshold);
+            if (oob_occupied && !grid_map->isInsideMap(safe_via)) {
+                logger::warn(
+                    logger::fsm_replan,
+                    "Adjusted via[{}] ({:.2f}, {:.2f}) landed outside navigation map bounds",
+                    idx,
+                    safe_via.x(),
+                    safe_via.y()
+                );
+                transition(Event::PLAN_FAILED);
+                return tl::make_unexpected(PathError::PLANNING_FAILED);
+            }
+            safe_vias.push_back(safe_via);
+        }
+
         const bool start_moved = (start - robot_pos).norm() > 1e-6;
 
         // 起点速度/加速度：取机器人在上一条参考（刹车段 + 样条）上最近投影时刻的计划 v(t)、a(t)
@@ -351,17 +592,16 @@ auto FsmReplan::Impl::plan(
         const auto& last_out = result_.ma_spline_traj;
         if (last_out.success && last_out.trajectory.isInitialized()) {
             const double dur = ma_spline_opt::total_duration(last_out);
-            const double best_t = projected_t.has_value()
-                ? projected_t.value()
-                : project_on_trajectory(
-                      last_out,
-                      robot_pos,
-                      elapsed_traj,
-                      last_monitor_t_,
-                      planner_config_.replan_params.projection_search_resolution,
-                      planner_config_.replan_params.replan_lateral_dev
-                  )
-                      .t;
+            const double best_t = proj_opt.has_value() ? proj_opt->t
+                                                       : project_on_trajectory(
+                                                             last_out,
+                                                             robot_pos,
+                                                             elapsed_traj,
+                                                             last_monitor_t_,
+                                                             rp.projection_search_resolution,
+                                                             rp.replan_lateral_dev
+                                                         )
+                                                             .t;
             // 投影到旧参考终点（已走完）时按静止处理
             if (best_t < dur) {
                 Eigen::Vector2d p;
@@ -374,9 +614,23 @@ auto FsmReplan::Impl::plan(
         const Eigen::Vector3d current_vel(start_vel.x(), start_vel.y(), current_pose.wz);
         path_planning.set_velocity(current_vel, Eigen::Vector3d::Zero());
 
-        auto trajectory =
-            path_planning.path_planning(*grid_map, start, goal, current_pose.yaw, goal_pose.yaw, timeout_ms);
+        auto run_frontend = [&](const Eigen::Vector2d& from) {
+            if (safe_vias.empty()) {
+                return path_planning
+                    .path_planning(*grid_map, from, goal, current_pose.yaw, win_goal_state.yaw, timeout_ms);
+            }
+            return path_planning.path_planning_through_poses(
+                *grid_map,
+                from,
+                safe_vias,
+                goal,
+                current_pose.yaw,
+                win_goal_state.yaw,
+                timeout_ms
+            );
+        };
 
+        auto trajectory = run_frontend(start);
         if (!trajectory.has_value()) {
             logger::warn(logger::fsm_replan, "planning failed");
             transition(Event::PLAN_FAILED);
@@ -416,8 +670,7 @@ auto FsmReplan::Impl::plan(
                 );
 
                 path_planning.set_velocity(Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
-                trajectory =
-                    path_planning.path_planning(*grid_map, start, goal, current_pose.yaw, goal_pose.yaw, timeout_ms);
+                trajectory = run_frontend(start);
                 if (!trajectory.has_value()) {
                     logger::warn(logger::fsm_replan, "planning from brake stop point failed");
                     transition(Event::PLAN_FAILED);
@@ -434,15 +687,32 @@ auto FsmReplan::Impl::plan(
             start_acc.setZero();
         }
 
-        // 打印 raw_path / optimized_path 点数,确认直线/近距离时的短路情况
-        // logger::info(logger::fsm_replan,
-        //     "path points: raw={} optimized={} total_time={:.2f}s",
-        //     result_.planning_traj.raw_path.size(),
-        //     result_.planning_traj.optimized_path.size(),
-        //     result_.planning_traj.total_time
-        // );
         minco_opt::GridMapESDF grid_map_esdf(grid_map);
         auto ma_intput = ma_spline_opt::from_path_planning_trajectory(trajectory.value());
+
+        // 注入中间途径点软球约束锚点（单点导航 safe_vias 为空时零开销跳过）
+        std::vector<size_t> active_win_via_goal_indices;
+        if (!safe_vias.empty() && trajectory->via_knot_indices.size() == safe_vias.size()
+            && ma_intput.timed_trajectory.size() == trajectory->timed_trajectory.size())
+        {
+            const int num_knots = static_cast<int>(ma_intput.timed_trajectory.size());
+            const double via_weight = std::max(0.0, planner_config_.ma_spline_opt_params.via_point_weight);
+            ma_intput.via_anchors.reserve(safe_vias.size());
+            active_win_via_goal_indices.reserve(safe_vias.size());
+            for (size_t k = 0; k < safe_vias.size(); ++k) {
+                const int knot_idx = trajectory->via_knot_indices[k];
+                if (knot_idx <= 0 || knot_idx >= num_knots - 1) {
+                    continue;
+                }
+                ma_spline_opt::ViaPointAnchor anchor;
+                anchor.knot_index = knot_idx;
+                anchor.target = safe_vias[k];
+                anchor.pass_radius = r_opt;
+                anchor.weight = via_weight;
+                ma_intput.via_anchors.push_back(anchor);
+                active_win_via_goal_indices.push_back(win_via_indices[k]);
+            }
+        }
 
         // 起点被挪开：速度只保留沿新路径首段方向的分量（反向置 0），加速度置 0
         if (start_moved) {
@@ -455,13 +725,14 @@ auto FsmReplan::Impl::plan(
         ma_intput.start_acc = start_acc;
         logger::debug(
             logger::fsm_replan,
-            "start state: hot={} moved={} v=({:.2f},{:.2f}) a=({:.2f},{:.2f})",
+            "start state: hot={} moved={} v=({:.2f},{:.2f}) a=({:.2f},{:.2f}) vias={}",
             hot_start,
             start_moved,
             start_vel.x(),
             start_vel.y(),
             start_acc.x(),
-            start_acc.y()
+            start_acc.y(),
+            ma_intput.via_anchors.size()
         );
 
         ma_intput.model = ma_spline_opt::OptModel::OMNI_XY;
@@ -473,6 +744,9 @@ auto FsmReplan::Impl::plan(
             return tl::make_unexpected(PathError::MINCO_OPT_FIALED);
         }
         ma_output.brake = brake; // 刹车段拼在样条前面（无刹车时 duration=0）
+        for (double& t_anchor: ma_output.via_anchor_times) {
+            t_anchor += brake.duration;
+        }
         // 统一提交门禁：用与监控态一致的 check_trajectory_collision 校验整条执行轨迹的硬净空与地图边界
         // （导航模式下 OutOfBoundsPolicy::OCCUPIED 时 isCollision 同步拦截越界点），避免提交违规轨迹导致下帧震荡重规划。
         if (check_trajectory_collision(ma_output, 0.0, *grid_map, hard_clearance)) {
@@ -484,16 +758,22 @@ auto FsmReplan::Impl::plan(
             transition(Event::PLAN_FAILED);
             return tl::make_unexpected(PathError::MINCO_OPT_FIALED);
         }
-        // 优化成功后再组装并整体提交，失败时保持旧轨迹不变。
+        // 优化成功后再组装并整体提交，失败时保持旧轨迹与旧任务进度不变。
         ResultPath candidate;
         candidate.planning_traj = std::move(trajectory.value());
         candidate.ma_spline_traj = std::move(ma_output);
         candidate.is_new_trajectory = true;
         candidate.path_state = PathState::SUCCESSED;
+        candidate.active_goal_index = candidate_active_idx;
+        candidate.remaining_goals = candidate_goals.size() - candidate_active_idx;
         last_trajectory_time_sec_ = clock_.nowSec();
         last_monitor_t_ = 0.0;
         result_ = std::move(candidate);
-        old_goal_pose_ = goal_pose;
+        old_goals_ = goals;
+        working_goals_ = std::move(candidate_goals);
+        working_active_idx_ = candidate_active_idx;
+        window_via_goal_indices_ = std::move(active_win_via_goal_indices);
+        window_includes_final_ = win_includes_final;
         transition(Event::PLAN_SUCCEEDED);
         return result_;
     }

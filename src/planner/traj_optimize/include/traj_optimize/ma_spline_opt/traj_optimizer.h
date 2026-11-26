@@ -57,7 +57,8 @@ private:
         Opt2D::OptimizationContext* ctx = nullptr;
 
         using Spec =
-            decltype(Opt2D::makeEvaluateSpec(std::declval<TimeCost&>(), std::declval<RobotIntegralCost<2,ESDF>&>()));
+            decltype(Opt2D::makeEvaluateSpec(std::declval<TimeCost&>(), std::declval<RobotIntegralCost<2, ESDF>&>())
+                         .withWaypointsCost(std::declval<ViaPointsCost&>()));
 
         Spec* spec = nullptr;
     };
@@ -70,6 +71,7 @@ private:
         const SplineTrajectory::SplineOptimizer<2>::ProblemDefinition& problem,
         const StageOptimizerConfig& stage,
         bool split_esdf,
+        const std::vector<ViaPointAnchor>* via_anchors,
         Eigen::VectorXd& x,
         double& final_cost
     ) -> bool;
@@ -86,7 +88,8 @@ private:
         Opt3D::OptimizationContext* ctx = nullptr;
 
         using Spec =
-            decltype(Opt3D::makeEvaluateSpec(std::declval<TimeCost&>(), std::declval<RobotIntegralCost<3,ESDF>&>()));
+            decltype(Opt3D::makeEvaluateSpec(std::declval<TimeCost&>(), std::declval<RobotIntegralCost<3, ESDF>&>())
+                         .withWaypointsCost(std::declval<ViaPointsCost&>()));
 
         Spec* spec = nullptr;
     };
@@ -98,6 +101,7 @@ private:
         const SplineTrajectory::SplineOptimizer<3>::ProblemDefinition& problem,
         const StageOptimizerConfig& stage,
         bool split_esdf,
+        const std::vector<ViaPointAnchor>* via_anchors,
         Eigen::VectorXd& x,
         double& final_cost
     ) -> bool;
@@ -117,6 +121,23 @@ private:
     Opt3D optimizer_3d_;
     Opt3D::OptimizationContext ctx_3d_;
 };
+
+inline auto
+compute_via_anchor_times(const std::vector<ViaPointAnchor>& anchors, const std::vector<double>& time_segments)
+    -> std::vector<double> {
+    std::vector<double> times;
+    times.reserve(anchors.size());
+    const int num_segs = static_cast<int>(time_segments.size());
+    for (const auto& anchor: anchors) {
+        const int k_limit = std::clamp(anchor.knot_index, 0, num_segs);
+        double t_acc = 0.0;
+        for (int j = 0; j < k_limit; ++j) {
+            t_acc += time_segments[static_cast<size_t>(j)];
+        }
+        times.push_back(t_acc);
+    }
+    return times;
+}
 
 inline auto extend_xy_with_zero_yaw(const SplineTrajectory::QuinticSplineND<2>& xy_spline)
     -> SplineTrajectory::QuinticSplineND<3> {
@@ -246,14 +267,14 @@ auto MaSplineTrajectoryOptimizer<ESDF>::optimize_xy(const MaSplineInput& input) 
     Eigen::VectorXd x;
 
     double cost_stage1 = 0.0;
-    if (!optimize_2d_stage(problem, config_.stage1, false, x, cost_stage1)) {
+    if (!optimize_2d_stage(problem, config_.stage1, false, &input.via_anchors, x, cost_stage1)) {
         logger::warn(logger::traj_opt, "lbfgs opt1 failed");
         return tl::make_unexpected(MaOptError::LBFGS_OPT_FAILED);
     }
 
     const Eigen::VectorXd x_stage1 = x;
     double cost_stage2 = 0.0;
-    if (!optimize_2d_stage(problem, config_.stage2, true, x, cost_stage2)) {
+    if (!optimize_2d_stage(problem, config_.stage2, true, &input.via_anchors, x, cost_stage2)) {
         logger::warn(logger::traj_opt, "lbfgs opt2 failed, keep stage1");
         x = x_stage1;
         cost_stage2 = cost_stage1;
@@ -269,17 +290,19 @@ auto MaSplineTrajectoryOptimizer<ESDF>::optimize_xy(const MaSplineInput& input) 
     out.trajectory = extend_xy_with_zero_yaw(xy_spline);
     out.time_segments = ctx_2d_.runtime.state.times;
     out.start_time = ctx_2d_.runtime.state.start_time;
+    out.via_anchor_times = compute_via_anchor_times(input.via_anchors, out.time_segments);
     out.cost = cost_stage2;
     out.success = out.trajectory.isInitialized();
 
     return out;
 }
 
-template <typename ESDF>
+template<typename ESDF>
 auto MaSplineTrajectoryOptimizer<ESDF>::optimize_2d_stage(
     const SplineTrajectory::SplineOptimizer<2>::ProblemDefinition& problem,
     const StageOptimizerConfig& stage,
     bool split_esdf,
+    const std::vector<ViaPointAnchor>* via_anchors,
     Eigen::VectorXd& x,
     double& final_cost
 ) -> bool {
@@ -316,7 +339,8 @@ auto MaSplineTrajectoryOptimizer<ESDF>::optimize_2d_stage(
     integral_cost1.v_max = config_.v_max;
     integral_cost1.a_max = config_.a_max;
 
-    auto spec1 = Opt2D::makeEvaluateSpec(time_cost1, integral_cost1);
+    ViaPointsCost via_cost1 {via_anchors};
+    auto spec1 = Opt2D::makeEvaluateSpec(time_cost1, integral_cost1).withWaypointsCost(via_cost1);
     CallbackCtx cb {&optimizer_2d_, &ctx_2d_, &spec1};
 
     lbfgs::lbfgs_parameter_t params;
@@ -342,11 +366,12 @@ auto MaSplineTrajectoryOptimizer<ESDF>::optimize_2d_stage(
     return result >= 0 && std::isfinite(final_cost) && x.allFinite();
 };
 
-template <typename ESDF>
+template<typename ESDF>
 auto MaSplineTrajectoryOptimizer<ESDF>::optimize_3d_stage(
     const SplineTrajectory::SplineOptimizer<3>::ProblemDefinition& problem,
     const StageOptimizerConfig& stage,
     bool split_esdf,
+    const std::vector<ViaPointAnchor>* via_anchors,
     Eigen::VectorXd& x,
     double& final_cost
 ) -> bool {
@@ -402,7 +427,8 @@ auto MaSplineTrajectoryOptimizer<ESDF>::optimize_3d_stage(
     time_cost.w_min_time = stage.weight_min_time;
     time_cost.min_time = stage.min_time;
 
-    auto spec = Opt3D::makeEvaluateSpec(time_cost, integral_cost);
+    ViaPointsCost via_cost {via_anchors};
+    auto spec = Opt3D::makeEvaluateSpec(time_cost, integral_cost).withWaypointsCost(via_cost);
 
     CallbackCtx3D callback_ctx;
     callback_ctx.optimizer = &optimizer_3d_;
@@ -481,13 +507,13 @@ auto MaSplineTrajectoryOptimizer<ESDF>::optimize_xy_yaw_joint(const MaSplineInpu
     Eigen::VectorXd x;
 
     double cost_stage1 = 0.0;
-    if (!optimize_3d_stage(problem, config_.stage1, false, x, cost_stage1)) {
+    if (!optimize_3d_stage(problem, config_.stage1, false, &input.via_anchors, x, cost_stage1)) {
         return tl::make_unexpected(MaOptError::LBFGS_OPT_FAILED);
     }
 
     const Eigen::VectorXd x_stage1 = x;
     double cost_stage2 = 0.0;
-    if (!optimize_3d_stage(problem, config_.stage2, true, x, cost_stage2)) {
+    if (!optimize_3d_stage(problem, config_.stage2, true, &input.via_anchors, x, cost_stage2)) {
         logger::warn(logger::traj_opt, "lbfgs opt2 failed, keep stage1");
         x = x_stage1;
         cost_stage2 = cost_stage1;
@@ -500,6 +526,7 @@ auto MaSplineTrajectoryOptimizer<ESDF>::optimize_xy_yaw_joint(const MaSplineInpu
     out.trajectory = optimizer_3d_.getWorkingSpline(ctx_3d_);
     out.time_segments = ctx_3d_.runtime.state.times;
     out.start_time = ctx_3d_.runtime.state.start_time;
+    out.via_anchor_times = compute_via_anchor_times(input.via_anchors, out.time_segments);
     out.cost = cost_stage2;
     out.success = out.trajectory.isInitialized();
     return out;

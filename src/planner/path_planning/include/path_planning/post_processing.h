@@ -45,6 +45,8 @@ public:
         Eigen::Vector3d final_state_XYTheta = Eigen::Vector3d::Zero();
 
         Eigen::VectorXd time_segments;
+        // 仅多点规划非空：每个中间途径点对应的 timed_trajectory 索引（无效/退化项为 -1）
+        std::vector<int> via_knot_indices;
 
         double total_time = 0;
         double total_length = 0;
@@ -104,6 +106,9 @@ public:
     auto sample_path_states(const std::vector<Eigen::Vector2d>& path) -> std::vector<PathState>;
     auto normalize_angle(double ref_angle, double& angle) const -> void;
     auto assign_trajectory_timing(Trajectory& traj) -> void;
+    // 多点保锚点时间分配：中间途径点不减速，按各子段时长比例重采样并将锚点索引写入 traj.via_knot_indices。
+    // opt_via_indices 为 traj.optimized_path 中有序的中间途径点顶点索引（0 < idx < size - 1）；空时等价于单点版本。
+    auto assign_trajectory_timing_with_anchors(Trajectory& traj, const std::vector<size_t>& opt_via_indices) -> void;
 
     auto fill_additional_trajectory_info(
         Trajectory& traj,
